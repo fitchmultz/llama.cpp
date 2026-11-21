@@ -1494,6 +1494,41 @@ typedef struct {
 } ggml_metal_kargs_opt_step_sgd;
 
 typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    float    inv_beta;
+    float    beta;
+    float    inv_lb;
+    float    lb;
+} ggml_metal_kargs_situ;
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  k_prev;
+    int32_t  n_q;
+    int32_t  n_tokens;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb11;
+    uint64_t nb21;
+    uint64_t nb1;
+    uint64_t nb2;
+    float    eps;
+    float    scale;
+} ggml_metal_kargs_depth_mix;
+
+typedef struct {
     int64_t ne;
 } ggml_metal_kargs_silu_back;
 

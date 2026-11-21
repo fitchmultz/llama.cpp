@@ -232,6 +232,9 @@ ggml_tensor * llama_model_inkling2::graph::mix_states(ggml_tensor * states, ggml
 // attention over the depth: mix the earlier block outputs and cur with learned queries
 ggml_tensor * llama_model_inkling2::graph::mix(ggml_tensor * blocks_norm, ggml_tensor * cur, ggml_tensor * query) {
     ggml_tensor * cur_norm = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), 1e-6f);
+    if (!blocks_norm && query->ne[1] == 1) {
+        return cur_norm;
+    }
     ggml_tensor * states   = blocks_norm ? ggml_concat(ctx0, blocks_norm, cur_norm, 1) : cur_norm;
     ggml_tensor * states_T = ggml_cont(ctx0, ggml_transpose(ctx0, states));
 

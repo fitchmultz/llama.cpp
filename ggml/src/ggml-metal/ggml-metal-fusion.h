@@ -45,6 +45,9 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_SSM_CONV_RES,  // SSM_CONV + RESHAPE + ADD (residual) + SCALE
     GGML_METAL_FUSION_L2_CLIP,       // [MUL +] SQR + SUM_ROWS + SQRT + SCALE + FILL + DIV + CLAMP + MUL
     GGML_METAL_FUSION_LOOP_CONTROL,  // TANH + SCALE(-1,1) + MUL + TANH + MUL + ADD
+    GGML_METAL_FUSION_SITU,          // SCALE + TANH + SCALE + SIGMOID + MUL + [VIEW] + SCALE + TANH + SCALE + MUL
+    GGML_METAL_FUSION_MUL_SIGMOID,   // SIGMOID + MUL
+    GGML_METAL_FUSION_DEPTH_MIX,     // RMS_NORM + CONCAT + TRANSPOSE + CONT + [REPEAT] + MUL_MAT + SOFT_MAX + MUL_MAT
     GGML_METAL_FUSION_MUL_MAT_ADD,   // MUL_MAT + ADD (residual added in the few-row MMA store)
 } ggml_metal_fusion_id;
 

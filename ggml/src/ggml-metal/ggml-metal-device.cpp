@@ -2325,6 +2325,39 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_loop_control(ggm
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_situ(ggml_metal_library_t lib) {
+    const char * name = "kernel_situ_f32_4";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_sigmoid(ggml_metal_library_t lib) {
+    const char * name = "kernel_mul_sigmoid_f32_4";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_depth_mix(ggml_metal_library_t lib) {
+    const char * name = "kernel_depth_mix_f32_4";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_group_norm(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_GROUP_NORM);
 
