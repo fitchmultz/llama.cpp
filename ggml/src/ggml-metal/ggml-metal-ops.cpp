@@ -6017,18 +6017,21 @@ int ggml_metal_op_argmax(ggml_metal_op_t ctx, int idx) {
         npart = (int) std::min<int64_t>(N_ARGMAX_NPART_MAX, (ne00 + N_ARGMAX_CHUNK - 1)/N_ARGMAX_CHUNK);
     }
 
+    const bool has_gumbel = op->src[1] != nullptr;
+
     ggml_metal_kargs_argmax args = {
         /*.ne00  = */ ne00,
         /*.nb01  = */ nb01,
         /*.npart = */ npart,
         /*.ne01  = */ ne01,
+        /*.nb11  = */ has_gumbel ? op->src[1]->nb[1] : 0,
     };
 
     const size_t smem = 32*(sizeof(float) + sizeof(int32_t));
 
     if (npart > 1) {
-        auto pipeline_part = ggml_metal_library_get_pipeline_argmax_part(lib);
-        auto pipeline_final = ggml_metal_library_get_pipeline_argmax_final(lib);
+        auto pipeline_part  = has_gumbel ? ggml_metal_library_get_pipeline_argmax_gumbel_part(lib) : ggml_metal_library_get_pipeline_argmax_part(lib);
+        auto pipeline_final = has_gumbel ? ggml_metal_library_get_pipeline_argmax_final_first(lib) : ggml_metal_library_get_pipeline_argmax_final(lib);
 
         ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
         ggml_metal_buffer_id bid_tmp = bid_dst;
@@ -6038,6 +6041,9 @@ int ggml_metal_op_argmax(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
         ggml_metal_encoder_set_buffer  (enc, bid_tmp, 2);
+        if (has_gumbel) {
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 3);
+        }
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
         ggml_metal_encoder_dispatch_threadgroups(enc, npart, nrows, 1, 256, 1, 1);
 
@@ -6058,7 +6064,7 @@ int ggml_metal_op_argmax(ggml_metal_op_t ctx, int idx) {
         return 1;
     }
 
-    auto pipeline = ggml_metal_library_get_pipeline_argmax(lib, op);
+    auto pipeline = has_gumbel ? ggml_metal_library_get_pipeline_argmax_gumbel(lib) : ggml_metal_library_get_pipeline_argmax(lib, op);
 
     int nth = 32; // SIMD width
     while (nth < ne00 && nth*ne01*ne02*ne03 < 256) {
@@ -6069,6 +6075,9 @@ int ggml_metal_op_argmax(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+    if (has_gumbel) {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 3);
+    }
 
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 

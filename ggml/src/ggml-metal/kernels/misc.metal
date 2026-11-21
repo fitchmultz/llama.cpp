@@ -194,6 +194,227 @@ kernel void kernel_argmax_final_f32(
     }
 }
 
+static inline float gumbel_noise_f32(uint32_t seed, uint32_t idx) {
+    uint32_t h = seed ^ (idx * 0x9e3779b9u + 0x85ebca6bu);
+    h ^= h >> 16;
+    h *= 0x7feb352du;
+    h ^= h >> 15;
+    h *= 0x846ca68bu;
+    h ^= h >> 16;
+    // v in [2^-24, 1 - 2^-24], exact in FP32
+    float v = (float(h >> 9) + 0.5f) * (1.0f / 8388608.0f);
+    // e = -log(1 - v) ~ Exp(1), avoiding fast-math cancellation near v = 0
+    float e = (v < 1e-3f) ? (v + 0.5f * v * v) : -log(1.0f - v);
+    return -log(e);
+}
+
+kernel void kernel_argmax_gumbel_f32(
+        constant ggml_metal_kargs_argmax & args,
+        device   const char * src0,
+        device         char * dst,
+        device   const char * src1,
+        threadgroup    char * shmem [[threadgroup(0)]],
+        uint  tgpig[[threadgroup_position_in_grid]],
+        uint  tpitg[[thread_position_in_threadgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint    ntg[[threads_per_threadgroup]]) {
+    device const float * x_row = (device const float *) (src0 + tgpig * args.nb01);
+    device const float * ctrl  = (device const float *) (src1 + tgpig * args.nb11);
+    const float    inv_temp = ctrl[0];
+    const uint32_t seed     = as_type<uint32_t>(ctrl[1]);
+
+    float   lmax = -INFINITY;
+    int32_t larg = INT_MAX;
+
+    for (int i00 = tpitg; i00 < args.ne00; i00 += ntg) {
+        const float val = inv_temp > 0.0f ? (x_row[i00] * inv_temp + gumbel_noise_f32(seed, (uint32_t) i00)) : x_row[i00];
+        if (val > lmax || (val == lmax && i00 < larg)) {
+            lmax = val;
+            larg = i00;
+        }
+    }
+
+    float max_val = simd_max(lmax);
+    int32_t arg_val = simd_min(select(INT_MAX, larg, lmax == max_val));
+
+    device int32_t * dst_i32 = (device int32_t *) dst;
+
+    threadgroup   float * shared_maxval = (threadgroup   float *) shmem;
+    threadgroup int32_t * shared_argmax = (threadgroup int32_t *) shmem + N_SIMDWIDTH;
+
+    if (ntg > N_SIMDWIDTH) {
+        if (sgitg == 0) {
+            shared_maxval[tiisg] = -INFINITY;
+            shared_argmax[tiisg] = INT_MAX;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tiisg == 0) {
+            shared_maxval[sgitg] = max_val;
+            shared_argmax[sgitg] = arg_val;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        max_val = shared_maxval[tiisg];
+        arg_val = shared_argmax[tiisg];
+
+        float max_val_reduced   = simd_max(max_val);
+        int32_t arg_val_reduced = simd_min(select(INT_MAX, arg_val, max_val == max_val_reduced));
+
+        if (tpitg == 0) {
+            dst_i32[tgpig] = arg_val_reduced;
+        }
+
+        return;
+    }
+
+    if (tpitg == 0) {
+        dst_i32[tgpig] = arg_val;
+    }
+}
+
+kernel void kernel_argmax_gumbel_part_f32(
+        constant ggml_metal_kargs_argmax & args,
+        device   const char * src0,
+        device         char * tmp,
+        device   const char * src1,
+        threadgroup    char * shmem [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint3  ntg[[threads_per_threadgroup]]) {
+    const int row   = tgpig.y;
+    const int part  = tgpig.x;
+    const int ne00  = (int) args.ne00;
+    const int npart = (int) args.npart;
+    const int chunk = (ne00 + npart - 1) / npart;
+    const int start = part * chunk;
+    const int end   = min(start + chunk, ne00);
+
+    device const float * x_row = (device const float *) (src0 + row * args.nb01);
+    device const float * ctrl  = (device const float *) (src1 + row * args.nb11);
+    const float    inv_temp = ctrl[0];
+    const uint32_t seed     = as_type<uint32_t>(ctrl[1]);
+
+    float   lmax = -INFINITY;
+    int32_t larg = INT_MAX;
+
+    for (int i00 = start + tpitg.x; i00 < end; i00 += ntg.x) {
+        const float val = inv_temp > 0.0f ? (x_row[i00] * inv_temp + gumbel_noise_f32(seed, (uint32_t) i00)) : x_row[i00];
+        if (val > lmax || (val == lmax && i00 < larg)) {
+            lmax = val;
+            larg = i00;
+        }
+    }
+
+    float max_val = simd_max(lmax);
+    int32_t arg_val = simd_min(select(INT_MAX, larg, lmax == max_val));
+
+    threadgroup   float * shared_maxval = (threadgroup   float *) shmem;
+    threadgroup int32_t * shared_argmax = (threadgroup int32_t *) shmem + N_SIMDWIDTH;
+
+    if (ntg.x > N_SIMDWIDTH) {
+        if (sgitg == 0) {
+            shared_maxval[tiisg] = -INFINITY;
+            shared_argmax[tiisg] = INT_MAX;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tiisg == 0) {
+            shared_maxval[sgitg] = max_val;
+            shared_argmax[sgitg] = arg_val;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        max_val = shared_maxval[tiisg];
+        arg_val = shared_argmax[tiisg];
+
+        float max_val_reduced   = simd_max(max_val);
+        int32_t arg_val_reduced = simd_min(select(INT_MAX, arg_val, max_val == max_val_reduced));
+
+        max_val = max_val_reduced;
+        arg_val = arg_val_reduced;
+    }
+
+    if (tpitg.x == 0) {
+        device float * tmp_max   = (device float *) tmp;
+        device int32_t * tmp_arg = (device int32_t *) tmp + npart * (int) args.ne01;
+
+        tmp_max[row*npart + part] = max_val;
+        tmp_arg[row*npart + part] = arg_val;
+    }
+}
+
+kernel void kernel_argmax_final_first_f32(
+        constant ggml_metal_kargs_argmax & args,
+        device   const char * tmp,
+        device         char * dst,
+        threadgroup    char * shmem [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint3  ntg[[threads_per_threadgroup]]) {
+    const int row   = tgpig.x;
+    const int npart = (int) args.npart;
+
+    device const float * tmp_max   = (device const float *) tmp;
+    device const int32_t * tmp_arg = (device const int32_t *) tmp + npart * (int) args.ne01;
+
+    float   lmax = -INFINITY;
+    int32_t larg = INT_MAX;
+
+    for (int i = tpitg.x; i < npart; i += ntg.x) {
+        const float   v = tmp_max[row*npart + i];
+        const int32_t a = tmp_arg[row*npart + i];
+        if (v > lmax || (v == lmax && a < larg)) {
+            lmax = v;
+            larg = a;
+        }
+    }
+
+    float max_val = simd_max(lmax);
+    int32_t arg_val = simd_min(select(INT_MAX, larg, lmax == max_val));
+
+    threadgroup   float * shared_maxval = (threadgroup   float *) shmem;
+    threadgroup int32_t * shared_argmax = (threadgroup int32_t *) shmem + N_SIMDWIDTH;
+
+    if (ntg.x > N_SIMDWIDTH) {
+        if (sgitg == 0) {
+            shared_maxval[tiisg] = -INFINITY;
+            shared_argmax[tiisg] = INT_MAX;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tiisg == 0) {
+            shared_maxval[sgitg] = max_val;
+            shared_argmax[sgitg] = arg_val;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        max_val = shared_maxval[tiisg];
+        arg_val = shared_argmax[tiisg];
+
+        float max_val_reduced   = simd_max(max_val);
+        int32_t arg_val_reduced = simd_min(select(INT_MAX, arg_val, max_val == max_val_reduced));
+
+        max_val = max_val_reduced;
+        arg_val = arg_val_reduced;
+    }
+
+    if (tpitg.x == 0) {
+        ((device int32_t *) dst)[row] = arg_val;
+    }
+}
+
 kernel void kernel_diag_f32(
         constant ggml_metal_kargs_diag & args,
         device   const char * src0,

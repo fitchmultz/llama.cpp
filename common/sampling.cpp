@@ -730,6 +730,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 }
 
 static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
+    if (id >= 0 && (size_t) id < n && data[id].id == id) {
+        return data[id].p;
+    }
     for (size_t k = 0; k < n; ++k) {
         if (data[k].id == id) {
             return data[k].p;
@@ -751,8 +754,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     // draws come from the sampler's own stream, so they stay independent of what was drafted
     std::uniform_real_distribution<float> uni(0.0f, 1.0f);
 
-    std::vector<llama_token_data> residual;
-
     std::vector<llama_token_data> cand; // candidate array masked by the grammar, if there is one
 
     size_t i = 0;
@@ -760,7 +761,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         // leaves the target distribution in the candidate array
         const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
-        const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+        const auto * cur_p = common_sampler_get_candidates(gsmpl, false);
         const auto & q     = draft_q[i];
 
         const bool masked = !grammar_first && grammar_should_apply(gsmpl);
@@ -793,10 +794,14 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         const float q_x = prob_of(q.data(), q.size(), draft[i]);
 
         float p_x = 0.0f;
-        for (size_t k = 0; k < cur_p->size; ++k) {
-            if (cur_p->data[k].id == draft[i]) {
-                p_x = p_of(k);
-                break;
+        if (draft[i] >= 0 && (size_t) draft[i] < cur_p->size && cur_p->data[draft[i]].id == draft[i]) {
+            p_x = p_of(draft[i]);
+        } else {
+            for (size_t k = 0; k < cur_p->size; ++k) {
+                if (cur_p->data[k].id == draft[i]) {
+                    p_x = p_of(k);
+                    break;
+                }
             }
         }
 
@@ -807,25 +812,30 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         }
 
         // rejected: tokens outside q's support keep all of p
-        residual.clear();
+        const llama_token_data * q_data = q.data();
+        const size_t q_size = q.size();
         float sum = 0.0f;
+        llama_token last_pos_id = id_tgt;
         for (size_t k = 0; k < cur_p->size; ++k) {
-            const float r = p_of(k) - prob_of(q.data(), q.size(), cur_p->data[k].id);
+            const float r = p_of(k) - prob_of(q_data, q_size, cur_p->data[k].id);
             if (r > 0.0f) {
-                residual.push_back({ cur_p->data[k].id, 0.0f, r });
                 sum += r;
+                last_pos_id = cur_p->data[k].id;
             }
         }
 
         llama_token id = id_tgt;
         if (sum > 0.0f) {
             float u = uni(gsmpl->rng) * sum;
-            id = residual.back().id;
-            for (const auto & e : residual) {
-                u -= e.p;
-                if (u <= 0.0f) {
-                    id = e.id;
-                    break;
+            id = last_pos_id;
+            for (size_t k = 0; k < cur_p->size; ++k) {
+                const float r = p_of(k) - prob_of(q_data, q_size, cur_p->data[k].id);
+                if (r > 0.0f) {
+                    u -= r;
+                    if (u <= 0.0f) {
+                        id = cur_p->data[k].id;
+                        break;
+                    }
                 }
             }
         }

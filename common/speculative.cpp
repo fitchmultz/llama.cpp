@@ -1490,6 +1490,9 @@ public:
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
 
+        const bool sample_rnn = has_rnn_context && params.probabilistic;
+        std::vector<std::vector<float>> sample_cfgs(n_seq);
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
@@ -1505,18 +1508,38 @@ public:
             const int32_t n_block_tokens = has_rnn_context ? block_size : n_draft + (sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
+
+            if (sample_rnn) {
+                if (rnn_seed[seq_id] != dp.seed) {
+                    rnn_seed[seq_id] = dp.seed;
+                    rnn_rng[seq_id].seed(dp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : dp.seed ^ 0x85ebca6bu);
+                }
+                auto & cfg = sample_cfgs[seq_id];
+                cfg.assign((size_t) n_embd_dec, 0.0f);
+                const float inv_t = (dp.result_q && dp.temp > 0.0f) ? (1.0f / dp.temp) : 0.0f;
+                for (int32_t s = 0; s < block_size - 1 && 2*s + 1 < n_embd_dec; ++s) {
+                    cfg[2*s + 0] = inv_t;
+                    const uint32_t seed_s = (inv_t > 0.0f) ? rnn_rng[seq_id]() : 0u;
+                    std::memcpy(&cfg[2*s + 1], &seed_s, sizeof(uint32_t));
+                }
+            }
+
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                // the greedy recurrent head only chains the rows that are read: the anchor and the first n_max masks
-                const bool output = !has_rnn_context || params.probabilistic || i <= params.n_max;
+                // the chained recurrent head only chains the rows that are read: the anchor and the first n_max masks
+                const bool output = !has_rnn_context || i <= params.n_max;
                 const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, output);
                 if (has_rnn_context) {
-                    // the context features of the committed anchor condition the recurrent head
-                    const llama_pos pos = dp.pos0 - 1;
-                    const size_t slot = (size_t) seq_id * context_rows + (size_t) pos % context_rows;
-                    if (pos < 0 || context_pos[slot] != pos) {
-                        throw std::runtime_error("DSpark committed context feature is missing");
+                    if (sample_rnn && i == 1) {
+                        batch.set_embd_state(idx, { sample_cfgs[seq_id].data(), 1, (size_t) n_embd_dec });
+                    } else {
+                        // the context features of the committed anchor condition the recurrent head
+                        const llama_pos pos = dp.pos0 - 1;
+                        const size_t slot = (size_t) seq_id * context_rows + (size_t) pos % context_rows;
+                        if (pos < 0 || context_pos[slot] != pos) {
+                            throw std::runtime_error("DSpark committed context feature is missing");
+                        }
+                        batch.set_embd_state(idx, { context_embd.data() + slot * (size_t) n_embd_dec, 1, (size_t) n_embd_dec });
                     }
-                    batch.set_embd_state(idx, { context_embd.data() + slot * (size_t) n_embd_dec, 1, (size_t) n_embd_dec });
                 }
             }
         }
@@ -1525,7 +1548,6 @@ public:
             return;
         }
 
-        const bool sample_rnn = has_rnn_context && params.probabilistic;
         // decode all sequence's noise block in a single batch
         int ret = sample_rnn ? llama_draft_backbone(ctx_dft, batch.get())
                              : llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
@@ -1535,15 +1557,7 @@ public:
         }
 
         const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
-        std::vector<float> hidden, base_logits;
-        if (sample_rnn) {
-            const float * rows = llama_get_embeddings_nextn(ctx_dft);
-            hidden.assign(rows, rows + size_t(batch.size())*n_embd_dec);
-            for (int32_t i = 0; i < batch.size(); ++i) {
-                const float * logits = llama_get_logits_ith(ctx_dft, i);
-                base_logits.insert(base_logits.end(), logits, logits + n_vocab);
-            }
-        }
+        const float * h_nextn_rows = sample_rnn ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
@@ -1559,52 +1573,20 @@ public:
             auto & result = *dp.result;
 
             if (sample_rnn) {
-                if (rnn_seed[seq_id] != dp.seed) {
-                    rnn_seed[seq_id] = dp.seed;
-                    rnn_rng[seq_id].seed(dp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : dp.seed ^ 0x85ebca6bu);
+                if (!h_nextn_rows) {
+                    LOG_ERR("%s: DSpark chained probabilistic sampling missing h_nextn\n", __func__);
+                    continue;
                 }
-                const float temp = dp.temp > 0.0f ? dp.temp : 1.0f;
-                const size_t slot = size_t(seq_id)*context_rows + size_t(dp.pos0 - 1)%context_rows;
-                const llama_embd context = { context_embd.data() + slot*n_embd_dec, 1, size_t(n_embd_dec) };
-                std::vector<float> state(markov_rank, 0.0f), logits;
-                llama_token prev = dp.id_last;
                 for (int32_t i = 1; i < std::min(n_block_tokens, params.n_max + 1); ++i) {
-                    const size_t row = beg + i;
-                    if (!llama_draft_step(ctx_dft, prev,
-                            { hidden.data() + row*n_embd_dec, 1, size_t(n_embd_dec) },
-                            { base_logits.data() + row*n_vocab, 1, size_t(n_vocab) }, context, state, logits)) {
-                        result.clear();
-                        if (dp.result_q) {
-                            dp.result_q->clear();
-                        }
-                        LOG_ERR("%s: DSpark recurrent head failed\n", __func__);
-                        break;
-                    }
-                    const float maximum = *std::max_element(logits.begin(), logits.end());
-                    std::vector<llama_token_data> q(n_vocab);
-                    double sum = 0.0;
-                    for (int32_t k = 0; k < n_vocab; ++k) {
-                        const float p = std::exp((logits[k] - maximum)/temp);
-                        q[k] = { k, logits[k], p };
-                        sum += p;
-                    }
-                    if (!std::isfinite(sum) || sum <= 0.0) {
-                        throw std::runtime_error("DSpark produced non-finite proposal probabilities");
-                    }
-                    for (auto & candidate : q) {
-                        candidate.p /= sum;
-                    }
-                    double u = std::uniform_real_distribution<double>(0.0, 1.0)(rnn_rng[seq_id]);
-                    prev = std::max_element(logits.begin(), logits.end()) - logits.begin();
-                    for (const auto & candidate : q) {
-                        u -= candidate.p;
-                        if (u < 0.0) {
-                            prev = candidate.id;
-                            break;
-                        }
-                    }
-                    result.push_back(prev);
+                    const int32_t row = beg + i;
+                    const llama_token tok = (llama_token) std::lround(h_nextn_rows[(size_t) row * n_embd_dec + markov_rank]);
+                    result.push_back(tok);
                     if (dp.result_q) {
+                        const float * probs = llama_get_logits_ith(ctx_dft, row);
+                        std::vector<llama_token_data> q(n_vocab);
+                        for (int32_t k = 0; k < n_vocab; ++k) {
+                            q[k] = { k, 0.0f, probs[k] };
+                        }
                         dp.result_q->push_back(std::move(q));
                     }
                 }

@@ -1482,6 +1482,7 @@ typedef struct {
     uint64_t nb01;
     int64_t npart;
     int64_t ne01;
+    uint64_t nb11;
 } ggml_metal_kargs_argmax;
 
 typedef struct {

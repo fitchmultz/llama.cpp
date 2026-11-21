@@ -1048,12 +1048,8 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     GGML_ASSERT(target->tok_embd && target->tok_norm && target->output);
     ggml_tensor * tokens;
     ggml_tensor * f_rnn = nullptr;
-    if (params.gtype == LLM_GRAPH_TYPE_DRAFT_BACKBONE) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
-        tokens = inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-        ggml_set_input(tokens);
-        res->add_input(std::move(inp));
-    } else {
+    const bool chained_prob = (params.gtype == LLM_GRAPH_TYPE_DRAFT_BACKBONE);
+    {
         auto inp = std::make_unique<llm_graph_input_embd_h>(n_embd, n_embd);
         tokens = inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
         ggml_set_input(tokens);
@@ -1093,7 +1089,7 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     }
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     res->t_embd = cur;
-    if (params.gtype == LLM_GRAPH_TYPE_DRAFT_BACKBONE || block > hparams.dflash_block_size) {
+    if (block > hparams.dflash_block_size || (chained_prob && block < 2)) {
         auto * base = build_lora_mm(target->output, cur, target->output_s);
         ggml_prec_set_acc(base, GGML_PREC_F32);
         res->t_h_nextn = cur;
@@ -1104,30 +1100,45 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     ggml_tensor * base = nullptr;
     auto * state = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, rank, nb), 0.0f);
     auto * states = ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0);
-    auto * logits = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, target->output->ne[1], nb), 0.0f);
+    auto * logits = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, chained_prob ? hparams.n_vocab_unpadded : target->output->ne[1], nb), 0.0f);
     const auto column = [&](ggml_tensor * t, int64_t i) {
         return ggml_cont(ctx0, ggml_view_2d(ctx0, t, t->ne[0], nb, block*t->nb[1], i*t->nb[1]));
     };
     auto * context = column(f_rnn, 0);
+    auto * sample_cfg = chained_prob ? column(f_rnn, 1) : nullptr;
     auto * prev = ids;
     // only the output rows are chained: the caller marks the anchor and the masks it reads (a prefix of each block)
     // (at least one chained row, so that every graph input stays in use)
     const int64_t n_out = n_outputs % nb == 0 && n_outputs/nb >= 2 ? std::min<int64_t>(n_outputs/nb, block) : block;
     ggml_tensor * tie_rank = nullptr;
-    if (n_out > 2) {
+    if (!chained_prob && n_out > 2) {
         tie_rank = ggml_arange(ctx0, 0, hparams.n_vocab_unpadded, 1);
         tie_rank = ggml_scale_bias(ctx0, tie_rank, -1.0f, hparams.n_vocab_unpadded);
     }
     for (int64_t i = 1; i < n_out; ++i) {
         auto * col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i), base, context);
-        states = ggml_concat(ctx0, states, ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0), 1);
-        logits = ggml_concat(ctx0, logits, col, 1);
-        if (i + 1 < n_out) {
-            // Select the first maximum, independent of backend argmax tie order.
+        if (chained_prob) {
             auto * valid = ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0));
-            auto * maximum = ggml_pool_1d(ctx0, valid, GGML_OP_POOL_MAX, valid->ne[0], 1, 0);
-            auto * is_max = ggml_scale_bias(ctx0, ggml_step(ctx0, ggml_sub(ctx0, ggml_repeat(ctx0, maximum, valid), valid)), -1.0f, 1.0f);
-            prev = ggml_argmax(ctx0, ggml_mul(ctx0, is_max, tie_rank));
+            auto * step_ctrl = ggml_view_2d(ctx0, sample_cfg, 2, nb, sample_cfg->nb[1], 2*(i - 1)*sizeof(float));
+            auto * sampled = ggml_argmax(ctx0, valid);
+            sampled->src[1] = step_ctrl;
+            prev = sampled;
+            auto * tok_f32 = ggml_reshape_2d(ctx0, ggml_cast(ctx0, prev, GGML_TYPE_F32), 1, nb);
+            auto * st_tok  = ggml_concat(ctx0, state, tok_f32, 0);
+            states = ggml_concat(ctx0, states, ggml_pad(ctx0, st_tok, n_embd - rank - 1, 0, 0, 0), 1);
+            auto * inv_t = ggml_cont(ctx0, ggml_view_2d(ctx0, step_ctrl, 1, nb, step_ctrl->nb[1], 0));
+            auto * probs = ggml_soft_max(ctx0, ggml_mul(ctx0, valid, inv_t));
+            logits = ggml_concat(ctx0, logits, probs, 1);
+        } else {
+            states = ggml_concat(ctx0, states, ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0), 1);
+            logits = ggml_concat(ctx0, logits, col, 1);
+            if (i + 1 < n_out) {
+                // Select the first maximum, independent of backend argmax tie order.
+                auto * valid = ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0));
+                auto * maximum = ggml_pool_1d(ctx0, valid, GGML_OP_POOL_MAX, valid->ne[0], 1, 0);
+                auto * is_max = ggml_scale_bias(ctx0, ggml_step(ctx0, ggml_sub(ctx0, ggml_repeat(ctx0, maximum, valid), valid)), -1.0f, 1.0f);
+                prev = ggml_argmax(ctx0, ggml_mul(ctx0, is_max, tie_rank));
+            }
         }
     }
     const auto block_order = [&](ggml_tensor * t, int64_t n) {
@@ -1142,5 +1153,5 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     cb(res->t_h_nextn, "dspark_chain_state", -1);
     ggml_build_forward_expand(gf, res->t_h_nextn);
     logits = block_order(logits, n_out);
-    res->t_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, logits, hparams.n_vocab_unpadded, nb*n_out, logits->nb[1], 0));
+    res->t_logits = chained_prob ? logits : ggml_cont(ctx0, ggml_view_2d(ctx0, logits, hparams.n_vocab_unpadded, nb*n_out, logits->nb[1], 0));
 }
