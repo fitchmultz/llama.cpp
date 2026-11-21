@@ -3245,6 +3245,47 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     const int16_t r2 = ne12/ne02;
     const int16_t r3 = ne13/ne03;
 
+    // Exact FP32 tiled K=16 broadcast batched matmul (e.g. attn_rel_bias f32[16, 1024] x f32[16, 24, T])
+    if (op->type == GGML_TYPE_F32 &&
+        op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+        ne00 == 16 && ne10 == 16 &&
+        !ggml_is_transposed(op->src[0]) && !ggml_is_transposed(op->src[1]) &&
+        ne02 == 1 && ne03 == 1 && ne13 == 1 &&
+        nb00 == sizeof(float) && nb10 == sizeof(float) &&
+        nb01 % 16 == 0 && nb11 % 16 == 0 && nb12 % 16 == 0 &&
+        nb1 == (uint64_t) ne0 * sizeof(float) && nb2 == (uint64_t) ne1 * nb1 &&
+        ne01 >= 32 && (int64_t) ne11 * ne12 >= 32) {
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mm_k16(lib);
+
+        ggml_metal_kargs_mul_mm args = {
+            /*.ne00 =*/ ne00,
+            /*.ne02 =*/ ne02,
+            /*.nb01 =*/ nb01,
+            /*.nb02 =*/ nb02,
+            /*.nb03 =*/ nb03,
+            /*.ne12 =*/ ne12,
+            /*.nb10 =*/ nb10,
+            /*.nb11 =*/ nb11,
+            /*.nb12 =*/ nb12,
+            /*.nb13 =*/ nb13,
+            /*.ne0  =*/ ne0,
+            /*.ne1  =*/ ne1,
+            /*.r2   =*/ r2,
+            /*.r3   =*/ r3,
+        };
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+
+        const int64_t n_flat = (int64_t) ne11 * ne12;
+        ggml_metal_encoder_dispatch_threadgroups(enc, (int)((n_flat + 63) / 64), (ne01 + 63) / 64, 1, 32, pipeline.nsg, 1);
+        return 1;
+    }
+
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
     if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
@@ -3520,6 +3561,9 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_buffer_id bid_ids = bid_tpe;
         bid_ids.offs += ggml_metal_op_mul_mat_id_extra_tpe(op);
 
+        auto pipeline_mm = ggml_metal_library_get_pipeline_mul_mm_id(lib, op, w_scale != nullptr);
+        const int ntile = pipeline_mm.nr1;
+
         {
             ggml_metal_kargs_mul_mm_id_map0 args = {
                 ne10,
@@ -3531,7 +3575,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                 nb21,
             };
 
-            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ne02, ne20, 32);
+            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ne02, ne20, ntile);
 
             const size_t smem = pipeline.smem;
 
@@ -3573,7 +3617,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_op_concurrency_reset(ctx);
 
         {
-            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id(lib, op, w_scale != nullptr);
+            auto pipeline = pipeline_mm;
 
             ggml_metal_kargs_mul_mm_id args = {
                 /*.ne00  =*/ ne00,
@@ -3608,9 +3652,11 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-            const int max_tiles = (int) ggml_metal_op_mul_mat_id_max_tiles(op);
+            const int64_t n_rows    = (int64_t) ne20 * ne21;
+            const int64_t tiles_ub  = (n_rows + ntile - 1) / ntile + std::min<int64_t>(ne02, n_rows) - 1;
+            const int     max_tiles = (int) std::min<int64_t>(n_rows, tiles_ub);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, max_tiles, (ne01 + 63)/64, 1, 128, 1, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + 63)/64, max_tiles, 1, 128, 1, 1);
         }
     } else if (props_dev->has_simdgroup_reduction &&
                ne21 >= 2 && ne21 < 32 && ne20 * ne21 * 2 >= ne02 &&
