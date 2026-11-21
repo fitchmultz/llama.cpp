@@ -13,7 +13,10 @@ kernel void kernel_ssm_conv_f32_f32(
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]]) {
-    const int64_t ir = tgpig.x;
+    const int64_t ir = (int64_t) tgpig.x * ntg.x + tpitg.x;
+    if (ir >= args.ne01) {
+        return;
+    }
     const int64_t i2 = tgpig.y;
     const int64_t i3 = tgpig.z;
 
@@ -44,7 +47,10 @@ kernel void kernel_ssm_conv_f32_f32_4(
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]]) {
-    const int64_t ir = tgpig.x;
+    const int64_t ir = (int64_t) tgpig.x * ntg.x + tpitg.x;
+    if (ir >= args.ne01) {
+        return;
+    }
     const int64_t i2 = tgpig.y;
     const int64_t i3 = tgpig.z;
 

@@ -451,6 +451,48 @@ kernel void kernel_depth_mix_f32_4(
     }
 }
 
+kernel void kernel_concat_rms_norm_f32_4(
+        constant ggml_metal_kargs_concat_rms_norm & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]]) {
+    const int half_idx = tgpig.x;
+    const int tok      = tgpig.y;
+
+    device const float4 * x = (device const float4 *) ((half_idx == 0) ? (src0 + tok * args.nb02) : (src1 + tok * args.nb12));
+    device       float4 * y = (device       float4 *) (dst + tok * args.nb2 + half_idx * args.nb1);
+
+    float ss = 0.0f;
+    for (int i = tpitg.x; i < args.ne00; i += 256) {
+        const float4 v = x[i];
+        ss += dot(v, v);
+    }
+    ss = simd_sum(ss);
+
+    threadgroup float shmem[9];
+    if (tiisg == 0) {
+        shmem[sgitg] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        float t = (tiisg < 8) ? shmem[tiisg] : 0.0f;
+        t = simd_sum(t);
+        if (tiisg == 0) {
+            shmem[8] = rsqrt(t / float(args.ne00 * 4) + args.eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv_rms = shmem[8];
+
+    for (int i = tpitg.x; i < args.ne00; i += 256) {
+        y[i] = x[i] * inv_rms;
+    }
+}
+
 constant bool FC_group_norm_flat [[function_constant(FC_GROUP_NORM + 0)]];
 
 kernel void kernel_group_norm_f32(

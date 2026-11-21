@@ -1529,6 +1529,15 @@ typedef struct {
 } ggml_metal_kargs_depth_mix;
 
 typedef struct {
+    int32_t  ne00;
+    uint64_t nb02;
+    uint64_t nb12;
+    uint64_t nb1;
+    uint64_t nb2;
+    float    eps;
+} ggml_metal_kargs_concat_rms_norm;
+
+typedef struct {
     int64_t ne;
 } ggml_metal_kargs_silu_back;
 

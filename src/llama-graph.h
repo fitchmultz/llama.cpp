@@ -326,6 +326,9 @@ public:
     ggml_tensor * s_copy_main; // I32 [n_seqs]
     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
 
+    // cached per-buffer {K-1, ..., 0} slot-order tensor for build_conv_state_store
+    std::vector<std::pair<ggml_backend_buffer_t, ggml_tensor *>> s_slot_rev_cache;
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse

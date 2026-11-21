@@ -565,6 +565,42 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
 int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
+    if (ctx->use_fusion()) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_CONCAT_RMS_NORM) {
+            ggml_tensor * rms = ctx->node(idx + 1);
+            if (!ggml_metal_op_concurrency_check(ctx, rms)) {
+                ggml_metal_op_concurrency_reset(ctx);
+            }
+            ctx->count_fusions(fusion);
+
+            const ggml_tensor * a = op->src[0];
+            const ggml_tensor * b = op->src[1];
+            auto pipeline = ggml_metal_library_get_pipeline_concat_rms_norm(ctx->lib);
+
+            ggml_metal_kargs_concat_rms_norm args = {
+                /*.ne00 =*/ (int32_t) (a->ne[0] / 4),
+                /*.nb02 =*/ a->nb[2],
+                /*.nb12 =*/ b->nb[2],
+                /*.nb1  =*/ rms->nb[1],
+                /*.nb2  =*/ rms->nb[2],
+                /*.eps  =*/ ggml_get_op_params_f32(rms, 0),
+            };
+
+            ggml_metal_encoder_t enc = ctx->enc;
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(a),   1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(b),   2);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rms), 3);
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, 2, (int) a->ne[2], 1, 256, 1, 1);
+
+            return 2;
+        }
+    }
+
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
@@ -2116,8 +2152,9 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
 
     const ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(n_fuse > 1 ? ctx->node(idx + n_fuse - 1) : op);
 
-    // Use batched kernel for prefill (ne1 > 1) to reduce threadgroup dispatch overhead
-    const bool use_batched = (ne1 > 1);
+    // Use batched kernel only when ne1 >= 32 (full simdgroup per threadgroup);
+    // smaller batches (decode ne1=1, speculative verify ne1=2..16) pack 256 channels per threadgroup
+    const bool use_batched = (ne1 >= 32);
 
     if (use_batched) {
         // Determine the smallest power of 2 that's >= ne1, but <= 256
@@ -2125,10 +2162,7 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
         if      (ne1 > 128) BATCH_SIZE = 256;
         else if (ne1 > 64 ) BATCH_SIZE = 128;
         else if (ne1 > 32 ) BATCH_SIZE = 64;
-        else if (ne1 > 16 ) BATCH_SIZE = 32;
-        else if (ne1 > 8  ) BATCH_SIZE = 16;
-        else if (ne1 > 4  ) BATCH_SIZE = 8;
-        else                BATCH_SIZE = 2;
+        else                BATCH_SIZE = 32;
 
         auto pipeline = ggml_metal_library_get_pipeline_ssm_conv_batched(lib, op, BATCH_SIZE, (int32_t) ne10, use_silu, use_res);
 
@@ -2151,7 +2185,9 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
         ggml_metal_encoder_set_buffer(enc, bid_dst, 3);
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne1, ne02, 1, 1, 1);
+        const int nth = 256;
+        const int ntg = (ne01 + nth - 1) / nth;
+        ggml_metal_encoder_dispatch_threadgroups(enc, ntg, ne1, ne02, nth, 1, 1);
     }
 
     if (n_fuse > 1 && ggml_metal_fusion_info_debug(ctx->finfo) > 1) {

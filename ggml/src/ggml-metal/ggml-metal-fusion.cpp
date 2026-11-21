@@ -564,6 +564,41 @@ static bool ggml_metal_fusion_check_depth_mix(
     return ggml_can_fuse_subgraph_ext(gf, raw_idxs, raw_count, fusion->ops_all.data(), outputs, 1);
 }
 
+// CONCAT(dim=1, ne01=1, ne11=1) + RMS_NORM (e.g. loop control)
+static bool ggml_metal_fusion_check_concat_rms_norm(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * cat = nodes[0];
+    const ggml_tensor * rms = nodes[1];
+    if (ggml_get_op_params_i32(cat, 0) != 1 || rms->src[0] != cat) {
+        return false;
+    }
+    const ggml_tensor * a = cat->src[0];
+    const ggml_tensor * b = cat->src[1];
+    if (!a || !b) {
+        return false;
+    }
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(rms)) {
+        return false;
+    }
+    if (a->ne[0] % 4 != 0 || a->ne[0] != b->ne[0] || a->ne[1] != 1 || b->ne[1] != 1 ||
+        a->ne[2] != b->ne[2] || a->ne[3] != 1 || b->ne[3] != 1 || rms->ne[1] != 2) {
+        return false;
+    }
+    return true;
+}
+
 // ADD x N: each ADD reads the previous ADD as src0, and all addends must share layout
 // (and, in FULL mode, live in the same Metal buffer)
 static bool ggml_metal_fusion_check_add_chain(
@@ -1238,6 +1273,9 @@ static const std::vector<ggml_op> ops_depth_mix_n = {
     GGML_OP_RMS_NORM, GGML_OP_CONCAT, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_REPEAT,
     GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT
 };
+static const std::vector<ggml_op> ops_concat_rms_norm = {
+    GGML_OP_CONCAT, GGML_OP_RMS_NORM
+};
 
 static const std::vector<ggml_op> ops_moe_reduce_2 = {
     GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_ADD
@@ -1323,8 +1361,9 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_SITU,          ops_situ_view,     {}, true,  ggml_metal_fusion_check_situ },
     { GGML_METAL_FUSION_SITU,          ops_situ,          {}, true,  ggml_metal_fusion_check_situ },
     { GGML_METAL_FUSION_MUL_SIGMOID,   ops_mul_sigmoid,   {}, false, ggml_metal_fusion_check_mul_sigmoid },
-    { GGML_METAL_FUSION_DEPTH_MIX,     ops_depth_mix_n,   {}, true,  ggml_metal_fusion_check_depth_mix },
-    { GGML_METAL_FUSION_DEPTH_MIX,     ops_depth_mix_1,   {}, true,  ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX,       ops_depth_mix_n,     {}, true,  ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX,       ops_depth_mix_1,     {}, true,  ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_CONCAT_RMS_NORM, ops_concat_rms_norm, {}, false, ggml_metal_fusion_check_concat_rms_norm },
 
     { GGML_METAL_FUSION_MUL_MAT_ADD, ops_mul_mat_add, {}, false, ggml_metal_fusion_check_mul_mat_add },
 };
