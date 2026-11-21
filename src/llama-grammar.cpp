@@ -1581,26 +1581,53 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
         }
     }
 
-    std::vector<std::pair<std::vector<uint32_t>, llama_partial_utf8>> candidates_decoded;
-    candidates_decoded.reserve(cur_p->size);
-
     llama_grammar_candidates candidates_grammar;
     candidates_grammar.reserve(cur_p->size);
 
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        const llama_token id      = cur_p->data[i].id;
-        const std::string & piece = grammar.vocab->token_to_piece(id);
+    std::vector<std::pair<std::vector<uint32_t>, llama_partial_utf8>> candidates_decoded;
 
-        if (grammar.vocab->is_eog(id)) {
-            if (!allow_eog) {
+    if (grammar.partial_utf8.n_remain == 0) {
+        const auto & cache = grammar.vocab->get_grammar_utf8_cache();
+        const auto * entries = cache.entries.data();
+        const size_t n_entries = cache.entries.size();
+        const uint32_t * cp_base = cache.code_points.data();
+
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            const llama_token id = cur_p->data[i].id;
+            const auto & e = (id >= 0 && (size_t) id < n_entries) ? entries[id] : cache.entries.at(id);
+
+            if (e.flags & 1) {
+                if (!allow_eog) {
+                    cur_p->data[i].logit = -INFINITY;
+                }
+            } else if (e.flags & 2) {
                 cur_p->data[i].logit = -INFINITY;
+            } else {
+                candidates_grammar.push_back({ i, cp_base + e.offset, { e.partial_value, e.partial_remain }, id });
             }
-        } else if (piece.empty() || piece[0] == 0) {
-            cur_p->data[i].logit = -INFINITY;
-        } else {
-            candidates_decoded.push_back(decode_utf8(piece, grammar.partial_utf8));
-            candidates_grammar.push_back({ i, candidates_decoded.back().first.data(), candidates_decoded.back().second, id });
         }
+    } else {
+        candidates_decoded.reserve(cur_p->size);
+
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            const llama_token id      = cur_p->data[i].id;
+            const std::string & piece = grammar.vocab->token_to_piece(id);
+
+            if (grammar.vocab->is_eog(id)) {
+                if (!allow_eog) {
+                    cur_p->data[i].logit = -INFINITY;
+                }
+            } else if (piece.empty() || piece[0] == 0) {
+                cur_p->data[i].logit = -INFINITY;
+            } else {
+                candidates_decoded.push_back(decode_utf8(piece, grammar.partial_utf8));
+                candidates_grammar.push_back({ i, candidates_decoded.back().first.data(), candidates_decoded.back().second, id });
+            }
+        }
+    }
+
+    if (candidates_grammar.empty()) {
+        return;
     }
 
     const auto rejects = llama_grammar_reject_candidates(*grammar.rules, grammar.stacks, candidates_grammar);

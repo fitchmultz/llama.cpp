@@ -3863,6 +3863,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--decode-share"}, "RATIO",
+        string_format("while slots generate and prompts are pending, follow every prompt-admitting iteration with decode-only iterations for RATIO times its wall time (default: %.2f, 0.0 = disabled; change at runtime via POST /props with --props)\n", params.decode_share),
+        [](common_params & params, const std::string & value) {
+            const float v = std::stof(value);
+            if (!(v >= 0.0f)) {
+                throw std::invalid_argument("--decode-share must be >= 0");
+            }
+            params.decode_share = v;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DECODE_SHARE"));
+    add_opt(common_arg(
         {"--lora-init-without-apply"},
         string_format("load LoRA adapters without applying them (apply later via POST /lora-adapters) (default: %s)", params.lora_init_without_apply ? "enabled" : "disabled"),
         [](common_params & params) {

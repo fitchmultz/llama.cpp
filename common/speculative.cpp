@@ -211,6 +211,8 @@ struct common_speculative_impl {
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
+    virtual bool need_prompt() const { return false; }
+
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
@@ -1489,6 +1491,22 @@ public:
         // record where each block starts and its size
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
+        std::vector<int32_t> n_draft_seq(n_seq,  0);
+
+        int32_t n_draft_batch = 0;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            const auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+            int32_t nd = params.n_max;
+            if (dp.n_max > 0) {
+                nd = std::min(nd, dp.n_max);
+            }
+            nd = std::max<int32_t>(1, std::min<int32_t>(nd, n_max));
+            n_draft_seq[seq_id] = nd;
+            n_draft_batch = std::max(n_draft_batch, nd);
+        }
 
         const bool sample_rnn = has_rnn_context && params.probabilistic;
         std::vector<std::vector<float>> sample_cfgs(n_seq);
@@ -1503,7 +1521,7 @@ public:
 
             const int32_t n = (int32_t) dp.pos0;
 
-            const int32_t n_draft = params.n_max;
+            const int32_t n_draft = n_draft_seq[seq_id];
             // the recurrent head reads a full block
             const int32_t n_block_tokens = has_rnn_context ? block_size : n_draft + (sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
@@ -1525,8 +1543,8 @@ public:
             }
 
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                // the chained recurrent head only chains the rows that are read: the anchor and the first n_max masks
-                const bool output = !has_rnn_context || i <= params.n_max;
+                // the chained recurrent head only chains the rows that are read: the anchor and the first n_draft_batch masks
+                const bool output = !has_rnn_context || i <= n_draft_batch;
                 const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, output);
                 if (has_rnn_context) {
                     if (sample_rnn && i == 1) {
@@ -1567,6 +1585,7 @@ public:
 
             const int32_t beg            = i_block_beg[seq_id];
             const int32_t n_block_tokens = n_block[seq_id];
+            const int32_t n_draft        = n_draft_seq[seq_id];
 
             auto * smpl = smpls[seq_id].get();
 
@@ -1577,15 +1596,28 @@ public:
                     LOG_ERR("%s: DSpark chained probabilistic sampling missing h_nextn\n", __func__);
                     continue;
                 }
-                for (int32_t i = 1; i < std::min(n_block_tokens, params.n_max + 1); ++i) {
+                for (int32_t i = 1; i < std::min(n_block_tokens, n_draft + 1); ++i) {
                     const int32_t row = beg + i;
                     const llama_token tok = (llama_token) std::lround(h_nextn_rows[(size_t) row * n_embd_dec + markov_rank]);
                     result.push_back(tok);
                     if (dp.result_q) {
                         const float * probs = llama_get_logits_ith(ctx_dft, row);
-                        std::vector<llama_token_data> q(n_vocab);
-                        for (int32_t k = 0; k < n_vocab; ++k) {
-                            q[k] = { k, 0.0f, probs[k] };
+                        std::vector<llama_token_data> q;
+                        if (dp.result_q_pool && !dp.result_q_pool->empty()) {
+                            q = std::move(dp.result_q_pool->back());
+                            dp.result_q_pool->pop_back();
+                        }
+                        if (q.size() == (size_t) n_vocab) {
+                            llama_token_data * qd = q.data();
+                            for (int32_t k = 0; k < n_vocab; ++k) {
+                                qd[k].p = probs[k];
+                            }
+                        } else {
+                            q.resize(n_vocab);
+                            llama_token_data * qd = q.data();
+                            for (int32_t k = 0; k < n_vocab; ++k) {
+                                qd[k] = { k, 0.0f, probs[k] };
+                            }
                         }
                         dp.result_q->push_back(std::move(q));
                     }
@@ -1597,7 +1629,7 @@ public:
                 // greedy read of the chained block: take the first maximum directly (as in the RNN conditioning graph)
                 // instead of running the sampler over the whole vocabulary
                 const int32_t n_vocab_dft = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
-                for (int32_t i = 1; i < std::min(n_block_tokens, 1 + params.n_max); ++i) {
+                for (int32_t i = 1; i < std::min(n_block_tokens, 1 + n_draft); ++i) {
                     const float * logits = llama_get_logits_ith(ctx_dft, beg + i);
                     llama_token best = 0;
                     float maximum = logits[0];
@@ -1619,7 +1651,7 @@ public:
             const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
             // bonus-anchor drafts read the mask positions only, like DFlash
             const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
-            for (int32_t i = i_draft_beg; i < std::min(n_block_tokens, i_draft_beg + params.n_max); ++i) {
+            for (int32_t i = i_draft_beg; i < std::min(n_block_tokens, i_draft_beg + n_draft); ++i) {
                 const int32_t idx = beg + i;
 
                 if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
@@ -2555,6 +2587,8 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
         // noop
     }
+
+    bool need_prompt() const override { return true; }
 };
 
 struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
@@ -2609,6 +2643,8 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
 
         common_ngram_map_accept(config[seq_id], n_accepted);
     }
+
+    bool need_prompt() const override { return true; }
 };
 
 struct common_speculative_impl_ngram_mod : public common_speculative_impl {
@@ -2745,6 +2781,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         return true;
     }
 
+    bool need_prompt() const override { return true; }
+
     void draft(common_speculative_draft_params_vec & dparams) override {
         assert(dparams.size() == n_seq);
 
@@ -2871,6 +2909,8 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
         sinfos[seq_id].cache_size = 0;
     }
+
+    bool need_prompt() const override { return true; }
 
     void draft_one(
             llama_seq_id seq_id,
@@ -3601,6 +3641,20 @@ common_speculative_draft_params & common_speculative_get_draft_params(
     GGML_ASSERT(seq_id < (llama_seq_id) spec->dparams.size());
 
     return spec->dparams[seq_id];
+}
+
+bool common_speculative_need_prompt(const common_speculative * spec) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    for (const auto & impl : spec->impls) {
+        if (impl->need_prompt()) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt) {

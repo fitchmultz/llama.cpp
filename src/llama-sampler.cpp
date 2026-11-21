@@ -21,6 +21,10 @@
 #include <unordered_set>
 #include <stdexcept>
 
+#if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#endif
+
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 template<typename T>
 struct ring_buffer {
@@ -298,6 +302,45 @@ static void llama_sampler_softmax_impl(llama_token_data_array * cur_p, bool do_s
     if (do_sort && !cur_p->sorted) {
         llama_token_data_array_partial_sort_inplace(cur_p, cur_p->size);
     }
+
+#if defined(__APPLE__)
+    const size_t n = cur_p->size;
+    if (n >= 1024 && n <= (size_t) INT_MAX) {
+        thread_local std::vector<float> buf;
+        buf.resize(n);
+        float * b = buf.data();
+        llama_token_data * d = cur_p->data;
+        for (size_t i = 0; i < n; ++i) {
+            b[i] = d[i].logit;
+        }
+
+        float max_l = d[0].logit;
+        if (!cur_p->sorted) {
+            vDSP_maxv(b, 1, &max_l, (vDSP_Length) n);
+        }
+
+        if (std::isfinite(max_l)) {
+            const float neg_max = -max_l;
+            vDSP_vsadd(b, 1, &neg_max, b, 1, (vDSP_Length) n);
+
+            int ni = (int) n;
+            vvexpf(b, b, &ni);
+
+            float cum_sum = 0.0f;
+            vDSP_sve(b, 1, &cum_sum, (vDSP_Length) n);
+
+            if (cum_sum > 0.0f && std::isfinite(cum_sum)) {
+                const float inv_sum = 1.0f / cum_sum;
+                vDSP_vsmul(b, 1, &inv_sum, b, 1, (vDSP_Length) n);
+
+                for (size_t i = 0; i < n; ++i) {
+                    d[i].p = b[i];
+                }
+                return;
+            }
+        }
+    }
+#endif
 
     float max_l = cur_p->data[0].logit;
     if (!cur_p->sorted) {

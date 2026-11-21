@@ -734,6 +734,7 @@ struct common_params {
     bool media_allow_private_urls = false; // allow http(s) media URLs on local or private addresses
 
     float slot_prompt_similarity = 0.1f;
+    float decode_share           = 0.0f; // decode-only wall time owed per second of prompt-admitting iterations while slots generate (0 = disabled)
 
     // batched-bench params
     bool is_pp_shared   = false;

@@ -76,12 +76,18 @@ struct common_speculative_draft_params {
     // candidate distribution per drafted token; set it to make draft-simple, draft-mtp, draft-dflash2 and Inkling2 draft-dspark sample
     std::vector<std::vector<llama_token_data>> * result_q = nullptr;
 
+    // optional reusable backing pool for result_q buffers to avoid per-step 2+ MB allocations
+    std::vector<std::vector<llama_token_data>> * result_q_pool = nullptr;
+
     // the target's temp and seed, read only when the drafter samples probabilistically
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
+
+// return true if any active speculative implementation reads common_speculative_draft_params::prompt
+bool common_speculative_need_prompt(const common_speculative * spec);
 
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);

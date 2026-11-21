@@ -304,6 +304,7 @@ struct server_slot {
 
     // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
     std::vector<std::vector<llama_token_data>> spec_draft_q;
+    std::vector<std::vector<llama_token_data>> spec_draft_q_pool;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
@@ -449,6 +450,8 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_draft_q.clear();
+            spec_draft_q_pool.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -1047,6 +1050,9 @@ public:
     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
     const llama_vocab * vocab = nullptr;
 
+    // ratio of decode-only wall time owed per prompt-admitting iteration (--decode-share, POST /props)
+    std::atomic<float> decode_share { -1.0f };
+
     // prompt of the "asr" chat template, for live ASR
     llama_tokens asr_prompt;
 
@@ -1144,6 +1150,12 @@ private:
     json json_ui_settings = json::object();
 
     server_slot_sched slot_sched;
+
+    // decode share: prompt admission waits while the decode-only time owed by earlier
+    // prompt-admitting iterations is positive (see --decode-share)
+    int64_t t_share_debt_us = 0;
+    bool    share_active    = false;
+    bool    share_mixed     = false;
 
     std::string model_name; // name of the loaded model, to be used by API
     std::set<std::string> model_aliases; // additional names for the model
@@ -1463,6 +1475,9 @@ private:
 
         // Necessary similarity of prompt for slot selection
         slot_sched.slot_prompt_similarity = params_base.slot_prompt_similarity;
+        if (decode_share.load() < 0.0f) {
+            decode_share.store(params_base.decode_share);
+        }
 
         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
 
@@ -3548,6 +3563,8 @@ private:
             }
         }
 
+        const int64_t t_iteration_start = ggml_time_us();
+
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
@@ -3634,6 +3651,13 @@ private:
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
+        }
+
+        if (share_active) {
+            const int64_t t_iteration = ggml_time_us() - t_iteration_start;
+            t_share_debt_us = share_mixed
+                ? t_share_debt_us + (int64_t) (decode_share.load() * (float) t_iteration)
+                : std::max<int64_t>(0, t_share_debt_us - t_iteration);
         }
     }
 
@@ -3835,7 +3859,10 @@ private:
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
 
-                    // stale candidates: a replay never reads them, a new draft refills them
+                    // recycle backing vectors before clearing so drafting avoids per-step 2+ MB allocs
+                    for (auto & q : slot.spec_draft_q) {
+                        slot.spec_draft_q_pool.push_back(std::move(q));
+                    }
                     slot.spec_draft_q.clear();
 
                     if (!slot.spec_draft.empty()) {
@@ -3855,20 +3882,23 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        if (common_speculative_need_prompt(spec.get())) {
+                            slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        }
 
                         const bool spec_reject = slot.use_spec_rejection();
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
-                            /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
-                            /* .pos0     = */ slot.prompt.tokens.pos_next(),
-                            /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
-                            /* .result   = */ &slot.spec_draft,
-                            /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
-                            /* .temp     = */ slot.task->params.sampling.temp,
-                            /* .seed     = */ slot.task->params.sampling.seed,
+                            /* .drafting      = */ true,
+                            /* .n_max         = */ n_draft_max,
+                            /* .pos0          = */ slot.prompt.tokens.pos_next(),
+                            /* .id_last       = */ slot.sampled,
+                            /* .prompt        = */ &slot.spec_prompt,
+                            /* .result        = */ &slot.spec_draft,
+                            /* .result_q      = */ spec_reject ? &slot.spec_draft_q : nullptr,
+                            /* .result_q_pool = */ spec_reject ? &slot.spec_draft_q_pool : nullptr,
+                            /* .temp          = */ slot.task->params.sampling.temp,
+                            /* .seed          = */ slot.task->params.sampling.seed,
                         };
 
                         drafting.push_back(&slot);
@@ -3941,11 +3971,21 @@ private:
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
+        bool has_prompt = false;
+        for (const auto & slot : slots) {
+            has_prompt |= slot.is_processing() && (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT);
+        }
+        share_active = decode_share.load() > 0.0f && params_base.cont_batching && !generating.empty() && has_prompt;
+        if (!share_active) {
+            t_share_debt_us = 0;
+        }
+        const int32_t n_generated = batch.size();
+
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
         // next, batch any pending prompts without exceeding n_batch
-        if (params_base.cont_batching || batch.size() == 0) {
+        if ((params_base.cont_batching || batch.size() == 0) && !(share_active && t_share_debt_us > 0)) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
@@ -4546,6 +4586,8 @@ private:
                 }
             });
         }
+
+        share_mixed = batch.size() > n_generated;
     }
 
     // see https://github.com/ggml-org/llama.cpp/pull/29969
@@ -4887,7 +4929,12 @@ private:
 
             // verify and try to accept the draft
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                // the recurrent snapshots are only guaranteed for batches of up to n_rs_seq + 1 tokens, so a longer draft uses its checkpoint
+                const bool use_ckpt_tgt =
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
+
+                common_sampler_ptr smpl_save(use_ckpt_tgt ? common_sampler_clone(slot.smpl.get()) : nullptr);
 
                 GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
@@ -4913,11 +4960,6 @@ private:
                 GGML_ASSERT(accepted.size() >= 1);
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
-
-                // the recurrent snapshots are only guaranteed for batches of up to n_rs_seq + 1 tokens, so a longer draft uses its checkpoint
-                const bool use_ckpt_tgt =
-                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
 
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
@@ -5873,13 +5915,23 @@ void server_routes::init_routes() {
         return res;
     };
 
-    this->post_props = [this](const server_http_req &) {
-        auto res = create_response();
+    this->post_props = [this](const server_http_req & req) {
+        // decode_share is an atomic outside the model state: changing it must not wake a sleeping server
+        auto res = create_response(true);
         if (!params.endpoint_props) {
             res->error(format_error_response("This server does not support changing global properties. Start it with `--props`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
         // update any props here
+        const json data = req.body.empty() ? json::object() : json::parse(req.body);
+        if (data.contains("decode_share")) {
+            const float value = data.at("decode_share").get<float>();
+            if (!(value >= 0.0f)) {
+                res->error(format_error_response("decode_share must be >= 0", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            ctx_server.decode_share.store(value);
+        }
 
         res->ok({{ "success", true }});
         return res;

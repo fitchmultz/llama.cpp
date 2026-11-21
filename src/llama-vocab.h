@@ -204,6 +204,20 @@ struct llama_vocab {
     // use cached data
     const std::string & token_to_piece(llama_token token) const;
 
+    struct grammar_utf8_entry {
+        uint32_t offset;
+        uint32_t partial_value;
+        int32_t  partial_remain;
+        uint8_t  flags; // bit 0: is_eog, bit 1: is_empty_or_nul
+    };
+
+    struct grammar_utf8_cache {
+        std::vector<uint32_t>           code_points;
+        std::vector<grammar_utf8_entry> entries;
+    };
+
+    const grammar_utf8_cache & get_grammar_utf8_cache() const;
+
     int32_t detokenize(
             const llama_token * tokens,
                       int32_t   n_tokens,

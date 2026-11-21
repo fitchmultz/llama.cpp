@@ -14,50 +14,28 @@
 // Tests that common_sampler_sample_and_accept_n_rejection preserves the target
 // distribution regardless of what the draft distribution Q looks like.
 
-static int test_speculative_rejection_sampling(common_params & params, int n_trials) {
-    params.sampling.backend_sampling = false;
-    auto llama_init = common_init_from_params(params);
-
-    auto * model_tgt = llama_init->model();
-    auto * ctx_tgt   = llama_init->context();
-    if (!model_tgt || !ctx_tgt) {
-        LOG_ERR("failed to initialize target model and context\n");
+static int check_rejection_distribution(
+        const llama_model * model_tgt,
+        llama_context     * ctx_tgt,
+        common_params_sampling sampling,
+        bool                grammar_first_ref,
+        bool                grammar_first_test,
+        int                 n_trials,
+        const char        * label) {
+    // Reference sampler computes the exact target distribution.
+    common_sampler_ptr smpl_ref(common_sampler_init(model_tgt, sampling));
+    if (!smpl_ref) {
+        LOG_ERR("%s: failed to initialize reference sampler\n", label);
         return 1;
     }
 
-    const llama_tokens prompt = { 1, 2, 3, 1, 2 };
+    common_sampler_sample(smpl_ref.get(), ctx_tgt, -1, grammar_first_ref);
+    const llama_token_data_array * dist_tgt = common_sampler_get_candidates(smpl_ref.get(), true);
 
-    // Process the prompt with the target model to get its true distribution for
-    // the position right after the prompt.
-    common_batch batch = common_batch_get_one(ctx_tgt, prompt);
-    if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
-        LOG_ERR("failed to decode the test prompt\n");
-        return 1;
-    }
-
-    common_params_sampling sampling;
-    sampling.seed     = 18;
-    sampling.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
-    sampling.temp     = 1.0f;
-
-    // Initialize the sampler for the target model.
-    common_sampler_ptr smpl(common_sampler_init(model_tgt, sampling));
-    if (!smpl) {
-        LOG_ERR("failed to initialize target sampler\n");
-        return 1;
-    }
-
-    // Sample once so the sampler chain runs and populates cur_p. We don't need
-    // the returned token id itself so the return value is ignored.
-    common_sampler_sample(smpl.get(), ctx_tgt, -1);
-
-    // Get the target candidates distribution in sorted order.
-    const llama_token_data_array * dist_tgt = common_sampler_get_candidates(smpl.get(), true);
-
-    // Clone smpl before the trial loop starts. We need the dist_tgt pointer to stay valid.
-    common_sampler_ptr smpl_verify(common_sampler_clone(smpl.get()));
+    // Verification sampler uses the same sampling config (without grammar_first when testing the fast path).
+    common_sampler_ptr smpl_verify(common_sampler_init(model_tgt, sampling));
     if (!smpl_verify) {
-        LOG_ERR("failed to clone target sampler\n");
+        LOG_ERR("%s: failed to initialize verification sampler\n", label);
         return 1;
     }
 
@@ -75,12 +53,36 @@ static int test_speculative_rejection_sampling(common_params & params, int n_tri
         q[i].logit = 0.0f;
     }
 
+    // Build a lookup of top target tokens to occasionally bias q near p (exercising both fast-accept and slow-path).
+    std::vector<llama_token> hot_tokens;
+    for (size_t i = 0; i < std::min<size_t>(dist_tgt->size, 16); ++i) {
+        if (dist_tgt->data[i].p > 0.0f) {
+            hot_tokens.push_back(dist_tgt->data[i].id);
+        }
+    }
+
     for (int trial = 0; trial < n_trials; ++trial) {
         float q_sum = 0.0f;
 
-        for (auto & td : q) {
-            td.p = uni(rng);
-            q_sum += td.p;
+        if ((trial & 1) == 0 && !hot_tokens.empty()) {
+            // Concentrated draft Q around hot valid tokens + a few random tokens to exercise fast-accept heavily.
+            for (auto & td : q) {
+                td.p = 1e-6f;
+                q_sum += td.p;
+            }
+            for (llama_token id : hot_tokens) {
+                const float w = 0.05f + uni(rng);
+                q[id].p += w;
+                q_sum += w;
+            }
+            const llama_token noise = (llama_token) (rng() % (uint32_t) n_vocab);
+            q[noise].p += 0.5f;
+            q_sum += 0.5f;
+        } else {
+            for (auto & td : q) {
+                td.p = uni(rng);
+                q_sum += td.p;
+            }
         }
 
         const float inv_sum = 1.0f / q_sum;
@@ -107,23 +109,24 @@ static int test_speculative_rejection_sampling(common_params & params, int n_tri
         const std::vector<int> idxs = { -1, -1 };
 
         const std::vector<llama_token> result =
-            common_sampler_sample_and_accept_n_rejection(smpl_verify.get(), ctx_tgt, idxs, draft, draft_q, false);
+            common_sampler_sample_and_accept_n_rejection(smpl_verify.get(), ctx_tgt, idxs, draft, draft_q, grammar_first_test);
 
         token_counts[result[0]]++;
     }
 
-    LOG("\n");
-    LOG("Empirical vs target distribution after %d trials:\n", n_trials);
+    LOG("\n[%s] Empirical vs target distribution after %d trials:\n", label, n_trials);
 
-    bool   ok      = true;
-    size_t covered = 0;
+    bool   ok          = true;
+    size_t covered     = 0;
+    float  tail_p_tgt  = 0.0f;
+    size_t tail_count  = 0;
+    const float min_bin_p = 5.0f / n_trials; // normal-approx validity threshold for per-token 6-sigma check
 
     auto get_count_for = [&](llama_token id) -> int {
         const auto it = token_counts.find(id);
         return it != token_counts.end() ? it->second : 0;
     };
 
-    // Iterate over the target distribution
     for (size_t i = 0; i < dist_tgt->size; ++i) {
         const llama_token id  = dist_tgt->data[i].id;
         const float       p_t = dist_tgt->data[i].p;
@@ -132,31 +135,93 @@ static int test_speculative_rejection_sampling(common_params & params, int n_tri
         const float p_e   = (float) count / n_trials;
         const float diff  = std::fabs(p_t - p_e);
 
-        // We only deal with ids in dist_tgt, and if each trial result was one
-        // of dist_tgt's candidates then covered ends up equal to the number of
-        // trials. If not this inconsistency tells us how many trials produced
-        // a token outside of the target's distribution.
         covered += count;
+
+        if (p_t == 0.0f) {
+            if (count > 0) {
+                LOG_ERR("[%s] token %d: forbidden token sampled %d times (target = 0)\n", label, id, count);
+                ok = false;
+            }
+            continue;
+        }
+
+        if (p_t < min_bin_p) {
+            tail_p_tgt += p_t;
+            tail_count += count;
+            continue;
+        }
 
         const float standard_error = std::sqrt(p_t * (1.0f - p_t) / n_trials);
         const float tolerance      = 6.0f * standard_error;
 
-        LOG("token %3d : target = %f, empirical = %f, diff = %f, tol = %f\n", id, p_t, p_e, diff, tolerance);
+        if (p_t >= 0.005f || diff > tolerance) {
+            LOG("token %5d : target = %f, empirical = %f, diff = %f, tol = %f\n", id, p_t, p_e, diff, tolerance);
+        }
 
         if (diff > tolerance) {
-            LOG_ERR("token %d: empirical probability %f too far from target %f (diff %f > tol %f)\n",
-                    id, p_e, p_t, diff, tolerance);
+            LOG_ERR("[%s] token %d: empirical probability %f too far from target %f (diff %f > tol %f)\n",
+                    label, id, p_e, p_t, diff, tolerance);
+            ok = false;
+        }
+    }
+
+    if (tail_p_tgt > 0.0f) {
+        const float tail_p_e  = (float) tail_count / n_trials;
+        const float tail_diff = std::fabs(tail_p_tgt - tail_p_e);
+        const float tail_tol  = 6.0f * std::sqrt(tail_p_tgt * (1.0f - tail_p_tgt) / n_trials);
+        LOG("tail  bucket: target = %f, empirical = %f, diff = %f, tol = %f\n", tail_p_tgt, tail_p_e, tail_diff, tail_tol);
+        if (tail_diff > tail_tol) {
+            LOG_ERR("[%s] tail bucket: empirical probability %f too far from target %f (diff %f > tol %f)\n",
+                    label, tail_p_e, tail_p_tgt, tail_diff, tail_tol);
             ok = false;
         }
     }
 
     if (covered != (size_t) n_trials) {
-        LOG_ERR("%zu of %d trials produced a token outside dist_tgt's candidates\n",
-                (size_t) n_trials - covered, n_trials);
+        LOG_ERR("[%s] %zu of %d trials produced a token outside dist_tgt's candidates\n",
+                label, (size_t) n_trials - covered, n_trials);
         ok = false;
     }
 
-    if (!ok) {
+    return ok ? 0 : 1;
+}
+
+static int test_speculative_rejection_sampling(common_params & params, int n_trials) {
+    params.sampling.backend_sampling = false;
+    auto llama_init = common_init_from_params(params);
+
+    auto * model_tgt = llama_init->model();
+    auto * ctx_tgt   = llama_init->context();
+    if (!model_tgt || !ctx_tgt) {
+        LOG_ERR("failed to initialize target model and context\n");
+        return 1;
+    }
+
+    const llama_tokens prompt = { 1, 2, 3, 1, 2 };
+
+    // Process the prompt with the target model to get its true distribution for
+    // the position right after the prompt.
+    common_batch batch = common_batch_get_one(ctx_tgt, prompt);
+    if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+        LOG_ERR("failed to decode the test prompt\n");
+        return 1;
+    }
+
+    common_params_sampling sampling;
+    sampling.seed     = 18;
+    sampling.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
+    sampling.temp     = 1.0f;
+
+    if (check_rejection_distribution(model_tgt, ctx_tgt, sampling, false, false, n_trials, "unconstrained") != 0) {
+        return 1;
+    }
+
+    // Grammar-masked rejection sampling: stationary grammar (accepts [a-zA-Z0-9 ] or EOG at every step)
+    // verifies the single-token fast path preserves the exact grammar-masked target distribution and
+    // never emits grammar-rejected tokens.
+    common_params_sampling sampling_grmr = sampling;
+    sampling_grmr.grammar = common_grammar(COMMON_GRAMMAR_TYPE_USER, "root ::= [a-zA-Z0-9 ]*");
+    if (check_rejection_distribution(model_tgt, ctx_tgt, sampling_grmr, true, false, n_trials, "grammar-masked") != 0) {
         return 1;
     }
 

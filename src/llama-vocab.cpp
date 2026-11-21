@@ -18,6 +18,7 @@
 #include <forward_list>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <queue>
 #include <set>
 #include <string_view>
@@ -2158,6 +2159,8 @@ struct llama_vocab::impl {
 
     std::vector<llama_token> cache_special_tokens;
     std::vector<std::string> cache_token_to_piece; // llama_token_to_piece(special = true);
+    mutable std::once_flag                    cache_grammar_utf8_once;
+    mutable llama_vocab::grammar_utf8_cache   cache_grammar_utf8;
     struct pair_hash {
         size_t operator()(const std::pair<std::string, std::string> & p) const {
             return std::hash<std::string>{}(p.first) ^  //create some hash for pair
@@ -2230,6 +2233,8 @@ struct llama_vocab::impl {
 
     // use cached data
     const std::string & token_to_piece(llama_token token) const;
+
+    const llama_vocab::grammar_utf8_cache & get_grammar_utf8_cache() const;
 
     int32_t detokenize(
             const llama_token * tokens,
@@ -4217,6 +4222,66 @@ const std::string & llama_vocab::impl::token_to_piece(llama_token token) const {
     return cache_token_to_piece.at(token);
 }
 
+const llama_vocab::grammar_utf8_cache & llama_vocab::impl::get_grammar_utf8_cache() const {
+    std::call_once(cache_grammar_utf8_once, [&]() {
+        static const int lookup[] = { 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 3, 4 };
+        const size_t n_tokens = cache_token_to_piece.size();
+        cache_grammar_utf8.entries.resize(n_tokens);
+        cache_grammar_utf8.code_points.reserve(n_tokens * 5);
+
+        for (size_t id = 0; id < n_tokens; ++id) {
+            const llama_token tok = (llama_token) id;
+            if (is_eog(tok)) {
+                cache_grammar_utf8.entries[id] = { 0, 0, 0, 1 };
+                continue;
+            }
+            const std::string & piece = cache_token_to_piece[id];
+            if (piece.empty() || piece[0] == 0) {
+                cache_grammar_utf8.entries[id] = { 0, 0, 0, 2 };
+                continue;
+            }
+
+            const uint32_t offset = (uint32_t) cache_grammar_utf8.code_points.size();
+            const char * pos = piece.c_str();
+            uint32_t value = 0;
+            int n_remain = 0;
+            bool invalid = false;
+
+            while (*pos != 0) {
+                const uint8_t first_byte = static_cast<uint8_t>(*pos);
+                const uint8_t highbits   = first_byte >> 4;
+                n_remain = lookup[highbits] - 1;
+
+                if (n_remain < 0) {
+                    cache_grammar_utf8.code_points.resize(offset);
+                    cache_grammar_utf8.code_points.push_back(0);
+                    cache_grammar_utf8.entries[id] = { offset, 0, n_remain, 0 };
+                    invalid = true;
+                    break;
+                }
+
+                const uint8_t mask = (1 << (7 - n_remain)) - 1;
+                value = first_byte & mask;
+
+                ++pos;
+                while (*pos != 0 && n_remain > 0) {
+                    value = (value << 6) + (static_cast<uint8_t>(*pos) & 0x3F);
+                    ++pos;
+                    --n_remain;
+                }
+                if (n_remain == 0) {
+                    cache_grammar_utf8.code_points.push_back(value);
+                }
+            }
+            if (!invalid) {
+                cache_grammar_utf8.code_points.push_back(0);
+                cache_grammar_utf8.entries[id] = { offset, value, n_remain, 0 };
+            }
+        }
+    });
+    return cache_grammar_utf8;
+}
+
 int32_t llama_vocab::impl::detokenize(
                const llama_token * tokens,
                          int32_t   n_tokens,
@@ -4686,6 +4751,10 @@ std::vector<llama_token> llama_vocab::tokenize(
 
 const std::string & llama_vocab::token_to_piece(llama_token token) const {
     return pimpl->token_to_piece(token);
+}
+
+const llama_vocab::grammar_utf8_cache & llama_vocab::get_grammar_utf8_cache() const {
+    return pimpl->get_grammar_utf8_cache();
 }
 
 int32_t llama_vocab::token_to_piece(llama_token token, char * buf, int32_t length, int32_t lstrip, bool special) const {
