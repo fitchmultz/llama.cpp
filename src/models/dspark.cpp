@@ -944,7 +944,8 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llm_graph_p
 }
 
 static ggml_tensor * build_inkling2_head(llm_graph_context & g, const llama_model & model, const llama_model & target,
-        ggml_tensor * prev, ggml_tensor * & state, ggml_tensor * hidden, ggml_tensor * base, ggml_tensor * context) {
+        ggml_tensor * prev, ggml_tensor * & state, ggml_tensor * hidden, ggml_tensor * base, ggml_tensor * context,
+        ggml_tensor * markov_lm = nullptr, ggml_tensor * markov_bias = nullptr) {
     auto * ctx0 = g.ctx0;
     const int64_t rank = model.hparams.dspark_markov_rank;
     auto * joint = ggml_concat(ctx0, state, ggml_get_rows(ctx0, model.dspark_markov_w1, prev), 0);
@@ -957,19 +958,29 @@ static ggml_tensor * build_inkling2_head(llm_graph_context & g, const llama_mode
     auto * candidate = ggml_tanh(ctx0, chunk(1));
     state = ggml_add(ctx0, candidate, ggml_mul(ctx0, gate, ggml_sub(ctx0, state, candidate)));
     auto * latent = ggml_tanh(ctx0, chunk(2));
-    auto * correction = ggml_add(ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
     ggml_tensor * logits;
-    if (base == nullptr) {
-        // one LM head product per step: W*(hidden + correction) == W*hidden + W*correction
-        logits = g.build_lora_mm(target.output, ggml_add(ctx0, hidden, correction), target.output_s);
-        ggml_prec_set_acc(logits, GGML_PREC_F32);
-    } else {
-        auto * bias = g.build_lora_mm(target.output, correction, target.output_s);
+    if (markov_lm != nullptr && base != nullptr && base->ne[0] == markov_lm->ne[1]) {
+        // Exact rank-256 factorization: (W @ H) @ latent is 9x smaller than W @ (H @ latent)
+        auto * bias = ggml_mul_mat(ctx0, markov_lm, latent);
         ggml_prec_set_acc(bias, GGML_PREC_F32);
-        if (bias->ne[0] != base->ne[0]) {
-            bias = ggml_cont(ctx0, ggml_view_2d(ctx0, bias, base->ne[0], bias->ne[1], bias->nb[1], 0));
+        if (markov_bias != nullptr) {
+            bias = ggml_add(ctx0, bias, markov_bias);
         }
         logits = ggml_add(ctx0, base, bias);
+    } else {
+        auto * correction = ggml_add(ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
+        if (base == nullptr) {
+            // one LM head product per step: W*(hidden + correction) == W*hidden + W*correction
+            logits = g.build_lora_mm(target.output, ggml_add(ctx0, hidden, correction), target.output_s);
+            ggml_prec_set_acc(logits, GGML_PREC_F32);
+        } else {
+            auto * bias = g.build_lora_mm(target.output, correction, target.output_s);
+            ggml_prec_set_acc(bias, GGML_PREC_F32);
+            if (bias->ne[0] != base->ne[0]) {
+                bias = ggml_cont(ctx0, ggml_view_2d(ctx0, bias, base->ne[0], bias->ne[1], bias->nb[1], 0));
+            }
+            logits = ggml_add(ctx0, base, bias);
+        }
     }
     const float cap = model.hparams.f_final_logit_softcapping;
     return ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, logits, 1.0f/cap)), cap);
@@ -991,7 +1002,12 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
         auto * hidden = rows(rank, n_embd);
         auto * context = rows(rank + n_embd, n_embd);
         auto * base = rows(rank + 2*n_embd, hparams.n_vocab_unpadded);
-        res->t_logits = build_inkling2_head(*this, model, *llama_get_model(cparams.ctx_other), inp->tokens, state, hidden, base, context);
+        const auto * target = llama_get_model(cparams.ctx_other);
+        const bool use_factored = dspark_markov_lm != nullptr && dspark_markov_bias != nullptr &&
+                                  loras->empty() && !target->output_s;
+        res->t_logits = build_inkling2_head(*this, model, *target, inp->tokens, state, hidden, base, context,
+                use_factored ? dspark_markov_lm : nullptr,
+                use_factored ? dspark_markov_bias : nullptr);
         res->t_embd = res->t_h_nextn = ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0);
         cb(res->t_h_nextn, "dspark_chain_state", -1);
         ggml_build_forward_expand(gf, res->t_h_nextn);
@@ -1096,29 +1112,51 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
         res->t_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, base, hparams.n_vocab_unpadded, n_tokens, base->nb[1], 0));
         return;
     }
-    // the chained block folds the base logits into each step's LM head product; the anchor row is not a prediction
-    ggml_tensor * base = nullptr;
+    // the chained block computes all base logits in one batched LM-head product when rank-256 factorization is active;
+    // the anchor row is not a prediction
+    const int64_t n_out = n_outputs % nb == 0 && n_outputs/nb >= 2 ? std::min<int64_t>(n_outputs/nb, block) : block;
+    const bool use_factored = dspark_markov_lm != nullptr && loras->empty() && !target->output_s && n_out >= 2;
+    const int64_t n_draft = n_out - 1;
+    ggml_tensor * base_all = nullptr;
+    if (use_factored) {
+        // Compute target.output @ (cur[1..n_out-1] + dspark_hidden_out_b) ONCE for all draft steps!
+        auto * cur_draft = ggml_view_3d(ctx0, cur, n_embd, n_draft, nb,
+                cur->nb[1], block * cur->nb[1], cur->nb[1]);
+        cur_draft = ggml_reshape_2d(ctx0, ggml_cont(ctx0, cur_draft), n_embd, n_draft * nb);
+        cur_draft = ggml_add(ctx0, cur_draft, model.dspark_hidden_out_b);
+        base_all = build_lora_mm(target->output, cur_draft, target->output_s);
+        ggml_prec_set_acc(base_all, GGML_PREC_F32);
+    }
     auto * state = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, rank, nb), 0.0f);
     auto * states = ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0);
-    auto * logits = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, chained_prob ? hparams.n_vocab_unpadded : target->output->ne[1], nb), 0.0f);
+    auto * logits = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (chained_prob || use_factored) ? hparams.n_vocab_unpadded : target->output->ne[1], nb), 0.0f);
     const auto column = [&](ggml_tensor * t, int64_t i) {
         return ggml_cont(ctx0, ggml_view_2d(ctx0, t, t->ne[0], nb, block*t->nb[1], i*t->nb[1]));
     };
     auto * context = column(f_rnn, 0);
     auto * sample_cfg = chained_prob ? column(f_rnn, 1) : nullptr;
     auto * prev = ids;
-    // only the output rows are chained: the caller marks the anchor and the masks it reads (a prefix of each block)
-    // (at least one chained row, so that every graph input stays in use)
-    const int64_t n_out = n_outputs % nb == 0 && n_outputs/nb >= 2 ? std::min<int64_t>(n_outputs/nb, block) : block;
     ggml_tensor * tie_rank = nullptr;
     if (!chained_prob && n_out > 2) {
         tie_rank = ggml_arange(ctx0, 0, hparams.n_vocab_unpadded, 1);
         tie_rank = ggml_scale_bias(ctx0, tie_rank, -1.0f, hparams.n_vocab_unpadded);
     }
     for (int64_t i = 1; i < n_out; ++i) {
-        auto * col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i), base, context);
+        ggml_tensor * base_i = nullptr;
+        if (use_factored) {
+            if (nb == 1) {
+                base_i = ggml_view_1d(ctx0, base_all, hparams.n_vocab_unpadded, (i - 1) * base_all->nb[1]);
+            } else {
+                base_i = ggml_cont(ctx0, ggml_view_2d(ctx0, base_all, hparams.n_vocab_unpadded, nb,
+                        n_draft * base_all->nb[1], (i - 1) * base_all->nb[1]));
+            }
+        }
+        auto * col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i), base_i, context,
+                use_factored ? dspark_markov_lm : nullptr, nullptr);
         if (chained_prob) {
-            auto * valid = ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0));
+            auto * valid = (col->ne[0] == hparams.n_vocab_unpadded)
+                ? col
+                : ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0));
             auto * step_ctrl = ggml_view_2d(ctx0, sample_cfg, 2, nb, sample_cfg->nb[1], 2*(i - 1)*sizeof(float));
             auto * sampled = ggml_argmax(ctx0, valid);
             sampled->src[1] = step_ctrl;
@@ -1134,7 +1172,9 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
             logits = ggml_concat(ctx0, logits, col, 1);
             if (i + 1 < n_out) {
                 // Select the first maximum, independent of backend argmax tie order.
-                auto * valid = ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0));
+                auto * valid = (col->ne[0] == hparams.n_vocab_unpadded)
+                    ? col
+                    : ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0));
                 auto * maximum = ggml_pool_1d(ctx0, valid, GGML_OP_POOL_MAX, valid->ne[0], 1, 0);
                 auto * is_max = ggml_scale_bias(ctx0, ggml_step(ctx0, ggml_sub(ctx0, ggml_repeat(ctx0, maximum, valid), valid)), -1.0f, 1.0f);
                 prev = ggml_argmax(ctx0, ggml_mul(ctx0, is_max, tie_rank));
@@ -1142,6 +1182,9 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
         }
     }
     const auto block_order = [&](ggml_tensor * t, int64_t n) {
+        if (nb == 1) {
+            return t;
+        }
         t = ggml_reshape_3d(ctx0, t, t->ne[0], nb, n);
         return ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, t, 0, 2, 1, 3)), t->ne[0], nb*n);
     };
@@ -1153,5 +1196,5 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     cb(res->t_h_nextn, "dspark_chain_state", -1);
     ggml_build_forward_expand(gf, res->t_h_nextn);
     logits = block_order(logits, n_out);
-    res->t_logits = chained_prob ? logits : ggml_cont(ctx0, ggml_view_2d(ctx0, logits, hparams.n_vocab_unpadded, nb*n_out, logits->nb[1], 0));
+    res->t_logits = (chained_prob || use_factored) ? logits : ggml_cont(ctx0, ggml_view_2d(ctx0, logits, hparams.n_vocab_unpadded, nb*n_out, logits->nb[1], 0));
 }

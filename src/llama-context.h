@@ -266,6 +266,9 @@ private:
     // (re)allocate the device buffer for cparams.embeddings_nextn_dev, false if it does not fit
     bool h_nextn_dev_alloc();
 
+    // precompute F16 [rank, n_vocab_unpadded] = target.output @ dspark_hidden_out for Inkling2 DSpark
+    void init_dspark_markov_lm();
+
     ggml_backend_t backend_from_dev(ggml_backend_dev_t dev) const;
 
     //
@@ -435,6 +438,12 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    // Inkling2 DSpark precomputed low-rank Markov LM head (W_valid @ dspark_hidden_out)
+    ggml_context_ptr        ctx_dspark_lm;
+    ggml_backend_buffer_ptr buf_dspark_lm;
+    ggml_tensor *           dspark_markov_lm   = nullptr;
+    ggml_tensor *           dspark_markov_bias = nullptr;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

@@ -1777,7 +1777,66 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
     GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
 };
 
-static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_mul_mat_add  = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_mul_soft_max = { GGML_OP_MUL, GGML_OP_SOFT_MAX };
+
+static bool ggml_metal_fusion_check_mul_soft_max(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+
+    const ggml_tensor * mul = nodes[0];
+    const ggml_tensor * sm  = nodes[1];
+
+    const ggml_tensor * x  = mul->src[0];
+    const ggml_tensor * sc = mul->src[1];
+
+    if (!x || !sc || x->type != GGML_TYPE_F32 || sc->type != GGML_TYPE_F32 ||
+        mul->type != GGML_TYPE_F32 || sm->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (mul->ne[0] < 16384 || mul->ne[1] > 16 || mul->ne[2] != 1 || mul->ne[3] != 1) {
+        return false;
+    }
+
+    if (x->ne[0] != mul->ne[0] || x->ne[1] != mul->ne[1] || x->ne[2] != 1 || x->ne[3] != 1 ||
+        sc->ne[0] != 1 || sc->ne[1] != mul->ne[1] || sc->ne[2] != 1 || sc->ne[3] != 1) {
+        return false;
+    }
+
+    if (!ggml_is_contiguous_rows(x) || !ggml_is_contiguous_rows(sc) ||
+        !ggml_is_contiguous_rows(mul) || !ggml_is_contiguous_rows(sm)) {
+        return false;
+    }
+
+    if (sm->src[0] != mul || sm->src[1] != nullptr || sm->src[2] != nullptr) {
+        return false;
+    }
+
+    float scale = 1.0f;
+    float max_bias = 0.0f;
+    memcpy(&scale,    ((const int32_t *) sm->op_params) + 0, sizeof(scale));
+    memcpy(&max_bias, ((const int32_t *) sm->op_params) + 1, sizeof(max_bias));
+    if (scale != 1.0f || max_bias != 0.0f) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        if (ggml_metal_fusion_overlap(sm, x) || ggml_metal_fusion_overlap(sm, sc)) {
+            return false;
+        }
+    }
+
+    return true;
+}
 
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_MUL,     ops_norm_mul,         {}, false, ggml_metal_fusion_check_norm },
@@ -1846,7 +1905,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MUL_MAT_ID_SCALE, ops_mul_mat_id_scale_rsh, {}, true,  ggml_metal_fusion_check_mul_mat_id_scale },
     { GGML_METAL_FUSION_MUL_MAT_ID_SCALE, ops_mul_mat_id_scale,     {}, true,  ggml_metal_fusion_check_mul_mat_id_scale },
 
-    { GGML_METAL_FUSION_MUL_MAT_ADD, ops_mul_mat_add, {}, false, ggml_metal_fusion_check_mul_mat_add },
+    { GGML_METAL_FUSION_MUL_MAT_ADD,  ops_mul_mat_add,  {}, false, ggml_metal_fusion_check_mul_mat_add },
+    { GGML_METAL_FUSION_MUL_SOFT_MAX, ops_mul_soft_max, {}, false, ggml_metal_fusion_check_mul_soft_max },
 };
 
 // ---- alloc deps -----------------------------------------------------------

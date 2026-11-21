@@ -1742,6 +1742,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     layer_inp_src    (params.layer_inp_src),
     h_nextn_dev      (params.h_nextn_dev),
     h_nextn_src      (params.h_nextn_src),
+    dspark_markov_lm   (params.dspark_markov_lm),
+    dspark_markov_bias (params.dspark_markov_bias),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),

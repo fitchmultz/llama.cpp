@@ -320,6 +320,10 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
             {
                 res += ggml_metal_op_argmax_extra(tensor);
             } break;
+        case GGML_OP_SOFT_MAX:
+            {
+                res += ggml_metal_op_soft_max_extra(tensor);
+            } break;
         default:
             break;
     }

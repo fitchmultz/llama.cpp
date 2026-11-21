@@ -221,3 +221,131 @@ template [[host_name("kernel_soft_max_f16")]]   kernel kernel_soft_max_t   kerne
 template [[host_name("kernel_soft_max_f32")]]   kernel kernel_soft_max_t   kernel_soft_max<float>;
 template [[host_name("kernel_soft_max_f16_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<half4>;
 template [[host_name("kernel_soft_max_f32_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<float4>;
+
+// Two-pass multi-threadgroup parallel softmax for wide rows (e.g. 200K vocab logits, nrows <= 16),
+// with optional fused per-row scalar multiply (e.g. inv_temp in probabilistic DSpark drafting).
+[[host_name("kernel_soft_max_large_part")]]
+kernel void kernel_soft_max_large_part(
+        constant ggml_metal_kargs_soft_max_large & args,
+        device const char  * src0,
+        device const char  * scale_buf,
+        device       float * tmp,
+        threadgroup  float * buf [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]],
+        uint  sgitg [[simdgroup_index_in_threadgroup]],
+        uint  tiisg [[thread_index_in_simdgroup]],
+        uint3 tptg  [[threads_per_threadgroup]]) {
+    const int row   = (int) tgpig.y;
+    const int part  = (int) tgpig.x;
+    const int npart = args.npart;
+    const int ne00  = args.ne00;
+    const int chunk = (ne00 + npart - 1) / npart;
+    const int start = part * chunk;
+    const int end   = min(start + chunk, ne00);
+
+    device const float * psrc = (device const float *)(src0 + (uint64_t) row * args.nb01);
+    const float row_scale = args.has_row_scale
+        ? *(device const float *)(scale_buf + (uint64_t) row * args.nb_sc1)
+        : args.scale;
+
+    float lmax = -INFINITY;
+    for (int i = start + (int) tpitg.x; i < end; i += (int) tptg.x) {
+        lmax = MAX(lmax, psrc[i] * row_scale);
+    }
+
+    float max_val = simd_max(lmax);
+    if (tptg.x > N_SIMDWIDTH) {
+        if (sgitg == 0) {
+            buf[tiisg] = -INFINITY;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tiisg == 0) {
+            buf[sgitg] = max_val;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        max_val = simd_max(buf[tiisg]);
+    }
+
+    float lsum = 0.0f;
+    for (int i = start + (int) tpitg.x; i < end; i += (int) tptg.x) {
+        lsum += exp(psrc[i] * row_scale - max_val);
+    }
+
+    float sum_val = simd_sum(lsum);
+    if (tptg.x > N_SIMDWIDTH) {
+        if (sgitg == 0) {
+            buf[tiisg] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tiisg == 0) {
+            buf[sgitg] = sum_val;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        sum_val = simd_sum(buf[tiisg]);
+    }
+
+    if (tpitg.x == 0) {
+        tmp[(row * npart + part) * 2 + 0] = max_val;
+        tmp[(row * npart + part) * 2 + 1] = sum_val;
+    }
+}
+
+[[host_name("kernel_soft_max_large_norm")]]
+kernel void kernel_soft_max_large_norm(
+        constant ggml_metal_kargs_soft_max_large & args,
+        device const char  * src0,
+        device const char  * scale_buf,
+        device const float * tmp,
+        device       char  * dst,
+        threadgroup  float * buf [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]],
+        uint  sgitg [[simdgroup_index_in_threadgroup]],
+        uint  tiisg [[thread_index_in_simdgroup]],
+        uint3 tptg  [[threads_per_threadgroup]]) {
+    const int row   = (int) tgpig.y;
+    const int part  = (int) tgpig.x;
+    const int npart = args.npart;
+    const int ne00  = args.ne00;
+    const int chunk = (ne00 + npart - 1) / npart;
+    const int start = part * chunk;
+    const int end   = min(start + chunk, ne00);
+
+    const float pm = ((int) tpitg.x < npart) ? tmp[(row * npart + (int) tpitg.x) * 2 + 0] : -INFINITY;
+    const float ps = ((int) tpitg.x < npart) ? tmp[(row * npart + (int) tpitg.x) * 2 + 1] : 0.0f;
+
+    float gmax = simd_max(pm);
+    if (sgitg == 0) {
+        buf[tiisg] = -INFINITY;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        buf[sgitg] = gmax;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    gmax = simd_max(buf[tiisg]);
+
+    const float w = (ps > 0.0f) ? (ps * exp(pm - gmax)) : 0.0f;
+    float gsum = simd_sum(w);
+    if (sgitg == 0) {
+        buf[tiisg] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        buf[sgitg] = gsum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    gsum = simd_sum(buf[tiisg]);
+
+    const float inv_sum = 1.0f / gsum;
+    device const float * psrc = (device const float *)(src0 + (uint64_t) row * args.nb01);
+    device       float * pdst = (device       float *)(dst  + (uint64_t) row * args.nb1);
+    const float row_scale = args.has_row_scale
+        ? *(device const float *)(scale_buf + (uint64_t) row * args.nb_sc1)
+        : args.scale;
+
+    for (int i = start + (int) tpitg.x; i < end; i += (int) tptg.x) {
+        pdst[i] = exp(psrc[i] * row_scale - gmax) * inv_sum;
+    }
+}

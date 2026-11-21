@@ -981,6 +981,16 @@ typedef struct {
 } ggml_metal_kargs_soft_max;
 
 typedef struct {
+    int32_t  ne00;
+    int32_t  npart;
+    uint64_t nb01;
+    uint64_t nb1;
+    uint64_t nb_sc1;
+    float    scale;
+    int32_t  has_row_scale;
+} ggml_metal_kargs_soft_max_large;
+
+typedef struct {
     int64_t  ne00;
     int64_t  ne01;
     int64_t  ne02;

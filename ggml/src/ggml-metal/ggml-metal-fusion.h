@@ -54,6 +54,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_LOOP_DOWN_NORM,  // CONCAT(dim=1) + RMS_NORM + RESHAPE + MUL_MAT(bf16[2D, R])
     GGML_METAL_FUSION_MUL_MAT_ID_SCALE, // MUL_MAT_ID + REPEAT + GET_ROWS + MUL (per-expert scalar weight scale)
     GGML_METAL_FUSION_MUL_MAT_ADD,   // MUL_MAT + ADD (residual added in the few-row MMA store)
+    GGML_METAL_FUSION_MUL_SOFT_MAX,  // MUL(x, per-row scalar) + SOFT_MAX (large-vocab parallel softmax)
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp
