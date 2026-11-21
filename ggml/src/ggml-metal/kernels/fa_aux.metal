@@ -48,6 +48,44 @@ template [[host_name("kernel_flash_attn_ext_kv_q5_0_f16")]] kernel kernel_flash_
 template [[host_name("kernel_flash_attn_ext_kv_q5_1_f16")]] kernel kernel_flash_attn_ext_kv_f16_t kernel_flash_attn_ext_kv_f16<block_q5_1, 32, dequantize_q5_1>;
 template [[host_name("kernel_flash_attn_ext_kv_q8_0_f16")]] kernel kernel_flash_attn_ext_kv_f16_t kernel_flash_attn_ext_kv_f16<block_q8_0, 32, dequantize_q8_0>;
 
+// pre-pack and scale Q from F32 [DK, ne01, ne02, ne03] into per-threadgroup contiguous F16 tiles
+// [DK, Q_TOK*H] for the inline-Q8_0 GQA Metal 4 tensor FlashAttention kernel (size independent of ne11)
+kernel void kernel_flash_attn_ext_q_f16(
+        constant ggml_metal_kargs_flash_attn_ext_q_f16 & args,
+        device const char * q_src,
+        device       half * q_dst,
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort  tiitg [[thread_index_in_threadgroup]],
+        ushort3 ntg   [[threads_per_threadgroup]]) {
+    const int iq1_blk = tgpig[0];
+    const int iq2_blk = tgpig[1];
+    const int iq3     = tgpig[2];
+
+    const int nq_blk = (args.ne01 + args.q_tok - 1) / args.q_tok;
+    const int n_grp  = args.ne02 / args.h_grp;
+    const int q_eff  = args.q_tok * args.h_grp;
+    const int dk4    = args.ne00 / 4;
+
+    const uint64_t tg_idx = ((uint64_t) iq3 * n_grp + iq2_blk) * nq_blk + iq1_blk;
+    device half4 * dst4 = (device half4 *) q_dst + tg_idx * ((uint64_t) q_eff * dk4);
+
+    for (int idx = tiitg; idx < q_eff * dk4; idx += ntg.x) {
+        const int r       = idx / dk4;
+        const int i4      = idx % dk4;
+        const int hh      = r / args.q_tok;
+        const int q_local = r % args.q_tok;
+        const int iq1     = iq1_blk * args.q_tok + q_local;
+        const int iq2     = iq2_blk * args.h_grp + hh;
+
+        if (iq1 < args.ne01) {
+            device const float4 * q4 = (device const float4 *) (q_src + (uint64_t) iq1 * args.nb01 + (uint64_t) iq2 * args.nb02 + (uint64_t) iq3 * args.nb03);
+            dst4[idx] = (half4) (q4[i4] * args.qscale);
+        } else {
+            dst4[idx] = half4(0.0h);
+        }
+    }
+}
+
 // gather the K/V cache rows referenced by the kv_rows lists into contiguous F16 buffers
 // - one threadgroup per (row, stream); the attention is then run as a standard dense op over the
 //   gathered rows, which avoids the per-tile K/V gather in the main kernels

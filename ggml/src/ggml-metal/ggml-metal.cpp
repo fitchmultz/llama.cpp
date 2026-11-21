@@ -296,12 +296,15 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_EXT_BANDED:
             {
-                res += ggml_metal_op_flash_attn_ext_extra_pad(tensor);
+                const bool has_tensor = ggml_metal_device_get_props((ggml_metal_device_t) buft->device->context)->has_tensor;
+
+                res += ggml_metal_op_flash_attn_ext_extra_pad(tensor, has_tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_blk(tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_tmp(tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_kv_f16(tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_idx(tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_rows(tensor);
+                res += ggml_metal_op_flash_attn_ext_extra_q_f16(tensor, has_tensor);
             } break;
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:

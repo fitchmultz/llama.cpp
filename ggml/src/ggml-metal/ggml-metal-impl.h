@@ -391,6 +391,19 @@ typedef struct {
     int32_t  nblocks;
 } ggml_metal_kargs_flash_attn_ext_kv_f16;
 
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  q_tok;
+    int32_t  h_grp;
+    float    qscale;
+} ggml_metal_kargs_flash_attn_ext_q_f16;
+
 // gather the K/V cache rows referenced by the kv_rows lists into contiguous F16 buffers
 typedef struct {
     int32_t  ne11;      // number of rows per list (n_kv_rows)

@@ -192,6 +192,31 @@ kernel void kernel_flash_attn_ext_vec(
             slope = pow(base, exph);
         }
 
+        constexpr float LOG2E = 1.4426950408889634f;
+        const float scale_log2 = args.scale * LOG2E;
+        const float scap_log2  = args.logit_softcap * LOG2E;
+        const float slope_log2 = slope * LOG2E;
+
+        // Hoist banded relative position query positions outside the KV loop
+        int qp_val[Q];
+        int qp_min = INT_MAX;
+        int qp_max = INT_MIN;
+        if (FC_flash_attn_ext_vec_has_banded) {
+            FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                const int iq1_q = iq1*Q + qq;
+                const int iq1_r = min(iq1_q, args.ne01 - 1);
+                if (FC_flash_attn_ext_vec_has_rel_pos) {
+                    qp_val[qq] = ((device const int *) q_pos)[(uint64_t) iq3*args.ne01 + iq1_r];
+                } else {
+                    qp_val[qq] = iq1_r + (args.ne11 - args.ne01);
+                }
+                if (iq1_q < args.ne01) {
+                    qp_min = min(qp_min, qp_val[qq]);
+                    qp_max = max(qp_max, qp_val[qq]);
+                }
+            }
+        }
+
         // loop over the KV cache
         // each simdgroup handles blocks of Q rows and C columns
         for (int ic0 = iwg*NSG + sgitg; ; ic0 += NWG*NSG) {
@@ -402,18 +427,18 @@ kernel void kernel_flash_attn_ext_vec(
                     if (FC_flash_attn_ext_vec_has_mask &&
                        !FC_flash_attn_ext_vec_has_scap &&
                        !FC_flash_attn_ext_vec_has_bias) {
-                        ss[qq*C + NE*tx + ty] = fma(mqk[qq][tx], args.scale, (qk_t) sm[qq*C + NE*tx + ty]);
+                        ss[qq*C + NE*tx + ty] = fma(mqk[qq][tx], scale_log2, (qk_t) sm[qq*C + NE*tx + ty] * LOG2E);
                     } else {
-                        mqk[qq][tx] *= args.scale;
-
                         if (FC_flash_attn_ext_vec_has_scap) {
-                            mqk[qq][tx] = args.logit_softcap*precise::tanh(mqk[qq][tx]);
+                            mqk[qq][tx] = scap_log2*precise::tanh(mqk[qq][tx]*args.scale);
+                        } else {
+                            mqk[qq][tx] *= scale_log2;
                         }
 
                         if (FC_flash_attn_ext_vec_has_bias) {
-                            mqk[qq][tx] += (qk_t) sm[qq*C + NE*tx + ty]*slope;
+                            mqk[qq][tx] += (qk_t) sm[qq*C + NE*tx + ty]*slope_log2;
                         } else {
-                            mqk[qq][tx] += (qk_t) sm[qq*C + NE*tx + ty];
+                            mqk[qq][tx] += (qk_t) sm[qq*C + NE*tx + ty]*LOG2E;
                         }
 
                         ss[qq*C + NE*tx + ty] = mqk[qq][tx];
@@ -423,39 +448,47 @@ kernel void kernel_flash_attn_ext_vec(
 
             simdgroup_barrier(mem_flags::mem_threadgroup);
 
-            // online softmax
+            // online softmax (in log2 space with hardware exp2 + tile-level rel skip + ms != 1.0f rescale guard)
             {
+                const int col_abs = ic_orig + tiisg;
+                const bool col_valid = col_abs < args.ne11;
+                int kp_val = col_abs;
+                bool tile_has_rel = false;
+                if (FC_flash_attn_ext_vec_has_banded) {
+                    int kp_min = ic_orig;
+                    int kp_max = min(ic_orig + C - 1, args.ne11 - 1);
+                    if (FC_flash_attn_ext_vec_has_rel_pos) {
+                        kp_val = col_valid ? ((device const int *) k_pos)[(uint64_t) iq3*args.ne11 + col_abs] : 0;
+                        kp_min = simd_min(col_valid ? kp_val : INT_MAX);
+                        kp_max = simd_max(col_valid ? kp_val : INT_MIN);
+                    }
+                    tile_has_rel = (qp_max >= kp_min) && (qp_min - kp_max < args.rel_extent);
+                }
+
                 FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                     const float m = M[qq];
                     float s = ss[qq*C + tiisg];
-                    if (FC_flash_attn_ext_vec_has_banded && (iq1*Q + qq) < args.ne01) {
+                    if (FC_flash_attn_ext_vec_has_banded && tile_has_rel && (iq1*Q + qq) < args.ne01 && col_valid) {
                         const int iq1_q = iq1*Q + qq;
-                        const int col_abs = ic_orig + tiisg;
-                        int rel_dist;
-                        if (FC_flash_attn_ext_vec_has_rel_pos) {
-                            const int qp_val = ((device const int *) q_pos)[iq3*args.ne01 + iq1_q];
-                            rel_dist = col_abs < args.ne11 ? (qp_val - ((device const int *) k_pos)[(uint64_t) iq3*args.ne11 + col_abs]) : -1;
-                        } else {
-                            rel_dist = iq1_q + (args.ne11 - args.ne01) - col_abs;
-                        }
+                        const int rel_dist = qp_val[qq] - kp_val;
                         if (rel_dist >= 0 && rel_dist < args.rel_extent) {
-                            device const float * pr = (device const float *) (rel + iq1_q*args.nb62 + iq2*args.nb61 + (iq3%args.ne63)*args.nb63);
-                            s += pr[rel_dist];
+                            device const float * pr = (device const float *) (rel + (uint64_t) iq1_q*args.nb62 + (uint64_t) iq2*args.nb61 + (uint64_t) (iq3%args.ne63)*args.nb63);
+                            s += pr[rel_dist] * LOG2E;
                         }
                     }
 
                     M[qq] = simd_max(max(M[qq], s));
 
-                    const float ms = exp(m - M[qq]);
-                    const float vs = exp(s - M[qq]);
+                    const float ms = exp2(m - M[qq]);
+                    const float vs = exp2(s - M[qq]);
 
                     S[qq] = S[qq]*ms + simd_sum(vs);
 
                     // the P matrix from the paper (Q rows, C columns)
                     ss[qq*C + tiisg] = vs;
 
-                    // O = diag(ms)*O
-                    if ((DV4/NL % NW == 0) || ty == 0) {
+                    // O = diag(ms)*O (skip shmem read-modify-write when running max did not change)
+                    if (ms != 1.0f && ((DV4/NL % NW == 0) || ty == 0)) {
                         FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
                             so4[qq*DV4 + ii*NL] *= ms;
                         }
@@ -590,16 +623,16 @@ kernel void kernel_flash_attn_ext_vec(
             FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                 const float m = M[qq];
                 const int iq1_s = min((int)(iq1*Q + qq), args.ne01 - 1);
-                const float s = tiisg == 0 ? ((device const float *) sinks)[iq2 + iq1_s*args.sinks_s1 + iq3*args.sinks_s2] : -FLT_MAX/2;
+                const float s = tiisg == 0 ? ((device const float *) sinks)[iq2 + iq1_s*args.sinks_s1 + iq3*args.sinks_s2] * LOG2E : -FLT_MAX/2;
 
                 M[qq] = simd_max(max(M[qq], s));
 
-                const float ms = exp(m - M[qq]);
-                const float vs = exp(s - M[qq]);
+                const float ms = exp2(m - M[qq]);
+                const float vs = exp2(s - M[qq]);
 
                 S[qq] = S[qq]*ms + simd_sum(vs);
 
-                if ((DV4/NL % NW == 0) || ty == 0) {
+                if (ms != 1.0f && ((DV4/NL % NW == 0) || ty == 0)) {
                     FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
                         so4[qq*DV4 + ii*NL] *= ms;
                     }
@@ -632,8 +665,8 @@ kernel void kernel_flash_attn_ext_vec(
 
                 const float Mx  = max(M0, M1);
 
-                const float ms0 = exp(M0 - Mx);
-                const float ms1 = exp(M1 - Mx);
+                const float ms0 = exp2(M0 - Mx);
+                const float ms1 = exp2(M1 - Mx);
 
                 const float Sx  = S0*ms0 + S1*ms1;
 
@@ -674,11 +707,12 @@ kernel void kernel_flash_attn_ext_vec(
                 dst4[rid*DV4*NWG + NWG*i + iwg] = (float4) so4[qq*DV4 + i]*Sval;
             }
 
-            // store S and M
+            // store S and M (convert log2 M back to natural log for kernel_flash_attn_ext_vec_reduce)
             if (NWG > 1) {
                 if (tiisg == 0) {
+                    constexpr float LN2 = 0.6931471805599453f;
                     dst1[rid*(2*NWG) + 2*iwg + 0] = ss[2*qq + 0];
-                    dst1[rid*(2*NWG) + 2*iwg + 1] = ss[2*qq + 1];
+                    dst1[rid*(2*NWG) + 2*iwg + 1] = ss[2*qq + 1] * LN2;
                 }
             }
         }

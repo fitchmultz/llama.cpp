@@ -238,7 +238,7 @@ else()
         add_custom_command(
             OUTPUT ${AIR_FA_TENSOR}
             COMMAND xcrun -sdk ${METAL_SDK} metal ${XC_FLAGS_TENSOR} -DGGML_METAL_HAS_TENSOR -I ${CMAKE_RUNTIME_OUTPUT_DIRECTORY} -c ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/kernels/fa_tensor.metal -o ${AIR_FA_TENSOR}
-            DEPENDS kernels/fa_tensor.metal kernels/common.h ${METALLIB_COMMON} ggml-metal-impl.h
+            DEPENDS kernels/fa_tensor.metal kernels/common.h kernels/dequantize.h ${METALLIB_COMMON} ggml-metal-impl.h
             COMMENT "Compiling kernels/fa_tensor.metal (tensor API)"
             VERBATIM
         )

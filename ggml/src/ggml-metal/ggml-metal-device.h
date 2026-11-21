@@ -210,6 +210,10 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         ggml_metal_library_t lib,
         const struct ggml_tensor * op);
 
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_q_f16(
+        ggml_metal_library_t lib,
+        const struct ggml_tensor * op);
+
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_blk(
         ggml_metal_library_t lib,
         const struct ggml_tensor * op,
@@ -219,6 +223,20 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_tensor(
         ggml_metal_library_t lib,
         const struct ggml_tensor * op,
+        bool has_mask,
+        bool has_sinks,
+        bool has_bias,
+        bool has_scap,
+        bool has_banded,
+        bool has_kvpad,
+        bool has_rel_pos);
+
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_tensor_wide(
+        ggml_metal_library_t lib,
+        const struct ggml_tensor * op,
+        int32_t q_blk,
+        int32_t c_blk,
+        int32_t nsg,
         bool has_mask,
         bool has_sinks,
         bool has_bias,
@@ -269,6 +287,32 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         bool    use_kv_f16,
         int32_t ns10,
         int32_t ns20);
+
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_q8_0_gqa(
+        ggml_metal_library_t lib,
+        const struct ggml_tensor * op,
+        bool    has_mask,
+        bool    has_sinks,
+        bool    has_scap,
+        bool    has_kvpad,
+        bool    has_banded,
+        bool    has_rel_pos,
+        int32_t nqpsg,
+        int32_t nhptg,
+        int32_t nsg,
+        int32_t nwg);
+
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_tensor_q8_0_gqa(
+        ggml_metal_library_t lib,
+        const struct ggml_tensor * op,
+        bool    has_mask,
+        bool    has_sinks,
+        bool    has_scap,
+        bool    has_kvpad,
+        bool    has_banded,
+        bool    has_rel_pos,
+        int32_t nhptg,
+        int32_t nwg);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(
         ggml_metal_library_t lib,
