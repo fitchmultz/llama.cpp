@@ -166,6 +166,14 @@ inline float block_q_n_dot_y(device const block_q5_1 * qb_curr, float sumy, thre
     return d * (acc[0] + acc[1] + acc[2] + acc[3]) + sumy * m;
 }
 
+constant short FC_mul_mv_nsg   [[function_constant(FC_MUL_MV + 0)]];
+constant short FC_mul_mv_nxpsg [[function_constant(FC_MUL_MV + 1)]];
+constant short FC_mul_mv_ne12  [[function_constant(FC_MUL_MV + 2)]];
+constant short FC_mul_mv_r2    [[function_constant(FC_MUL_MV + 3)]];
+constant short FC_mul_mv_r3    [[function_constant(FC_MUL_MV + 4)]];
+constant bool  FC_mul_mv_split [[function_constant(FC_MUL_MV + 5)]];
+constant bool  FC_mul_mv_id_scale [[function_constant(FC_MUL_MV + 6)]];
+
 template<short NR0>
 static inline void helper_mv_reduce_and_write(
         device float * dst_f32,
@@ -175,46 +183,46 @@ static inline void helper_mv_reduce_and_write(
         ushort tiisg,
         ushort sgitg,
         threadgroup char * shmem) {
-    constexpr short NW = N_SIMDWIDTH;
+    const short NSG = FC_mul_mv_nsg;
 
-    threadgroup float * shmem_f32[NR0];
-
-    for (short row = 0; row < NR0; ++row) {
-        shmem_f32[row] = (threadgroup float *) shmem + NW*row;
-
-        if (sgitg == 0) {
-            shmem_f32[row][tiisg] = 0.0f;
-        }
-
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
         sumf[row] = simd_sum(sumf[row]);
     }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (short row = 0; row < NR0; ++row) {
+    if (NSG == 1) {
         if (tiisg == 0) {
-            shmem_f32[row][sgitg] = sumf[row];
+            FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                if (r0 + row < ne01) {
+                    dst_f32[r0 + row] = sumf[row];
+                }
+            }
+        }
+        return;
+    }
+
+    threadgroup float * shmem_f32 = (threadgroup float *) shmem;
+
+    if (tiisg == 0) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            shmem_f32[row * 32 + sgitg] = sumf[row];
         }
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (short row = 0; row < NR0 && r0 + row < ne01; ++row) {
-        float tot = simd_sum(shmem_f32[row][tiisg]);
+    if (sgitg == 0) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            if (r0 + row < ne01) {
+                const float v = (tiisg < (ushort) NSG) ? shmem_f32[row * 32 + tiisg] : 0.0f;
+                const float tot = simd_sum(v);
 
-        if (tiisg == 0 && sgitg == 0) {
-            dst_f32[r0 + row] = tot;
+                if (tiisg == 0) {
+                    dst_f32[r0 + row] = tot;
+                }
+            }
         }
     }
 }
-
-constant short FC_mul_mv_nsg   [[function_constant(FC_MUL_MV + 0)]];
-constant short FC_mul_mv_nxpsg [[function_constant(FC_MUL_MV + 1)]];
-constant short FC_mul_mv_ne12  [[function_constant(FC_MUL_MV + 2)]];
-constant short FC_mul_mv_r2    [[function_constant(FC_MUL_MV + 3)]];
-constant short FC_mul_mv_r3    [[function_constant(FC_MUL_MV + 4)]];
-constant bool  FC_mul_mv_split [[function_constant(FC_MUL_MV + 5)]];
-constant bool  FC_mul_mv_id_scale [[function_constant(FC_MUL_MV + 6)]];
 
 template<typename block_q_type, short NR0, typename args_t>
 void mul_vec_q_n_f32_impl(
@@ -1064,7 +1072,7 @@ void kernel_mul_mv_t_t_4_impl(
         ushort sgitg) {
     const short NSG = FC_mul_mv_nsg;
 
-    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NW  = N_SIMDWIDTH;
     constexpr short NB  = 32;
     constexpr short NF  = 16;
     constexpr short NF4 = NF/4;
@@ -1078,20 +1086,20 @@ void kernel_mul_mv_t_t_4_impl(
     const uint i12 = im%FC_mul_mv_ne12;
     const uint i13 = im/FC_mul_mv_ne12;
 
-  //const uint64_t offset0 = r0*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
-    const uint64_t offset1 = r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+    const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
 
     device const T1  * y  = (device const T1  *) (src1 + offset1);
     device const T14 * y4 = (device const T14 *) (src1 + offset1);
 
-    // pointers to src0 rows
+    const uint64_t off0_base = (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
     device const T0  * ax [NR0];
     device const T04 * ax4[NR0];
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
-        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+        const int rr = min(r0 + (int) row, args.ne01 - 1);
+        const uint64_t offset0 = rr*args.nb01 + off0_base;
 
-        ax [row] = (device const T0  *) ((device char *) src0 + offset0);
-        ax4[row] = (device const T04 *) ((device char *) src0 + offset0);
+        ax [row] = (device const T0  *) ((device const char *) src0 + offset0);
+        ax4[row] = (device const T04 *) ((device const char *) src0 + offset0);
     }
 
     float sumf[NR0] = { 0.f };
@@ -1106,11 +1114,11 @@ void kernel_mul_mv_t_t_4_impl(
     device const T14 * yb4 = y4 + (ib0*NB + il*NF)/4;
 
     for (int ib = ib0; ib < nb; ib += NSG*NF) {
-        for (short i = 0; i < NF4; ++i) {
+        FOR_UNROLL (short i = 0; i < NF4; ++i) {
             yl4[i] = yb4[i];
         }
 
-        for (short row = 0; row < NR0; row++) {
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
             device const T04 * xb4 = ax4[row] + (ib*NB + il*NF)/4;
 
             float sumq = 0.f;
@@ -1125,7 +1133,7 @@ void kernel_mul_mv_t_t_4_impl(
     }
 
     for (int i = nb*NB + sgitg*NW + tiisg; i < args.ne00; i += NW*NSG) {
-        for (short row = 0; row < NR0; row++) {
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
             sumf[row] += ax[row][i] * y[i];
         }
     }
@@ -1146,10 +1154,8 @@ void kernel_mul_mv_t_t_4_disp(
         ushort tiisg,
         ushort sgitg) {
     switch (args.nr0) {
-      //case 1: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 1, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 1: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 1, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
         case 2: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 2, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-      //case 3: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 3, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-      //case 4: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 4, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
     };
 }
 

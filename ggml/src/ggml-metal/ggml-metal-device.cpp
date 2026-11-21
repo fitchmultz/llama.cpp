@@ -1059,7 +1059,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                     suffix = "_short";
                 } else {
                     nsg = std::min(4, (ne00 + 127) / 128);
-                    nr0 = 2;
+                    nr0 = (ne00 % 4 == 0 && ne01 < 64) ? 1 : 2;
                     nr1 = 1;
                     smem = 32*sizeof(float)*nr0;
                     suffix = ne00 % 4 == 0 ? "_4" : "";
@@ -1361,7 +1361,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         case GGML_TYPE_BF16:
             {
                 nsg = std::min(4, (ne00 + 127) / 128);
-                nr0 = 2;
+                nr0 = (ne00 % 4 == 0 && ne01 < 64) ? 1 : 2;
                 nr1 = 1;
                 smem = 32*sizeof(float)*nr0;
                 suffix = ne00 % 4 == 0 ? "_4" : "";
@@ -2362,6 +2362,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_depth_mix(ggml_m
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat_rms_norm(ggml_metal_library_t lib) {
     const char * name = "kernel_concat_rms_norm_f32_4";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_loop_down_norm(ggml_metal_library_t lib, bool multi_tok) {
+    const char * name = multi_tok ? "kernel_loop_down_norm_bf16_f32_tn" : "kernel_loop_down_norm_bf16_f32_t1";
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {

@@ -477,6 +477,144 @@ kernel void kernel_concat_rms_norm_f32_4(
 }
 
 #if defined(GGML_METAL_HAS_BF16)
+template <bool MULTI_TOK>
+kernel void kernel_loop_down_norm_bf16_f32_impl(
+        constant ggml_metal_kargs_loop_down_norm & args,
+        device const char * src_a,
+        device const char * src_b,
+        device const char * w_down,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]]) {
+    const int r = (int) tgpig.x;
+    if (r >= args.ne01) {
+        return;
+    }
+    const int n4 = args.ne00;
+    device const bfloat4 * wa4 = (device const bfloat4 *) (w_down + (uint64_t) r * args.nb_w1);
+    device const bfloat4 * wb4 = wa4 + n4;
+
+    if (!MULTI_TOK) {
+        device const float4 * a4 = (device const float4 *) src_a;
+        device const float4 * b4 = (device const float4 *) src_b;
+
+        float ss_a = 0.0f;
+        float ss_b = 0.0f;
+        float da   = 0.0f;
+        float db   = 0.0f;
+
+        for (int i = tpitg.x; i < n4; i += 128) {
+            const float4 av = a4[i];
+            const float4 bv = b4[i];
+            ss_a += dot(av, av);
+            ss_b += dot(bv, bv);
+            da   += dot(float4(wa4[i]), av);
+            db   += dot(float4(wb4[i]), bv);
+        }
+
+        ss_a = simd_sum(ss_a);
+        ss_b = simd_sum(ss_b);
+        da   = simd_sum(da);
+        db   = simd_sum(db);
+
+        threadgroup float shmem[4 * 4];
+        if (tiisg == 0) {
+            shmem[sgitg * 4 + 0] = ss_a;
+            shmem[sgitg * 4 + 1] = ss_b;
+            shmem[sgitg * 4 + 2] = da;
+            shmem[sgitg * 4 + 3] = db;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sgitg == 0 && tiisg == 0) {
+            const float tot_ssa = shmem[0] + shmem[4] + shmem[8]  + shmem[12];
+            const float tot_ssb = shmem[1] + shmem[5] + shmem[9]  + shmem[13];
+            const float tot_da  = shmem[2] + shmem[6] + shmem[10] + shmem[14];
+            const float tot_db  = shmem[3] + shmem[7] + shmem[11] + shmem[15];
+
+            const float inv_d = 1.0f / float(n4 * 4);
+            const float inv_a = rsqrt(tot_ssa * inv_d + args.eps);
+            const float inv_b = rsqrt(tot_ssb * inv_d + args.eps);
+
+            ((device float *) dst)[r] = tot_da * inv_a + tot_db * inv_b;
+        }
+    } else {
+        constexpr int BT = 4;
+        const int t0 = (int) tgpig.y * BT;
+        const int t_cnt = min(BT, args.n_tokens - t0);
+        if (t_cnt <= 0) {
+            return;
+        }
+
+        device const float4 * a4[BT];
+        device const float4 * b4[BT];
+        FOR_UNROLL (int k = 0; k < BT; ++k) {
+            const int tk = min(t0 + k, args.n_tokens - 1);
+            a4[k] = (device const float4 *) (src_a + (uint64_t) tk * args.nb_a2);
+            b4[k] = (device const float4 *) (src_b + (uint64_t) tk * args.nb_b2);
+        }
+
+        float ss_a[BT] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        float ss_b[BT] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        float da[BT]   = { 0.0f, 0.0f, 0.0f, 0.0f };
+        float db[BT]   = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+        for (int i = tpitg.x; i < n4; i += 128) {
+            const float4 wva = float4(wa4[i]);
+            const float4 wvb = float4(wb4[i]);
+            FOR_UNROLL (int k = 0; k < BT; ++k) {
+                if (k < t_cnt) {
+                    const float4 av = a4[k][i];
+                    const float4 bv = b4[k][i];
+                    ss_a[k] += dot(av, av);
+                    ss_b[k] += dot(bv, bv);
+                    da[k]   += dot(wva, av);
+                    db[k]   += dot(wvb, bv);
+                }
+            }
+        }
+
+        threadgroup float shmem[4 * BT * 4];
+        FOR_UNROLL (int k = 0; k < BT; ++k) {
+            if (k < t_cnt) {
+                const float sa = simd_sum(ss_a[k]);
+                const float sb = simd_sum(ss_b[k]);
+                const float xa = simd_sum(da[k]);
+                const float xb = simd_sum(db[k]);
+                if (tiisg == 0) {
+                    const int base = (k * 4 + sgitg) * 4;
+                    shmem[base + 0] = sa;
+                    shmem[base + 1] = sb;
+                    shmem[base + 2] = xa;
+                    shmem[base + 3] = xb;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sgitg == 0 && tiisg < (ushort) t_cnt) {
+            const int k = tiisg;
+            const int base = k * 16;
+            const float tot_ssa = shmem[base + 0] + shmem[base + 4] + shmem[base + 8]  + shmem[base + 12];
+            const float tot_ssb = shmem[base + 1] + shmem[base + 5] + shmem[base + 9]  + shmem[base + 13];
+            const float tot_da  = shmem[base + 2] + shmem[base + 6] + shmem[base + 10] + shmem[base + 14];
+            const float tot_db  = shmem[base + 3] + shmem[base + 7] + shmem[base + 11] + shmem[base + 15];
+
+            const float inv_d = 1.0f / float(n4 * 4);
+            const float inv_a = rsqrt(tot_ssa * inv_d + args.eps);
+            const float inv_b = rsqrt(tot_ssb * inv_d + args.eps);
+
+            ((device float *) (dst + (uint64_t) (t0 + k) * args.nb_d1))[r] = tot_da * inv_a + tot_db * inv_b;
+        }
+    }
+}
+
+typedef decltype(kernel_loop_down_norm_bf16_f32_impl<false>) kernel_loop_down_norm_t;
+template [[host_name("kernel_loop_down_norm_bf16_f32_t1")]] kernel kernel_loop_down_norm_t kernel_loop_down_norm_bf16_f32_impl<false>;
+template [[host_name("kernel_loop_down_norm_bf16_f32_tn")]] kernel kernel_loop_down_norm_t kernel_loop_down_norm_bf16_f32_impl<true>;
+
 kernel void kernel_loop_control_mm_bf16_f32(
         constant ggml_metal_kargs_loop_control_mm & args,
         device const char * w_gain,

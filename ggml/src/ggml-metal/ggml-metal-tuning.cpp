@@ -1145,10 +1145,6 @@ fa_vec_cfg_t fa_vec_pick(int gpu_family, int dtype, int dk, int dv, int64_t ne11
     const fa_vec_cfg_t baseline = fa_vec_baseline_cfg(dk, dv);
 
     const int ne11_b = fa_vec_ne11_bucket(ne11);
-    if (ne11_b == 0) {
-        return baseline;  // short KV: attention is a small slice of the step, left to baseline
-    }
-
     const int ne01_b = fa_vec_ne01_bucket(ne01);
 
     fa_vec_key_t k{};
@@ -1159,9 +1155,11 @@ fa_vec_cfg_t fa_vec_pick(int gpu_family, int dtype, int dk, int dv, int64_t ne11
     k.ne11_b = (int8_t) ne11_b;
     k.ne01_b = (int8_t) ne01_b;
 
-    // exact bucket, then the ne01 domain default (ne11 collapsed)
-    if (auto * c = find_cfg(fa_vec_tuned_table, std::size(fa_vec_tuned_table), k)) {
-        return *c;
+    // exact bucket (when ne11 >= smallest bucket), then the ne01 domain default (ne11 collapsed)
+    if (ne11_b > 0) {
+        if (auto * c = find_cfg(fa_vec_tuned_table, std::size(fa_vec_tuned_table), k)) {
+            return *c;
+        }
     }
     k.ne11_b = FA_VEC_NE11_DEFAULT;
     k.ne01_b = (ne01_b == 0) ? FA_VEC_DOMAIN_DECODE : FA_VEC_DOMAIN_BATCH;

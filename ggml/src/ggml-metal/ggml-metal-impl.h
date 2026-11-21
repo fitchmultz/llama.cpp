@@ -1538,6 +1538,17 @@ typedef struct {
 } ggml_metal_kargs_concat_rms_norm;
 
 typedef struct {
+    int32_t  ne00;     // D / 4
+    int32_t  ne01;     // output rows R
+    int32_t  n_tokens; // T
+    uint64_t nb_a2;    // byte stride between tokens in a
+    uint64_t nb_b2;    // byte stride between tokens in b
+    uint64_t nb_w1;    // byte stride between rows in w (bf16[2*D, R])
+    uint64_t nb_d1;    // byte stride between tokens in dst (f32[R, T])
+    float    eps;
+} ggml_metal_kargs_loop_down_norm;
+
+typedef struct {
     int32_t  ne01;
     uint64_t nb_g1;
     uint64_t nb_f1;

@@ -644,6 +644,49 @@ int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
 
             return n;
         }
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_LOOP_DOWN_NORM) {
+            const ggml_tensor * rms = ctx->node(idx + 1);
+            ggml_tensor *       mm  = ctx->node(idx + 2);
+            for (int i = 1; i < 3; ++i) {
+                if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+                    ggml_metal_op_concurrency_reset(ctx);
+                    break;
+                }
+            }
+            ctx->count_fusions(fusion);
+
+            const ggml_tensor * a = op->src[0];
+            const ggml_tensor * b = op->src[1];
+            const ggml_tensor * w = mm->src[0];
+            const int32_t T = (int32_t) a->ne[2];
+            const bool multi_tok = (T > 1);
+
+            auto pipeline = ggml_metal_library_get_pipeline_loop_down_norm(ctx->lib, multi_tok);
+
+            ggml_metal_kargs_loop_down_norm args = {
+                /*.ne00     =*/ (int32_t) (a->ne[0] / 4),
+                /*.ne01     =*/ (int32_t) w->ne[1],
+                /*.n_tokens =*/ T,
+                /*.nb_a2    =*/ a->nb[2],
+                /*.nb_b2    =*/ b->nb[2],
+                /*.nb_w1    =*/ w->nb[1],
+                /*.nb_d1    =*/ mm->nb[1],
+                /*.eps      =*/ ggml_get_op_params_f32(rms, 0),
+            };
+
+            ggml_metal_encoder_t enc = ctx->enc;
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(a),  1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(b),  2);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w),  3);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm), 4);
+
+            const int ntg_y = multi_tok ? (T + 3) / 4 : 1;
+            ggml_metal_encoder_dispatch_threadgroups(enc, args.ne01, ntg_y, 1, 128, 1, 1);
+
+            return 3;
+        }
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_CONCAT_RMS_NORM) {
             ggml_tensor * rms = ctx->node(idx + 1);
             if (!ggml_metal_op_concurrency_check(ctx, rms)) {
@@ -3104,10 +3147,10 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-    if (op->src[0]->type == GGML_TYPE_F32 ||
-        op->src[0]->type == GGML_TYPE_F16 ||
-        op->src[0]->type == GGML_TYPE_BF16 ||
-        op->src[0]->type == GGML_TYPE_Q8_0) {
+    if ((op->src[0]->type == GGML_TYPE_F32 ||
+         op->src[0]->type == GGML_TYPE_F16 ||
+         op->src[0]->type == GGML_TYPE_BF16 ||
+         op->src[0]->type == GGML_TYPE_Q8_0) && smem > 0) {
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + nr0 - 1)/(nr0)), ((ne11 + nr1 - 1)/nr1), ne12*ne13, 32, nsg, 1);
     } else {
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + nr0*nsg - 1)/(nr0*nsg)), ((ne11 + nr1 - 1)/nr1), ne12*ne13, 32, nsg, 1);
@@ -3617,10 +3660,10 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-        if (op->src[0]->type == GGML_TYPE_F32 ||
-            op->src[0]->type == GGML_TYPE_F16 ||
-            op->src[0]->type == GGML_TYPE_BF16 ||
-            op->src[0]->type == GGML_TYPE_Q8_0) {
+        if ((op->src[0]->type == GGML_TYPE_F32 ||
+             op->src[0]->type == GGML_TYPE_F16 ||
+             op->src[0]->type == GGML_TYPE_BF16 ||
+             op->src[0]->type == GGML_TYPE_Q8_0) && smem > 0) {
             ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr0 - 1)/(nr0), (_ne1 + nr1 - 1)/nr1, ne123, 32, nsg, 1);
         } else {
             ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr0*nsg - 1)/(nr0*nsg), (_ne1 + nr1 - 1)/nr1, ne123, 32, nsg, 1);
