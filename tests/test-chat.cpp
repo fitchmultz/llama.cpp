@@ -7910,6 +7910,121 @@ static void test_inkling2_media_blocks() {
     assert_equals(U + T + "a" + E,                             render({ "a" }));
 }
 
+// Inkling 2: mid-conversation `{role:"system", tools:[...]}` emits native tool_declare in place
+// (preserving the cached prompt prefix) and registers those tools in the PEG parser and grammar
+static void test_inkling2_mid_convo_tools() {
+    LOG_DBG("%s\n", __func__);
+
+    const std::string S = "<|message_system|>";
+    const std::string U = "<|message_user|>";
+    const std::string T = "<|content_text|>";
+    const std::string E = "<|end_message|>";
+    const std::string M = "<|message_model|>";
+
+    // Include top-level tool_declare matching the real Inkling 2 GGUF chat template
+    static const char * INKLING2_TOOL_TEMPLATE = R"({%- set role_token = {"user": "<|message_user|>", "assistant": "<|message_model|>", "system": "<|message_system|>", "tool": "<|message_tool|>"} -%}
+{%- if tools -%}
+    {%- set tool_state = namespace(specs=[]) -%}
+    {%- for tool in tools -%}
+        {%- set fn = tool.function if tool.function is defined else tool -%}
+        {%- set spec = {"description": (fn.description if fn.description is defined and fn.description else ""), "name": fn.name, "parameters": (fn.parameters if fn.parameters is defined and fn.parameters else {}), "type": (tool.type if tool.type is defined and tool.type else "function")} -%}
+        {%- set tool_state.specs = tool_state.specs + [spec] -%}
+    {%- endfor -%}
+    {{- "<|message_system|>tool_declare<|content_xml|>" ~ (tool_state.specs | tojson(sort_keys=true, separators=(",", ":"))) ~ "<|end_message|>" -}}
+{%- endif -%}
+{%- for m in messages -%}
+    {%- if m.content is string -%}{{ role_token[m.role] }}<|content_text|>{{ m.content }}<|end_message|>
+    {%- else -%}{%- for p in m.content -%}{{ role_token[m.role] }}
+        {%- if p.type == 'image' -%}<|content_image|>{%- else -%}<|content_text|>{{ p.text }}{%- endif -%}<|end_message|>
+    {%- endfor -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}<|message_model|>{%- endif -%})";
+
+    common_chat_templates_ptr tmpls(common_chat_templates_init(nullptr, INKLING2_TOOL_TEMPLATE));
+
+    const json top_tool = {
+        {"type", "function"},
+        {"function", {
+            {"name", "read"},
+            {"description", "Read a file"},
+            {"parameters", {{"type", "object"}, {"properties", {{"path", {{"type", "string"}}}}}}},
+        }},
+    };
+    const json added_tool = {
+        {"type", "function"},
+        {"function", {
+            {"name", "linear_search"},
+            {"description", "Search Linear issues"},
+            {"parameters", {{"properties", {{"query", {{"type", "string"}}}}}, {"type", "object"}}},
+        }},
+    };
+
+    // Turn 1: only top-level `read` tool
+    json msgs_turn1 = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", "Find issues"}},
+    });
+    common_chat_templates_inputs in1;
+    in1.messages = common_chat_msgs_parse_oaicompat(msgs_turn1);
+    in1.tools    = common_chat_tools_parse_oaicompat(json::array({ top_tool }));
+    const auto out1 = common_chat_templates_apply(tmpls.get(), in1);
+
+    // Turn 2: appends mid-convo `{role:"system", tools:[linear_search]}` without `content` + user follow-up
+    json msgs_turn2 = msgs_turn1;
+    msgs_turn2.push_back({{"role", "assistant"}, {"content", "Searching tools."}});
+    msgs_turn2.push_back({{"role", "system"}, {"tools", json::array({ added_tool })}});
+    msgs_turn2.push_back({{"role", "user"}, {"content", "Go ahead"}});
+
+    common_chat_templates_inputs in2;
+    in2.messages = common_chat_msgs_parse_oaicompat(msgs_turn2);
+    in2.tools    = in1.tools;
+    const auto out2 = common_chat_templates_apply(tmpls.get(), in2);
+
+    // Prefix before generation prompt must be byte-for-byte identical (100% KV cache hit)
+    const std::string prefix1 = out1.prompt.str().substr(0, out1.prompt.str().size() - M.size());
+    assert_equals(true, string_starts_with(out2.prompt.str(), prefix1));
+
+    // Mid-convo tool_declare must use sorted keys and no empty <|content_text|> block
+    const std::string expected_decl =
+        S + "tool_declare<|content_xml|>"
+        R"([{"description":"Search Linear issues","name":"linear_search","parameters":{"properties":{"query":{"type":"string"}},"type":"object"},"type":"function"}])"
+        + E;
+    assert_contains(out2.prompt.str(), expected_decl);
+    assert_equals(std::string::npos, out2.prompt.str().find(S + T + E));
+
+    // The tool_declare block must be emitted with is_input=false so special tokens tokenize properly
+    bool found_non_input_decl = false;
+    for (const auto & part : out2.prompt.parts) {
+        if (!part.is_input && part.text.find(expected_decl) != std::string::npos) {
+            found_non_input_decl = true;
+        }
+    }
+    assert_equals(true, found_non_input_decl);
+
+    // PEG parser and lazy grammar must accept calls to both the original and mid-convo added tools
+    const std::string call_added =
+        "linear_search<|content_invoke_tool_json|>{\"name\":\"linear_search\",\"args\":{\"query\":\"atlas\"}}<|end_message|>";
+    common_chat_parser_params parse_params(out2);
+    parse_params.parser = out2.parser;
+    const auto parsed = common_chat_parse(common_chat_input(call_added), /* is_partial= */ false, parse_params);
+    assert_equals(size_t(1), parsed.tool_calls.size());
+    assert_equals(std::string("linear_search"), parsed.tool_calls[0].name);
+    assert_equals(std::string("{\"query\":\"atlas\"}"), parsed.tool_calls[0].arguments);
+    assert_contains(out2.grammar, "linear_search");
+    assert_contains(out2.grammar, "read");
+
+    // System message with BOTH tools and non-empty content emits tool_declare followed by text
+    json msgs_both = json::array({
+        {{"role", "system"}, {"content", "Note"}, {"tools", json::array({ added_tool })}},
+        {{"role", "user"}, {"content", "Hi"}},
+    });
+    common_chat_templates_inputs in_both;
+    in_both.messages = common_chat_msgs_parse_oaicompat(msgs_both);
+    const auto out_both = common_chat_templates_apply(tmpls.get(), in_both);
+    assert_contains(out_both.prompt.str(), expected_decl + S + T + "Note" + E + U + T + "Hi" + E);
+}
+
 static void test_template_generation_prompt() {
     common_chat_msg system_msg;
     system_msg.role = "system";
@@ -8918,6 +9033,7 @@ int main(int argc, char ** argv) {
         test_deepseek_v4_tool_result_ordering();
         test_deepseek_v4_1_message_fields();
         test_inkling2_media_blocks();
+        test_inkling2_mid_convo_tools();
         test_template_generation_prompt();
         test_reasoning_effort_caps();
         test_prompt_parts();

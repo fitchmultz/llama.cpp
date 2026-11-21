@@ -1556,7 +1556,8 @@ json oaicompat_chat_params_parse(
     }
     for (auto & msg : messages) {
         std::string role = json_value(msg, "role", std::string());
-        if (role != "assistant" && !msg.contains("content")) {
+        const bool is_system_tools = role == "system" && msg.contains("tools") && msg.at("tools").is_array();
+        if (role != "assistant" && !is_system_tools && !msg.contains("content")) {
             throw std::invalid_argument("All non-assistant messages must contain 'content'");
         }
         if (role == "assistant") {
@@ -1566,6 +1567,9 @@ json oaicompat_chat_params_parse(
             if (!msg.contains("content")) {
                 continue; // avoid errors with no content
             }
+        }
+        if (!msg.contains("content")) {
+            continue;
         }
         json & content = msg.at("content");
         if (content.is_string() || content.is_null()) {
@@ -1615,7 +1619,15 @@ json oaicompat_chat_params_parse(
         inputs.reasoning_format = common_reasoning_format_from_name(body.at("reasoning_format").get<std::string>());
     }
     inputs.enable_thinking = opt.enable_thinking;
-    if (!inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+    bool has_mid_convo_tools = false;
+    for (const auto & msg : messages) {
+        if (json_value(msg, "role", std::string()) == "system" &&
+            msg.contains("tools") && msg.at("tools").is_array() && !msg.at("tools").empty()) {
+            has_mid_convo_tools = true;
+            break;
+        }
+    }
+    if ((!inputs.tools.empty() || has_mid_convo_tools) && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
         if (body.contains("grammar")) {
             throw std::invalid_argument("Cannot use custom grammar constraints with tools.");
         }

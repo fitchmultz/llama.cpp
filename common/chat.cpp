@@ -370,6 +370,7 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messa
 
             auto has_content    = message.contains("content");
             auto has_tool_calls = message.contains("tool_calls");
+            auto has_msg_tools  = msg.role == "system" && message.contains("tools") && message.at("tools").is_array();
             if (has_content) {
                 const auto & content = message.at("content");
                 if (content.is_string()) {
@@ -428,7 +429,7 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messa
                     msg.tool_calls.push_back(tc);
                 }
             }
-            if (!has_content && !has_tool_calls) {
+            if (!has_content && !has_tool_calls && !has_msg_tools) {
                 throw std::invalid_argument(
                     "Expected 'content' or 'tool_calls' (ref: https://github.com/ggml-org/llama.cpp/issues/8367 & "
                     "https://github.com/ggml-org/llama.cpp/issues/12279)");
@@ -560,7 +561,14 @@ static json render_message_to_json(const std::vector<common_chat_msg> & msgs, co
 
     json messages = json::array();
     for (const auto & msg : msgs) {
-        messages.push_back(msg.to_json_oaicompat(/* concat_typed_text= */ false));
+        json jmsg = msg.to_json_oaicompat(/* concat_typed_text= */ false);
+        if (msg.role == "system" && !msg.extra_json.empty()) {
+            const json extra = json::parse(msg.extra_json);
+            if (extra.contains("tools") && extra.at("tools").is_array()) {
+                jmsg["tools"] = extra.at("tools");
+            }
+        }
+        messages.push_back(std::move(jmsg));
     }
     return messages_inp_normalizer(c).normalize(messages);
 }

@@ -104,7 +104,7 @@ struct common_chat_msg {
 
     bool empty() const {
         return content.empty() && content_parts.empty() && tool_calls.empty() && reasoning_content.empty() &&
-               tool_name.empty() && tool_call_id.empty();
+               tool_name.empty() && tool_call_id.empty() && extra_json.empty();
     }
 
     bool contains_media() const {
