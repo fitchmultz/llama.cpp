@@ -236,6 +236,70 @@ typedef decltype(kernel_l2_norm_impl<float, float>) kernel_l2_norm_t;
 template [[host_name("kernel_l2_norm_f32_f32")]]   kernel kernel_l2_norm_t kernel_l2_norm_impl<float,  float>;
 template [[host_name("kernel_l2_norm_f32_f32_4")]] kernel kernel_l2_norm_t kernel_l2_norm_impl<float4, float4>;
 
+template <typename T, bool HAS_SCALE>
+kernel void kernel_l2_clip_impl(
+        constant ggml_metal_kargs_l2_clip & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]]) {
+    const int i01 = tgpig.x;
+    const int i02 = tgpig.y;
+    const int i03 = tgpig.z;
+
+    device const T * x = (device const T *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
+    device const T * s = HAS_SCALE ? (device const T *) (src1 + (i03%args.ne13)*args.nb13 + (i02%args.ne12)*args.nb12 + (i01%args.ne11)*args.nb11) : nullptr;
+    device       T * y = (device       T *) (dst  + i03*args.nb3  + i02*args.nb2  + i01*args.nb1);
+
+    if (args.ne00 <= 32) {
+        T v = T(0.0f);
+        if ((int) tiisg < args.ne00) {
+            v = HAS_SCALE ? (x[tiisg] * s[tiisg]) : x[tiisg];
+        }
+        const float sumf = simd_sum(dot(v, v));
+        if ((int) tiisg < args.ne00) {
+            const float factor = clamp(args.threshold / (sqrt(sumf) + args.eps), 0.0f, 1.0f);
+            y[tiisg] = v * factor;
+        }
+        return;
+    }
+
+    float sumf = 0.0f;
+    for (int i00 = tiisg; i00 < args.ne00; i00 += 32) {
+        T v = HAS_SCALE ? (x[i00] * s[i00]) : x[i00];
+        sumf += dot(v, v);
+    }
+    sumf = simd_sum(sumf);
+
+    const float factor = clamp(args.threshold / (sqrt(sumf) + args.eps), 0.0f, 1.0f);
+
+    for (int i00 = tiisg; i00 < args.ne00; i00 += 32) {
+        T v = HAS_SCALE ? (x[i00] * s[i00]) : x[i00];
+        y[i00] = v * factor;
+    }
+}
+
+typedef decltype(kernel_l2_clip_impl<float, false>) kernel_l2_clip_t;
+
+template [[host_name("kernel_l2_clip_f32")]]         kernel kernel_l2_clip_t kernel_l2_clip_impl<float,  false>;
+template [[host_name("kernel_l2_clip_scale_f32")]]   kernel kernel_l2_clip_t kernel_l2_clip_impl<float,  true>;
+template [[host_name("kernel_l2_clip_f32_4")]]       kernel kernel_l2_clip_t kernel_l2_clip_impl<float4, false>;
+template [[host_name("kernel_l2_clip_scale_f32_4")]] kernel kernel_l2_clip_t kernel_l2_clip_impl<float4, true>;
+
+kernel void kernel_loop_control_f32_4(
+        constant int64_t & n4,
+        device const float4 * f_lin,
+        device const float4 * g_lin,
+        device const float4 * cur,
+        device const float4 * msg,
+        device       float4 * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if ((int64_t) gid < n4) {
+        dst[gid] = (1.0f - tanh(f_lin[gid])) * cur[gid] + tanh(g_lin[gid]) * msg[gid];
+    }
+}
+
 constant bool FC_group_norm_flat [[function_constant(FC_GROUP_NORM + 0)]];
 
 kernel void kernel_group_norm_f32(

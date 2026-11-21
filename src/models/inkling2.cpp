@@ -244,8 +244,13 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     h = ggml_reshape_2d(ctx0, ggml_rms_norm(ctx0, h, 1e-6f), 2*n_embd, n_tokens);
     h = build_lora_mm(layer.loop_down[module], h);
 
-    ggml_tensor * gain   = ggml_tanh(ctx0, build_lora_mm(layer.loop_gain[module],   h));
-    ggml_tensor * forget = ggml_tanh(ctx0, build_lora_mm(layer.loop_forget[module], h));
+    ggml_tensor * g_lin = build_lora_mm(layer.loop_gain[module],   h);
+    ggml_tensor * f_lin = build_lora_mm(layer.loop_forget[module], h);
+    ggml_build_forward_expand(gf, g_lin);
+    ggml_build_forward_expand(gf, f_lin);
+
+    ggml_tensor * forget = ggml_tanh(ctx0, f_lin);
+    ggml_tensor * gain   = ggml_tanh(ctx0, g_lin);
 
     return ggml_add(ctx0, ggml_mul(ctx0, ggml_scale_bias(ctx0, forget, -1.0f, 1.0f), cur), ggml_mul(ctx0, gain, message));
 }
