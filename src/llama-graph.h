@@ -809,6 +809,8 @@ public:
     // distance from the token to the cell, extent for the empty, future and more distant cells
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
+    ggml_tensor * self_k_pos       = nullptr; // I32 [n_kv,     n_stream]
+    ggml_tensor * self_k_pos_swa   = nullptr; // I32 [n_kv_swa, n_stream]
 
     // [base, swa] device copies, made once per graph
     ggml_tensor * self_rel_pos_dev[2] = { nullptr, nullptr };

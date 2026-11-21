@@ -1,8 +1,10 @@
-constant bool FC_flash_attn_ext_has_mask  [[function_constant(FC_FLASH_ATTN_EXT + 0)]];
-constant bool FC_flash_attn_ext_has_sinks [[function_constant(FC_FLASH_ATTN_EXT + 1)]];
-constant bool FC_flash_attn_ext_has_bias  [[function_constant(FC_FLASH_ATTN_EXT + 2)]];
-constant bool FC_flash_attn_ext_has_scap  [[function_constant(FC_FLASH_ATTN_EXT + 3)]];
-constant bool FC_flash_attn_ext_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT + 4)]];
+constant bool FC_flash_attn_ext_has_mask   [[function_constant(FC_FLASH_ATTN_EXT + 0)]];
+constant bool FC_flash_attn_ext_has_sinks  [[function_constant(FC_FLASH_ATTN_EXT + 1)]];
+constant bool FC_flash_attn_ext_has_bias   [[function_constant(FC_FLASH_ATTN_EXT + 2)]];
+constant bool FC_flash_attn_ext_has_scap   [[function_constant(FC_FLASH_ATTN_EXT + 3)]];
+constant bool FC_flash_attn_ext_has_kvpad  [[function_constant(FC_FLASH_ATTN_EXT + 4)]];
+constant bool FC_flash_attn_ext_has_banded  [[function_constant(FC_FLASH_ATTN_EXT + 5)]];
+constant bool FC_flash_attn_ext_has_rel_pos [[function_constant(FC_FLASH_ATTN_EXT + 6)]];
 
 constant bool FC_flash_attn_ext_bc_mask [[function_constant(FC_FLASH_ATTN_EXT + 10)]];
 
@@ -54,6 +56,9 @@ void kernel_flash_attn_ext_impl(
         device const char * pad,
         device const char * blk,
         device       char * dst,
+        device const char * rel,
+        device const char * k_pos,
+        device const char * q_pos,
         threadgroup  half * shmem_f16,
         uint3   tgpig,
         ushort  tiisg,
@@ -116,6 +121,20 @@ void kernel_flash_attn_ext_impl(
         const short j = jj*NSG + sgitg;
 
         pm2[jj] = (device const half2 *) ((device const char *) mask + (iq1 + j)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+    }
+
+    device const float * pr[NQ];
+    int qp[NQ];
+    if (FC_flash_attn_ext_has_banded) {
+        FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+            const short j = jj*NSG + sgitg;
+            const int iq1_r = min((int)(iq1 + j), args.ne01 - 1);
+
+            pr[jj] = (device const float *) (rel + iq1_r*args.nb62 + iq2*args.nb61 + (iq3%args.ne63)*args.nb63);
+            if (FC_flash_attn_ext_has_rel_pos) {
+                qp[jj] = ((device const int *) q_pos)[iq3*args.ne01 + iq1_r];
+            }
+        }
     }
 
     {
@@ -186,6 +205,7 @@ void kernel_flash_attn_ext_impl(
         // each simdgroup handles blocks of Q rows and C columns
         for (int ic0 = 0; ; ++ic0) {
             int ic = ic0*C;
+            const int ic_orig = ic;
             if (ic >= args.ne11) {
                 break;
             }
@@ -430,6 +450,27 @@ void kernel_flash_attn_ext_impl(
                     }
                 }
 
+                if (FC_flash_attn_ext_has_banded && (iq1 + j) < args.ne01) {
+                    int rel_dist0;
+                    int rel_dist1;
+                    if (FC_flash_attn_ext_has_rel_pos) {
+                        device const int * kp = (device const int *) k_pos + (uint64_t) iq3*args.ne11;
+                        const int c0 = ic_orig + 2*tiisg;
+                        const int c1 = c0 + 1;
+                        rel_dist0 = c0 < args.ne11 ? (qp[jj] - kp[c0]) : -1;
+                        rel_dist1 = c1 < args.ne11 ? (qp[jj] - kp[c1]) : -1;
+                    } else {
+                        rel_dist0 = (iq1 + j) + (args.ne11 - args.ne01) - (ic_orig + 2*tiisg);
+                        rel_dist1 = rel_dist0 - 1;
+                    }
+                    if (rel_dist0 >= 0 && rel_dist0 < args.rel_extent) {
+                        s2[0] += pr[jj][rel_dist0];
+                    }
+                    if (rel_dist1 >= 0 && rel_dist1 < args.rel_extent) {
+                        s2[1] += pr[jj][rel_dist1];
+                    }
+                }
+
                 M[jj] = simd_max(max(M[jj], max(s2[0], s2[1])));
 
                 const float  ms  = exp(m  - M[jj]);
@@ -610,7 +651,8 @@ void kernel_flash_attn_ext_impl(
                 const short j = jj*NSG + sgitg;
 
                 const float m = M[jj];
-                const float s = tiisg == 0 ? ((device const float *) sinks)[iq2] : -FLT_MAX/2;
+                const int iq1_s = min((int)(iq1 + j), args.ne01 - 1);
+                const float s = tiisg == 0 ? ((device const float *) sinks)[iq2 + iq1_s*args.sinks_s1 + iq3*args.sinks_s2] : -FLT_MAX/2;
 
                 M[jj] = simd_max(max(M[jj], s));
 
@@ -692,12 +734,15 @@ kernel void kernel_flash_attn_ext(
         device const char * pad,
         device const char * blk,
         device       char * dst,
+        device const char * rel,
+        device const char * k_pos,
+        device const char * q_pos,
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
 #define FWD_TMPL q_t, q4_t, q8x8_t, k_t, k4x4_t, k8x8_t, v_t, v4x4_t, v8x8_t, qk_t, qk8x8_t, s_t, s2_t, s8x8_t, o_t, o4_t, o8x8_t, kd4x4_t, nl_k, deq_k, vd4x4_t, nl_v, deq_v, DK, DV, Q, C
-#define FWD_ARGS args, q, k, v, mask, sinks, pad, blk, dst, shmem_f16, tgpig, tiisg, sgitg
+#define FWD_ARGS args, q, k, v, mask, sinks, pad, blk, dst, rel, k_pos, q_pos, shmem_f16, tgpig, tiisg, sgitg
     switch (FC_flash_attn_ext_nsg) {
       // note: disabled cases to reduce library load time
       //case 1: kernel_flash_attn_ext_impl<FWD_TMPL, 1>(FWD_ARGS); break;

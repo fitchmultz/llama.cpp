@@ -2,10 +2,13 @@
 
 #ifdef GGML_METAL_HAS_TENSOR
 
-constant bool FC_flash_attn_ext_tensor_has_mask  [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 0)]];
-constant bool FC_flash_attn_ext_tensor_has_sinks [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 1)]];
-constant bool FC_flash_attn_ext_tensor_has_bias  [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 2)]];
-constant bool FC_flash_attn_ext_tensor_has_scap  [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 3)]];
+constant bool FC_flash_attn_ext_tensor_has_mask   [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 0)]];
+constant bool FC_flash_attn_ext_tensor_has_sinks  [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 1)]];
+constant bool FC_flash_attn_ext_tensor_has_bias   [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 2)]];
+constant bool FC_flash_attn_ext_tensor_has_scap   [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 3)]];
+constant bool FC_flash_attn_ext_tensor_has_banded  [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 4)]];
+constant bool FC_flash_attn_ext_tensor_has_kvpad   [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 5)]];
+constant bool FC_flash_attn_ext_tensor_has_rel_pos [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 6)]];
 
 // ref: https://arxiv.org/pdf/2307.08691.pdf
 template<
@@ -25,6 +28,10 @@ kernel void kernel_flash_attn_ext_tensor(
         device const char * sinks,
         device const char * blk,
         device       char * dst,
+        device const char * rel,
+        device const char * pad,
+        device const char * k_pos,
+        device const char * q_pos,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
@@ -81,6 +88,20 @@ kernel void kernel_flash_attn_ext_tensor(
         const short j = jj*NSG + sgitg;
 
         pm[jj] = (device const half *) (mask + (iq1 + j)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+    }
+
+    device const float * pr[NQ];
+    int qp[NQ];
+    if (FC_flash_attn_ext_tensor_has_banded) {
+        FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+            const short j = jj*NSG + sgitg;
+            const int iq1_r = min(iq1 + j, args.ne01 - 1);
+
+            pr[jj] = (device const float *) (rel + iq1_r*args.nb62 + iq2*args.nb61 + (iq3%args.ne63)*args.nb63);
+            if (FC_flash_attn_ext_tensor_has_rel_pos) {
+                qp[jj] = ((device const int *) q_pos)[iq3*args.ne01 + iq1_r];
+            }
+        }
     }
 
     {
@@ -142,7 +163,6 @@ kernel void kernel_flash_attn_ext_tensor(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // the host guarantees ne11 % C == 0
     for (int ic0 = 0, ic = 0; ic < args.ne11; ++ic0, ic += C) {
         char blk_cur = 1;
 
@@ -154,9 +174,20 @@ kernel void kernel_flash_attn_ext_tensor(
             }
         }
 
+        const bool is_pad = FC_flash_attn_ext_tensor_has_kvpad && (ic + C > args.ne11);
+        device const char * k_tile = k + (uint64_t) ic*args.nb11;
+        device const char * v_tile = v + (uint64_t) ic*args.nb21;
+
+        if (is_pad) {
+            const int ikv2 = iq2/(args.ne02/args.ne_12_2);
+            const int ikv3 = iq3/(args.ne03/args.ne_12_3);
+            k_tile = pad + (uint64_t)(ikv2 + ikv3*args.ne_12_2)*args.nb11*C;
+            v_tile = pad + args.nb11*C*args.ne_12_2*args.ne_12_3 + (uint64_t)(ikv2 + ikv3*args.ne_12_2)*args.nb21*C;
+        }
+
         // Q*K^T
         {
-            auto tk = tensor((device T *) (k + (uint64_t) ic*args.nb11), dextents<int32_t, 2>(DK, C), array<int, 2>({1, sk}));
+            auto tk = tensor((device T *) k_tile, dextents<int32_t, 2>(DK, C), array<int, 2>({1, sk}));
 
             mm_qk.run(tq, tk, ts);
         }
@@ -179,9 +210,48 @@ kernel void kernel_flash_attn_ext_tensor(
                 }
             }
 
-            if (FC_flash_attn_ext_tensor_has_mask && blk_cur != 2 && iq1 + j < args.ne31) {
+            if (is_pad) {
+                if (FC_flash_attn_ext_tensor_has_mask && iq1 + j < args.ne31) {
+                    device const half * pm_pad = (device const half *) (pad + args.nb11*C*args.ne_12_2*args.ne_12_3 + args.nb21*C*args.ne_12_2*args.ne_12_3)
+                        + (iq1 + j)*C + (iq2%args.ne32)*(C*args.ne31) + (iq3%args.ne33)*(C*args.ne31*args.ne32);
+                    FOR_UNROLL (short ii = 0; ii < NC; ++ii) {
+                        s[ii] += slope*(float) pm_pad[ii*NW + tiisg];
+                    }
+                } else {
+                    FOR_UNROLL (short ii = 0; ii < NC; ++ii) {
+                        if (ic + ii*NW + tiisg >= args.ne11) {
+                            s[ii] = -FLT_MAX/2;
+                        }
+                    }
+                }
+            } else if (FC_flash_attn_ext_tensor_has_mask && blk_cur != 2 && iq1 + j < args.ne31) {
                 FOR_UNROLL (short ii = 0; ii < NC; ++ii) {
                     s[ii] += slope*(float) pm[jj][ic + ii*NW + tiisg];
+                }
+            }
+
+            if (FC_flash_attn_ext_tensor_has_banded && iq1 + j < args.ne01) {
+                if (FC_flash_attn_ext_tensor_has_rel_pos) {
+                    device const int * kp = (device const int *) k_pos + (uint64_t) iq3*args.ne11 + ic;
+                    FOR_UNROLL (short ii = 0; ii < NC; ++ii) {
+                        const int col = ii*NW + tiisg;
+                        if (ic + col < args.ne11) {
+                            const int rel_dist = qp[jj] - kp[col];
+                            if (rel_dist >= 0 && rel_dist < args.rel_extent) {
+                                s[ii] += pr[jj][rel_dist];
+                            }
+                        }
+                    }
+                } else {
+                    const int rel_base = (iq1 + j) + (args.ne11 - args.ne01) - ic;
+                    if (rel_base >= 0 && rel_base - (C - 1) < args.rel_extent) {
+                        FOR_UNROLL (short ii = 0; ii < NC; ++ii) {
+                            const int rel_dist = rel_base - (ii*NW + tiisg);
+                            if (rel_dist >= 0 && rel_dist < args.rel_extent) {
+                                s[ii] += pr[jj][rel_dist];
+                            }
+                        }
+                    }
                 }
             }
 
@@ -235,7 +305,7 @@ kernel void kernel_flash_attn_ext_tensor(
         }
 
         {
-            auto tv = tensor((device T *) (v + (uint64_t) ic*args.nb21), dextents<int32_t, 2>(DV, C), array<int, 2>({1, sv}));
+            auto tv = tensor((device T *) v_tile, dextents<int32_t, 2>(DV, C), array<int, 2>({1, sv}));
 
             mm_pv.run(tp, tv, co);
         }
@@ -250,7 +320,8 @@ kernel void kernel_flash_attn_ext_tensor(
         float ms = 1.0f;
 
         if (FC_flash_attn_ext_tensor_has_sinks) {
-            const float s = ((device const float *) sinks)[iq2];
+            const int iq1_s = min(iq1 + j, args.ne01 - 1);
+            const float s = ((device const float *) sinks)[iq2 + iq1_s*args.sinks_s1 + iq3*args.sinks_s2];
             const float m = max(M[jj], s);
 
             ms = exp(M[jj] - m);

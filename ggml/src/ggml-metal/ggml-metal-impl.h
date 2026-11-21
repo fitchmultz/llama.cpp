@@ -466,6 +466,13 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    int32_t  rel_extent;
+    int32_t  ne63;
+    uint64_t nb61;
+    uint64_t nb62;
+    uint64_t nb63;
+    int32_t  sinks_s1;
+    int32_t  sinks_s2;
 } ggml_metal_kargs_flash_attn_ext;
 
 typedef struct {
@@ -502,6 +509,13 @@ typedef struct {
     int32_t  n_head_log2;
     float    logit_softcap;
     int32_t  n_kv_max_padded;
+    int32_t  rel_extent;
+    int32_t  ne63;
+    uint64_t nb61;
+    uint64_t nb62;
+    uint64_t nb63;
+    int32_t  sinks_s1;
+    int32_t  sinks_s2;
 } ggml_metal_kargs_flash_attn_ext_vec;
 
 typedef struct {

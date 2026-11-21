@@ -1742,6 +1742,20 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return true;
         case GGML_OP_ROLL:
             return ggml_is_contiguous(op->src[0]);
+        case GGML_OP_FLASH_ATTN_EXT_BANDED:
+            if (op->src[6] == NULL || op->src[6]->type != GGML_TYPE_F32 || op->src[5] != NULL) {
+                return false;
+            }
+            if (op->src[4] != NULL && op->src[4]->type != GGML_TYPE_F32) {
+                return false;
+            }
+            if ((op->src[7] != NULL) != (op->src[8] != NULL)) {
+                return false;
+            }
+            if (op->src[7] != NULL && (op->src[7]->type != GGML_TYPE_I32 || op->src[8]->type != GGML_TYPE_I32)) {
+                return false;
+            }
+            // fallthrough
         case GGML_OP_FLASH_ATTN_EXT:
             // K/V row lists (ggml_flash_attn_ext_rows): one list of cache rows per q slice
             if (op->src[5] != NULL) {

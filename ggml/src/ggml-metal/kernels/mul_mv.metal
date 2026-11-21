@@ -3035,21 +3035,6 @@ kernel void kernel_mul_mv_iq4_xs_f32(
     kernel_mul_mv_iq4_xs_f32_impl<N_R0_IQ4_XS, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
-// decode the E2M1 value in the low nibble of n, scaled by 2^-14, without a lookup table: the 3 magnitude bits
-// land in the fp16 exponent/mantissa (e=0 gives the 0.5 subnormal). same decode as MLX's fp4_e2m1
-static inline half mxfp4_dq1(uint32_t n) {
-    const half c = as_type<half>(ushort((n & 7) << 9));
-    return (n & 8) ? -c : c;
-}
-
-// low / high nibbles of the 4 bytes of w, in byte order, scaled by 2^-14
-static inline float4 mxfp4_lo4(uint32_t w) {
-    return float4(mxfp4_dq1(w), mxfp4_dq1(w >> 8), mxfp4_dq1(w >> 16), mxfp4_dq1(w >> 24));
-}
-
-static inline float4 mxfp4_hi4(uint32_t w) {
-    return float4(mxfp4_dq1(w >> 4), mxfp4_dq1(w >> 12), mxfp4_dq1(w >> 20), mxfp4_dq1(w >> 28));
-}
 
 template<int NR0, typename args_t>
 void kernel_mul_mv_mxfp4_f32_impl(
@@ -3163,7 +3148,7 @@ void kernel_mul_mv_nvfp4_f32_impl(
         ushort sgitg) {
     const short NSG = FC_mul_mv_nsg;
 
-    threadgroup float * shmem_f32 = (threadgroup float *) shmem;
+    (void) shmem;
 
     const int r0 = tgpig.x;
     const int r1 = tgpig.y;
@@ -3183,47 +3168,39 @@ void kernel_mul_mv_nvfp4_f32_impl(
     const int nb   = args.ne00/QK_NVFP4;
     const int ns01 = args.nb01/args.nb00; // this can be larger than nb for permuted src0 tensors
 
-    const short ix = tiisg/2;  // 0...15
-    const short it = tiisg%2;  // 0 or 1, each thread takes 2 of the 4 sub-blocks
+    const short ix = tiisg/4;  // 0...7
+    const short it = tiisg%4;  // 0...3, each thread takes 1 of the 4 sub-blocks
 
-    shmem_f32[tiisg] = kvalues_mxfp4_f[tiisg%16];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float4 yl[8];
+    float4 yl[4];
     float sumf[NR0]={0.f};
 
-    device const float * yb = y + ix*QK_NVFP4 + it*2*QK_NVFP4_SUB;
+    device const float * yb = y + ix*QK_NVFP4 + it*QK_NVFP4_SUB;
 
-    for (int ib = ix; ib < nb && ib < ns01; ib += 16) {
+    for (int ib = ix; ib < nb && ib < ns01; ib += 8) {
         device const float4 * y4 = (device const float4 *) yb;
 
-        FOR_UNROLL (short i = 0; i < 8; ++i) {
+        FOR_UNROLL (short i = 0; i < 4; ++i) {
             yl[i] = y4[i];
         }
 
         FOR_UNROLL (short row = 0; row < NR0; row++) {
             device const block_nvfp4 & xb = x[row*ns01 + ib];
-            device const uint8_t     * q2 = xb.qs + 2*it*(QK_NVFP4_SUB/2);
+            device const uint32_t    * qw = (device const uint32_t *)(xb.qs + it*(QK_NVFP4_SUB/2));
 
-            float sumq = 0.f;
+            const uint32_t w0 = qw[0];
+            const uint32_t w1 = qw[1];
 
-            FOR_UNROLL (short s = 0; s < 2; ++s) {
-                device const uint8_t * q = q2 + 8*s;
+            float4 acc1 = yl[0]*mxfp4_lo4(w0);
+            float4 acc2 = yl[1]*mxfp4_lo4(w1);
+            float4 acc3 = yl[2]*mxfp4_hi4(w0);
+            float4 acc4 = yl[3]*mxfp4_hi4(w1);
 
-                float4 acc1 = yl[4*s + 0]*float4(shmem_f32[q[0] &  0x0F], shmem_f32[q[1] &  0x0F], shmem_f32[q[2] &  0x0F], shmem_f32[q[3] &  0x0F]);
-                float4 acc2 = yl[4*s + 1]*float4(shmem_f32[q[4] &  0x0F], shmem_f32[q[5] &  0x0F], shmem_f32[q[6] &  0x0F], shmem_f32[q[7] &  0x0F]);
-                float4 acc3 = yl[4*s + 2]*float4(shmem_f32[q[0] >> 4   ], shmem_f32[q[1] >> 4   ], shmem_f32[q[2] >> 4   ], shmem_f32[q[3] >> 4   ]);
-                float4 acc4 = yl[4*s + 3]*float4(shmem_f32[q[4] >> 4   ], shmem_f32[q[5] >> 4   ], shmem_f32[q[6] >> 4   ], shmem_f32[q[7] >> 4   ]);
+            acc1 = (acc1 + acc3) + (acc2 + acc4);
 
-                acc1 = (acc1 + acc3) + (acc2 + acc4);
-
-                sumq += ue4m3_to_fp32(xb.d[2*it + s]) * ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
-            }
-
-            sumf[row] += sumq;
+            sumf[row] += (ue4m3_to_fp32(xb.d[it]) * 16384.0f) * ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
         }
 
-        yb += 16 * QK_NVFP4;
+        yb += 8 * QK_NVFP4;
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;

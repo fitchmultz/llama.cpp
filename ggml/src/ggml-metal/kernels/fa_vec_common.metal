@@ -14,6 +14,8 @@ constant int32_t FC_flash_attn_ext_vec_nsg  [[function_constant(FC_FLASH_ATTN_EX
 constant int32_t FC_flash_attn_ext_vec_nwg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 23)]];
 constant bool    FC_flash_attn_ext_vec_has_sparse [[function_constant(FC_FLASH_ATTN_EXT_VEC + 5)]];
 constant bool    FC_flash_attn_ext_vec_has_rows   [[function_constant(FC_FLASH_ATTN_EXT_VEC + 6)]];
+constant bool    FC_flash_attn_ext_vec_has_banded  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 7)]];
+constant bool    FC_flash_attn_ext_vec_has_rel_pos [[function_constant(FC_FLASH_ATTN_EXT_VEC + 8)]];
 template<
     typename q4_t,  // query types in shared memory
     typename k4_t,  // key types in shared memory
@@ -44,6 +46,9 @@ kernel void kernel_flash_attn_ext_vec(
         device const char * pad,
         device       char * dst,
         device const char * idx,
+        device const char * rel,
+        device const char * k_pos,
+        device const char * q_pos,
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
@@ -191,6 +196,7 @@ kernel void kernel_flash_attn_ext_vec(
         // each simdgroup handles blocks of Q rows and C columns
         for (int ic0 = iwg*NSG + sgitg; ; ic0 += NWG*NSG) {
             int ic = ic0*C;
+            const int ic_orig = ic;
             if (ic >= args.ne11) {
                 break;
             }
@@ -421,7 +427,22 @@ kernel void kernel_flash_attn_ext_vec(
             {
                 FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                     const float m = M[qq];
-                    const float s = ss[qq*C + tiisg];
+                    float s = ss[qq*C + tiisg];
+                    if (FC_flash_attn_ext_vec_has_banded && (iq1*Q + qq) < args.ne01) {
+                        const int iq1_q = iq1*Q + qq;
+                        const int col_abs = ic_orig + tiisg;
+                        int rel_dist;
+                        if (FC_flash_attn_ext_vec_has_rel_pos) {
+                            const int qp_val = ((device const int *) q_pos)[iq3*args.ne01 + iq1_q];
+                            rel_dist = col_abs < args.ne11 ? (qp_val - ((device const int *) k_pos)[(uint64_t) iq3*args.ne11 + col_abs]) : -1;
+                        } else {
+                            rel_dist = iq1_q + (args.ne11 - args.ne01) - col_abs;
+                        }
+                        if (rel_dist >= 0 && rel_dist < args.rel_extent) {
+                            device const float * pr = (device const float *) (rel + iq1_q*args.nb62 + iq2*args.nb61 + (iq3%args.ne63)*args.nb63);
+                            s += pr[rel_dist];
+                        }
+                    }
 
                     M[qq] = simd_max(max(M[qq], s));
 
@@ -568,7 +589,8 @@ kernel void kernel_flash_attn_ext_vec(
         if (FC_flash_attn_ext_vec_has_sinks && sgitg == 0 && iwg == 0) {
             FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                 const float m = M[qq];
-                const float s = tiisg == 0 ? ((device const float *) sinks)[iq2] : -FLT_MAX/2;
+                const int iq1_s = min((int)(iq1*Q + qq), args.ne01 - 1);
+                const float s = tiisg == 0 ? ((device const float *) sinks)[iq2 + iq1_s*args.sinks_s1 + iq3*args.sinks_s2] : -FLT_MAX/2;
 
                 M[qq] = simd_max(max(M[qq], s));
 

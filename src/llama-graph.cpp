@@ -1417,6 +1417,10 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
     }
 
+    if (self_k_pos && self_k_pos->buffer) {
+        attn_ctx->get_base()->set_input_k_pos(self_k_pos, ubatch);
+    }
+
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
         attn_ctx->get_swa()->set_input_k_idxs(inp_attn->self_k_idxs_swa, ubatch);
@@ -1429,6 +1433,10 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
 
     if (self_rel_pos_swa->buffer) {
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
+    }
+
+    if (self_k_pos_swa && self_k_pos_swa->buffer) {
+        attn_ctx->get_swa()->set_input_k_pos(self_k_pos_swa, ubatch);
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
@@ -1464,6 +1472,10 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     res &= self_rel_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
     res &= self_rel_pos->ne[1] == params.ubatch.n_tokens;
+    if (self_k_pos) {
+        res &= self_k_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
+        res &= self_k_pos->ne[1] == inp_attn->self_attn_mask.raw->ne[3];
+    }
 
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
@@ -1474,6 +1486,10 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+    if (self_k_pos_swa) {
+        res &= self_k_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
+        res &= self_k_pos_swa->ne[1] == inp_attn->self_attn_mask_swa.raw->ne[3];
+    }
 
     if (banded) {
         res &= attn_ctx->get_base()->get_n_kv_pos_contiguous() == n_kv_banded[0];
@@ -4485,6 +4501,14 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     inp->self_rel_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv(), ubatch.n_tokens);
     ggml_set_input(inp->self_rel_pos_swa);
     ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
+
+    inp->self_k_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv(), inp->inp_attn->self_attn_mask.raw->ne[3]);
+    ggml_set_input(inp->self_k_pos);
+    ggml_set_name(inp->self_k_pos, "attn_inp_k_pos");
+
+    inp->self_k_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv(), inp->inp_attn->self_attn_mask_swa.raw->ne[3]);
+    ggml_set_input(inp->self_k_pos_swa);
+    ggml_set_name(inp->self_k_pos_swa, "attn_inp_k_pos_swa");
 
     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
 }
