@@ -314,8 +314,11 @@ llama_kv_cache::llama_kv_cache(
             ggml_is_quantized(type_k) &&
             hparams.n_embd_head_k() % 64 == 0;
 
-        // always create Hadamard rotation tensors for lightning indexer keys
-        if (model.lid_k_hdmd() && hparams.n_embd_head_k_full == hparams.indexer_head_size) {
+        // always create Hadamard rotation tensors for DeepSeek lightning indexers
+        if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 ||
+                model.arch == LLM_ARCH_GLM_DSA || model.arch == LLM_ARCH_DOTS3NOTE ||
+                model.arch == LLM_ARCH_MISTRAL_LARGE4) &&
+                hparams.n_embd_head_k_full == hparams.indexer_head_size) {
             attn_rot_k = true;
         }
 
@@ -3130,6 +3133,10 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
+uint32_t llama_kv_cache_context::get_size() const {
+    return kv->get_size();
+}
+
 uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
     if (ubatches.empty() || sinfos.empty() || i_cur >= ubatches.size() || i_cur >= sinfos.size()) {
         // reserve the banded path; the dense fallback is unallocatable at large n_ctx
@@ -3141,10 +3148,6 @@ uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
 
     const uint32_t result = kv->get_n_kv_pos_contiguous(sinfos[i_cur], ubatches[i_cur]);
     return result <= (uint32_t) n_kv ? result : 0;
-}
-
-uint32_t llama_kv_cache_context::get_size() const {
-    return kv->get_size();
 }
 
 uint32_t llama_kv_cache_context::get_n_kv_rows() const {
