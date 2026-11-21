@@ -786,6 +786,8 @@ class TestInkling2DSparkConversion(unittest.TestCase):
                   "text_config": {"hidden_size": 16, "num_hidden_layers": 2, "vocab_size": 64,
                                   "unpadded_vocab_size": 60, "final_logit_softcapping": 30.0}, "mtp_config": mtp}
         (path / "config.json").write_text(json.dumps(config))
+        # the released checkpoint ships the target's precision map next to mtp.safetensors
+        (path / "hf_quant_config.json").write_text(json.dumps({"model": {"parameter_groups": []}}))
         shapes = {"norm.weight": (16,), "mask_embed": (16,), "fuse_weight": (6, 2),
                   "markov_head.markov_w1.weight": (64, 4), "markov_head.rnn_proj.weight": (12, 40),
                   "markov_head.rnn_proj.bias": (12,), "markov_head.hidden_out.weight": (16, 4),
@@ -831,6 +833,27 @@ class TestInkling2DSparkConversion(unittest.TestCase):
                                        ("dflash.sample_from_anchor", False), ("dflash.has_confidence_head", False),
                                        ("dflash.rope.freq_base", 1000000.0), ("dflash.attention.sliding_window", 16)):
                         self.assertEqual(kv[key].value, value)
+
+    def test_dspark_looped_taps_and_quant_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            config, _ = self.fixture(path)
+            # 2 layers, core [1, 2) run 3 times: 4 visits, the final normed hidden state is tap 4
+            config["text_config"]["loop_config"] = {"core_start": 1, "core_end": 2, "num_passes": 3}
+            (path / "hf_quant_config.json").write_text(json.dumps({"quant_method": "inkling2", "model": {"parameter_groups": []}}))
+            for targets, ok in (([0, 4], True), ([0, 2], False)):
+                with self.subTest(targets=targets):
+                    config["mtp_config"]["target_layer_ids"] = targets
+                    (path / "config.json").write_text(json.dumps(config))
+                    if not ok:
+                        with self.assertRaises(ValueError):
+                            Inkling2DSparkModel(path, gguf.LlamaFileType.ALL_F32, path / "unused.gguf")
+                        continue
+                    model = Inkling2DSparkModel(path, gguf.LlamaFileType.ALL_F32, path / "unused.gguf")
+                    model.set_gguf_parameters()
+                    model.prepare_tensors()
+                    self.assertEqual(len(model.gguf_writer.tensors[0]), 84)
+                    self.assertEqual(list(model.gguf_writer.kv_data[0]["dflash.target_layers"].value), targets)
 
     def test_dspark_invalid_config(self):
         with tempfile.TemporaryDirectory() as directory:

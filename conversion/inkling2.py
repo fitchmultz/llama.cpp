@@ -385,6 +385,9 @@ class Inkling2DSparkModel(TextModel):
         mtp = config.get("mtp_config")
         if not mtp:
             raise ValueError("Inkling2 DSpark requires mtp_config")
+        if loop := text.get("loop_config"):
+            # the taps of a looped trunk count layer visits, the last one is the final normed hidden state
+            text = {**text, "num_hidden_layers": text["num_hidden_layers"] + (loop["num_passes"] - 1)*(loop["core_end"] - loop["core_start"])}
         targets = mtp["target_layer_ids"]
         if (len(targets) < 2 or targets != sorted(set(targets)) or targets[0] < 0 or
                 targets[-1] != text["num_hidden_layers"] or mtp["hidden_size"] != text["hidden_size"] or
@@ -408,6 +411,10 @@ class Inkling2DSparkModel(TextModel):
         if not (self.dir_model / "mtp.safetensors").is_file():
             raise ValueError("Inkling2 DSpark requires mtp.safetensors")
         return self.index_local_tensors("mtp")
+
+    def dequant_model(self):
+        # mtp.safetensors is BF16; hf_quant_config.json only describes the target checkpoint
+        return
 
     def get_vocab_base(self):
         tokens, types, pre = super().get_vocab_base()
