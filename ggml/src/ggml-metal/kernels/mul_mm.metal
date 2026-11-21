@@ -8,6 +8,7 @@ constant short FC_mul_mm_ne13  [[function_constant(FC_MUL_MM + 3)]];
 constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
 constant int32_t FC_mul_mm_id_map0_ne02 [[function_constant(FC_MUL_MM + 7)]];
+constant bool    FC_mul_mm_id_scale     [[function_constant(FC_MUL_MM + 8)]];
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -553,6 +554,7 @@ kernel void kernel_mul_mm_id(
         device const char * htpe,
         device const char * hids,
         device       char * dst,
+        device const float * w_scale,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -862,6 +864,8 @@ kernel void kernel_mul_mm_id(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    const float ex_scale = FC_mul_mm_id_scale ? w_scale[im] : 1.0f;
+
     for (short j = sgitg; j < nr1; j += 4) {
         const int id = ids_i32[idb + j];
 
@@ -876,12 +880,12 @@ kernel void kernel_mul_mm_id(
 
         int i = tiisg;
         for (; i < nr0/4; i += 32) {
-            *(D4 + i) = *(C4 + i);
+            *(D4 + i) = FC_mul_mm_id_scale ? (*(C4 + i) * ex_scale) : *(C4 + i);
         }
 
         i = (4*(nr0/4)) + tiisg;
         for (; i < nr0; i += 32) {
-            *(D + i) = *(C + i);
+            *(D + i) = FC_mul_mm_id_scale ? (*(C + i) * ex_scale) : *(C + i);
         }
     }
 }
