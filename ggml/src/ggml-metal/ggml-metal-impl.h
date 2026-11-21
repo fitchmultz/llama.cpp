@@ -1552,12 +1552,14 @@ typedef struct {
     int32_t  n_seq_tokens;
     int32_t  n_seqs;
     int32_t  kw;
+    int32_t  head_dim;
     uint64_t nb_p1;
     uint64_t nb_p2;
     uint64_t nb_w1;
     uint64_t nb_st1;
     uint64_t nb_st2;
     uint64_t nb_st3;
+    uint64_t nb_d1;
     float    res_scale;
 } ggml_metal_kargs_ssm_conv_full;
 

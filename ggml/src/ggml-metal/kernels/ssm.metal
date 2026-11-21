@@ -167,7 +167,7 @@ kernel void kernel_ssm_conv_f32_f32_batched_4(
     x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : (FC_ssm_conv_res ? (sumf + s[nc/4 - 1][3])*args.res_scale : sumf);
 }
 
-template <bool IS_SET_ROWS>
+template <bool IS_SET_ROWS, bool HAS_DYN>
 kernel void kernel_ssm_conv_full_impl(
         constant ggml_metal_kargs_ssm_conv_full & args,
         device const char * past,
@@ -175,6 +175,7 @@ kernel void kernel_ssm_conv_full_impl(
         device const char * weight,
         device       char * state_dst,
         device const char * slot_order,
+        device const char * dyn,
         device       char * dst,
         uint3  tgpig[[threadgroup_position_in_grid]],
         uint3  tpitg[[thread_position_in_threadgroup]],
@@ -183,26 +184,39 @@ kernel void kernel_ssm_conv_full_impl(
     if (c >= args.n_channels) {
         return;
     }
-    const int64_t s = tgpig.y;
-
-    device const float  * p_ptr = (device const float  *) (past   + s * args.nb_p2 + c * args.nb_p1);
-    device const float4 * w_ptr = (device const float4 *) (weight + c * args.nb_w1);
-    device const float  * cur_f = (device const float  *) cur;
-    device       float  * dst_f = (device       float  *) dst;
-    device const int32_t * sl_o = IS_SET_ROWS ? (device const int32_t *) slot_order : nullptr;
-
-    float p0 = p_ptr[0];
-    float p1 = p_ptr[1];
-    float p2 = p_ptr[2];
-    const float4 w = w_ptr[0];
-
-    const int64_t C = args.n_channels;
-    const int64_t T = args.n_seq_tokens;
+    constexpr int64_t BT = 4;
+    const int64_t t0 = (int64_t) tgpig.y * BT;
+    const int64_t T  = args.n_seq_tokens;
+    if (t0 >= T) {
+        return;
+    }
+    const int64_t t_end    = min(t0 + BT, T);
+    const int64_t s        = tgpig.z;
+    const int64_t C        = args.n_channels;
     const int64_t base_tok = s * T;
 
-    for (int64_t t = 0; t < T; ++t) {
+    device const float   * p_ptr = (device const float   *) (past   + s * args.nb_p2 + c * args.nb_p1);
+    device const float4  * w_ptr = (device const float4  *) (weight + c * args.nb_w1);
+    device const float   * cur_f = (device const float   *) cur;
+    device       float   * dst_f = (device       float   *) dst;
+    device const int32_t * sl_o  = IS_SET_ROWS ? (device const int32_t *) slot_order : nullptr;
+
+    const float4  w = w_ptr[0];
+    const int64_t h = HAS_DYN ? (c / args.head_dim) : 0;
+
+    float p0 = (t0 < 3) ? p_ptr[t0]     : cur_f[(base_tok + t0 - 3) * C + c];
+    float p1 = (t0 < 2) ? p_ptr[t0 + 1] : cur_f[(base_tok + t0 - 2) * C + c];
+    float p2 = (t0 < 1) ? p_ptr[t0 + 2] : cur_f[(base_tok + t0 - 1) * C + c];
+
+    for (int64_t t = t0; t < t_end; ++t) {
         const float v = cur_f[(base_tok + t) * C + c];
-        const float y = (p0 * w.x + p1 * w.y + p2 * w.z + v * w.w + v) * args.res_scale;
+        float y;
+        if (HAS_DYN) {
+            const float4 d = ((device const float4 *) (dyn + (base_tok + t) * args.nb_d1))[h];
+            y = (p0 * (w.x + d.w) + p1 * (w.y + d.z) + p2 * (w.z + d.y) + v * (w.w + d.x) + v) * args.res_scale;
+        } else {
+            y = (p0 * w.x + p1 * w.y + p2 * w.z + v * w.w + v) * args.res_scale;
+        }
         dst_f[(base_tok + t) * C + c] = y;
 
         p0 = p1;
@@ -221,7 +235,7 @@ kernel void kernel_ssm_conv_full_impl(
         }
     }
 
-    if (!IS_SET_ROWS) {
+    if (!IS_SET_ROWS && t_end == T) {
         device float * st = (device float *) (state_dst + s * args.nb_st1 + c * 3 * sizeof(float));
         st[0] = p0;
         st[1] = p1;
@@ -229,9 +243,11 @@ kernel void kernel_ssm_conv_full_impl(
     }
 }
 
-typedef decltype(kernel_ssm_conv_full_impl<false>) kernel_ssm_conv_full_t;
-template [[host_name("kernel_ssm_conv_full_cpy_f32")]] kernel kernel_ssm_conv_full_t kernel_ssm_conv_full_impl<false>;
-template [[host_name("kernel_ssm_conv_full_set_f32")]] kernel kernel_ssm_conv_full_t kernel_ssm_conv_full_impl<true>;
+typedef decltype(kernel_ssm_conv_full_impl<false, false>) kernel_ssm_conv_full_t;
+template [[host_name("kernel_ssm_conv_full_cpy_f32")]]     kernel kernel_ssm_conv_full_t kernel_ssm_conv_full_impl<false, false>;
+template [[host_name("kernel_ssm_conv_full_set_f32")]]     kernel kernel_ssm_conv_full_t kernel_ssm_conv_full_impl<true,  false>;
+template [[host_name("kernel_ssm_conv_full_dyn_cpy_f32")]] kernel kernel_ssm_conv_full_t kernel_ssm_conv_full_impl<false, true>;
+template [[host_name("kernel_ssm_conv_full_dyn_set_f32")]] kernel kernel_ssm_conv_full_t kernel_ssm_conv_full_impl<true,  true>;
 
 // ref: ggml.c:ggml_compute_forward_ssm_scan_f32, Mamba-2 part
 // Optimized version: reduces redundant memory loads by having one thread load shared values

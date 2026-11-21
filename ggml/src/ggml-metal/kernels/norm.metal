@@ -342,112 +342,95 @@ kernel void kernel_depth_mix_f32_4(
         device const char * cur,
         device const char * query,
         device       char * dst,
-        uint   tgpig[[threadgroup_position_in_grid]],
-        ushort tpitg[[thread_position_in_threadgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]],
-        ushort tiisg[[thread_index_in_simdgroup]]) {
-    const int tok = tgpig;
-    device const float4 * cur_row = (device const float4 *) (cur + tok * args.nb11);
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]]) {
+    const int tok    = tgpig.x;
+    const int j      = tgpig.y;
+    const int k_prev = args.k_prev;
+    const int K      = k_prev + 1;
 
-    // 1. RMS-normalize cur in registers (up to 4 float4s/thread = D <= 4096)
+    device const float4 * cur_row = (device const float4 *) (cur   + tok * args.nb11);
+    device const float4 * q_row   = (device const float4 *) (query + j   * args.nb21);
+
+    // 1. Single-pass: accumulate ||cur||^2, dot(cur, q), and dot(blocks[k], q) before one barrier
     float ss = 0.0f;
+    float s_cur = 0.0f;
     float4 cn[4];
     int cidx = 0;
-    for (int i = tpitg; i < args.ne00; i += 256) {
+    for (int i = tpitg.x; i < args.ne00; i += 256) {
         const float4 v = cur_row[i];
-        ss += dot(v, v);
+        const float4 q = q_row[i];
+        ss    += dot(v, v);
+        s_cur += dot(v, q);
         if (cidx < 4) {
             cn[cidx] = v;
         }
         cidx++;
     }
-    ss = simd_sum(ss);
 
-    // shmem[0..127] = 8 simdgroups x 16 depth scores; shmem[128..135] = RMS reduction; shmem[136] = inv_rms
-    threadgroup float shmem[137];
+    float sc[16];
+    sc[k_prev] = simd_sum(s_cur);
+    ss         = simd_sum(ss);
+
+    for (int k = 0; k < k_prev; ++k) {
+        device const float4 * b_row = (device const float4 *) (blocks + tok * args.nb02 + k * args.nb01);
+        float sk = 0.0f;
+        for (int i = tpitg.x; i < args.ne00; i += 256) {
+            sk += dot(b_row[i], q_row[i]);
+        }
+        sc[k] = simd_sum(sk);
+    }
+
+    // shmem[sg * 17 + 0..K-1] = simdgroup dot partials; shmem[sg * 17 + 16] = simdgroup ss partial
+    threadgroup float shmem[8 * 17];
     if (tiisg == 0) {
-        shmem[128 + sgitg] = ss;
+        for (int k = 0; k < K; ++k) {
+            shmem[sgitg * 17 + k] = sc[k];
+        }
+        shmem[sgitg * 17 + 16] = ss;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sgitg == 0) {
-        float t = (tiisg < 8) ? shmem[128 + tiisg] : 0.0f;
-        t = simd_sum(t);
-        if (tiisg == 0) {
-            shmem[136] = rsqrt(t / float(args.ne00 * 4) + args.eps);
+
+    const float tot_ss =
+        shmem[0*17 + 16] + shmem[1*17 + 16] + shmem[2*17 + 16] + shmem[3*17 + 16] +
+        shmem[4*17 + 16] + shmem[5*17 + 16] + shmem[6*17 + 16] + shmem[7*17 + 16];
+    const float inv_rms = rsqrt(tot_ss / float(args.ne00 * 4) + args.eps);
+
+    float w[16];
+    float smax = -INFINITY;
+    for (int k = 0; k < K; ++k) {
+        float tot =
+            shmem[0*17 + k] + shmem[1*17 + k] + shmem[2*17 + k] + shmem[3*17 + k] +
+            shmem[4*17 + k] + shmem[5*17 + k] + shmem[6*17 + k] + shmem[7*17 + k];
+        if (k == k_prev) {
+            tot *= inv_rms;
         }
+        w[k] = tot * args.scale;
+        smax = max(smax, w[k]);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float inv_rms = shmem[136];
-    for (int c = 0; c < cidx && c < 4; ++c) {
-        cn[c] *= inv_rms;
+    float wsum = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        w[k] = exp(w[k] - smax);
+        wsum += w[k];
     }
+    const float inv_wsum = 1.0f / wsum;
+    for (int k = 0; k < K; ++k) {
+        w[k] *= inv_wsum;
+    }
+    const float w_cur = w[k_prev] * inv_rms;
 
-    const int k_prev = args.k_prev;
-    const int K      = k_prev + 1;
-
-    for (int j = 0; j < args.n_q; ++j) {
-        device const float4 * q_row = (device const float4 *) (query + j * args.nb21);
-        float sc[16];
-
-        float s_cur = 0.0f;
-        int ci = 0;
-        for (int i = tpitg; i < args.ne00; i += 256) {
-            const float4 v = (ci < 4) ? cn[ci] : (cur_row[i] * inv_rms);
-            s_cur += dot(v, q_row[i]);
-            ci++;
-        }
-        sc[k_prev] = simd_sum(s_cur);
-
+    device float4 * out_row = (device float4 *) (dst + tok * args.nb2 + j * args.nb1);
+    int ci = 0;
+    for (int i = tpitg.x; i < args.ne00; i += 256) {
+        float4 acc = w_cur * ((ci < 4) ? cn[ci] : cur_row[i]);
         for (int k = 0; k < k_prev; ++k) {
             device const float4 * b_row = (device const float4 *) (blocks + tok * args.nb02 + k * args.nb01);
-            float sk = 0.0f;
-            for (int i = tpitg; i < args.ne00; i += 256) {
-                sk += dot(b_row[i], q_row[i]);
-            }
-            sc[k] = simd_sum(sk);
+            acc += w[k] * b_row[i];
         }
-
-        if (tiisg == 0) {
-            for (int k = 0; k < K; ++k) {
-                shmem[sgitg * 16 + k] = sc[k];
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float w[16];
-        float smax = -INFINITY;
-        for (int k = 0; k < K; ++k) {
-            const float tot =
-                shmem[0*16 + k] + shmem[1*16 + k] + shmem[2*16 + k] + shmem[3*16 + k] +
-                shmem[4*16 + k] + shmem[5*16 + k] + shmem[6*16 + k] + shmem[7*16 + k];
-            w[k] = tot * args.scale;
-            smax = max(smax, w[k]);
-        }
-        float wsum = 0.0f;
-        for (int k = 0; k < K; ++k) {
-            w[k] = exp(w[k] - smax);
-            wsum += w[k];
-        }
-        const float inv_wsum = 1.0f / wsum;
-        for (int k = 0; k < K; ++k) {
-            w[k] *= inv_wsum;
-        }
-
-        device float4 * out_row = (device float4 *) (dst + tok * args.nb2 + j * args.nb1);
-        ci = 0;
-        for (int i = tpitg; i < args.ne00; i += 256) {
-            float4 acc = w[k_prev] * ((ci < 4) ? cn[ci] : (cur_row[i] * inv_rms));
-            for (int k = 0; k < k_prev; ++k) {
-                device const float4 * b_row = (device const float4 *) (blocks + tok * args.nb02 + k * args.nb01);
-                acc += w[k] * b_row[i];
-            }
-            out_row[i] = acc;
-            ci++;
-        }
-
-        if (j + 1 < args.n_q) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
+        out_row[i] = acc;
+        ci++;
     }
 }
 

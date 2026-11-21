@@ -226,7 +226,11 @@ ggml_tensor * llama_model_inkling2::graph::mix_states(ggml_tensor * states, ggml
     ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
 
-    return ggml_mul_mat(ctx0, states_T, scores);
+    ggml_tensor * out = ggml_mul_mat(ctx0, states_T, scores);
+    if (n_tokens > 1 && query->ne[1] > 1) {
+        out = ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3));
+    }
+    return out;
 }
 
 // attention over the depth: mix the earlier block outputs and cur with learned queries
@@ -275,6 +279,10 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
     const int64_t n_seqs       = ubatch.n_seqs;
 
+    if (dynamic) {
+        ggml_build_forward_expand(gf, dynamic);
+    }
+
     ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
 
     ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
@@ -308,9 +316,7 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     }
 
     ggml_tensor * res = ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
-    if (!dynamic) {
-        ggml_build_forward_expand(gf, res);
-    }
+    ggml_build_forward_expand(gf, res);
     return res;
 }
 
@@ -429,7 +435,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         if (n_tokens == 1) {
             return ggml_view_2d(ctx0, m, n_embd, 1, m->nb[1], r*m->nb[1]);
         }
-        return ggml_cont(ctx0, ggml_view_2d(ctx0, m, n_embd, n_tokens, m->nb[2], r*m->nb[1]));
+        return ggml_view_2d(ctx0, m, n_embd, n_tokens, m->nb[1], r*m->nb[2]);
     };
 
     for (int il = 0; il < n_layer; ++il) {
@@ -447,14 +453,15 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                     prelude_blocks_norm     = blocks_norm;
                     prelude_cur             = cur;
                 } else {
-                    ggml_tensor * bank_states = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), 1e-6f);
+                    ggml_tensor * bank_prev = nullptr;
                     for (size_t bi = prelude_blocks_norm_vec.size() + 1; bi < blocks_norm_vec.size(); ++bi) {
-                        bank_states = ggml_concat(ctx0, blocks_norm_vec[bi], bank_states, 1);
+                        bank_prev = bank_prev ? ggml_concat(ctx0, blocks_norm_vec[bi], bank_prev, 1) : blocks_norm_vec[bi];
                     }
-                    ggml_tensor * bank_states_T = ggml_cont(ctx0, ggml_transpose(ctx0, bank_states));
 
-                    pass_m_attn = mix_states(bank_states, bank_states_T, model.loop_res_query);
-                    pass_m_kv   = mix_states(bank_states, bank_states_T, model.loop_kv_res_query);
+                    pass_m_attn = mix(bank_prev, cur, model.loop_res_query);
+                    pass_m_kv   = mix(bank_prev, cur, model.loop_kv_res_query);
+                    ggml_build_forward_expand(gf, pass_m_attn);
+                    ggml_build_forward_expand(gf, pass_m_kv);
 
                     blocks_norm_vec = prelude_blocks_norm_vec;
                     blocks_norm     = prelude_blocks_norm;
