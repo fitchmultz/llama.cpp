@@ -50,7 +50,7 @@
 #define N_R0_MXFP4 2
 #define N_SG_MXFP4 2
 
-#define N_R0_NVFP4 2
+#define N_R0_NVFP4 4
 #define N_SG_NVFP4 2
 
 #define N_R0_Q2_K 4
@@ -1536,6 +1536,30 @@ typedef struct {
     uint64_t nb2;
     float    eps;
 } ggml_metal_kargs_concat_rms_norm;
+
+typedef struct {
+    int32_t  ne01;
+    uint64_t nb_g1;
+    uint64_t nb_f1;
+    uint64_t nb_h1;
+    uint64_t nb_c1;
+    uint64_t nb_m1;
+    uint64_t nb_d1;
+} ggml_metal_kargs_loop_control_mm;
+
+typedef struct {
+    int32_t  n_channels;
+    int32_t  n_seq_tokens;
+    int32_t  n_seqs;
+    int32_t  kw;
+    uint64_t nb_p1;
+    uint64_t nb_p2;
+    uint64_t nb_w1;
+    uint64_t nb_st1;
+    uint64_t nb_st2;
+    uint64_t nb_st3;
+    float    res_scale;
+} ggml_metal_kargs_ssm_conv_full;
 
 typedef struct {
     int64_t ne;

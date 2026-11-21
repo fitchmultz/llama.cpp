@@ -255,7 +255,9 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     ggml_tensor * forget = ggml_tanh(ctx0, f_lin);
     ggml_tensor * gain   = ggml_tanh(ctx0, g_lin);
 
-    return ggml_add(ctx0, ggml_mul(ctx0, ggml_scale_bias(ctx0, forget, -1.0f, 1.0f), cur), ggml_mul(ctx0, gain, message));
+    ggml_tensor * out = ggml_add(ctx0, ggml_mul(ctx0, ggml_scale_bias(ctx0, forget, -1.0f, 1.0f), cur), ggml_mul(ctx0, gain, message));
+    ggml_build_forward_expand(gf, out);
+    return out;
 }
 
 // causal short convolution with a residual; dynamic adds input-dependent taps per head
@@ -305,7 +307,11 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
         }
     }
 
-    return ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
+    ggml_tensor * res = ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
+    if (!dynamic) {
+        ggml_build_forward_expand(gf, res);
+    }
+    return res;
 }
 
 llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {

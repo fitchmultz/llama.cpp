@@ -493,6 +493,57 @@ kernel void kernel_concat_rms_norm_f32_4(
     }
 }
 
+#if defined(GGML_METAL_HAS_BF16)
+kernel void kernel_loop_control_mm_bf16_f32(
+        constant ggml_metal_kargs_loop_control_mm & args,
+        device const char * w_gain,
+        device const char * w_forget,
+        device const char * h,
+        device const char * cur,
+        device const char * msg,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+    const int tok     = tgpig.y;
+    const int half_id = tiisg / 16;
+    const int lane    = tiisg % 16;
+    const int row0    = (tgpig.x * 8 + sgitg * 2 + half_id) * 2;
+
+    device const float4 * h4   = (device const float4 *) (h   + tok * args.nb_h1);
+    device const float  * crow = (device const float  *) (cur + tok * args.nb_c1);
+    device const float  * mrow = (device const float  *) (msg + tok * args.nb_m1);
+    device       float  * drow = (device       float  *) (dst + tok * args.nb_d1);
+
+    const float4 hv = h4[lane];
+
+    FOR_UNROLL (int r = 0; r < 2; ++r) {
+        const int row = row0 + r;
+        if (row < args.ne01) {
+            device const bfloat4 * wg4 = (device const bfloat4 *) (w_gain   + row * args.nb_g1);
+            device const bfloat4 * wf4 = (device const bfloat4 *) (w_forget + row * args.nb_f1);
+
+            float dg = dot(float4(wg4[lane]), hv);
+            float df = dot(float4(wf4[lane]), hv);
+
+            dg += simd_shuffle_xor(dg, 8);
+            dg += simd_shuffle_xor(dg, 4);
+            dg += simd_shuffle_xor(dg, 2);
+            dg += simd_shuffle_xor(dg, 1);
+
+            df += simd_shuffle_xor(df, 8);
+            df += simd_shuffle_xor(df, 4);
+            df += simd_shuffle_xor(df, 2);
+            df += simd_shuffle_xor(df, 1);
+
+            if (lane == 0) {
+                drow[row] = (1.0f - tanh(df)) * crow[row] + tanh(dg) * mrow[row];
+            }
+        }
+    }
+}
+#endif
+
 constant bool FC_group_norm_flat [[function_constant(FC_GROUP_NORM + 0)]];
 
 kernel void kernel_group_norm_f32(

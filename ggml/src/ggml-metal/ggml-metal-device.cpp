@@ -2369,6 +2369,28 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat_rms_norm(
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_loop_control_mm(ggml_metal_library_t lib) {
+    const char * name = "kernel_loop_control_mm_bf16_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_full(ggml_metal_library_t lib, bool is_set_rows) {
+    const char * name = is_set_rows ? "kernel_ssm_conv_full_set_f32" : "kernel_ssm_conv_full_cpy_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_group_norm(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_GROUP_NORM);
 
