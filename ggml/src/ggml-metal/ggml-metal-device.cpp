@@ -1272,17 +1272,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(ggml_metal_library_t lib, int ne02, int ne20) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(ggml_metal_library_t lib, int ne02, int ne20, int ntile) {
     char base[256];
     char name[256];
 
     snprintf(base, 256, "kernel_mul_mm_id_map0_ne20_%d", ne20);
-    snprintf(name, 256, "%s_ne02=%d", base, ne02);
+    snprintf(name, 256, "%s_ne02=%d_nt=%d", base, ne02, ntile);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
-        ggml_metal_cv_set_int32(cv, ne02, FC_MUL_MM + 7);
+        ggml_metal_cv_set_int32(cv, ne02,  FC_MUL_MM + 7);
+        ggml_metal_cv_set_int32(cv, ntile, FC_MUL_MM + 9);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -1292,6 +1293,49 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(g
     // per expert: entry count + base offset, followed by the staging of the ids of ntg tokens
     res.smem = 2*(size_t) ne02*sizeof(uint32_t) + (size_t) ne02*ne20*sizeof(uint16_t);
     res.smem = GGML_PAD(res.smem, 16);
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_grouped(ggml_metal_library_t lib, const ggml_tensor * op, bool has_scale) {
+    char base[256];
+    char name[256];
+
+    const ggml_type tsrc0 = op->src[0]->type;
+    const int ne00 = (int) op->src[0]->ne[0];
+
+    int nsg = 2;
+    int nr0 = 2;
+    size_t smem = 0;
+
+    if (tsrc0 == GGML_TYPE_NVFP4) {
+        nsg  = N_SG_NVFP4;
+        nr0  = N_R0_NVFP4;
+        smem = 0;
+    } else {
+        nsg  = std::min(4, (ne00 + 127) / 128);
+        nr0  = 2;
+        smem = 32 * sizeof(float) * nr0 * 4;
+    }
+
+    snprintf(base, 256, "kernel_mul_mv_id_%s_f32_grouped", ggml_type_name(tsrc0));
+    snprintf(name, 256, "%s_nsg=%d_sc=%d", base, nsg, has_scale);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_int16(cv, nsg,       FC_MUL_MV + 0);
+        ggml_metal_cv_set_bool (cv, has_scale, FC_MUL_MV + 6);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    res.nr0  = nr0;
+    res.nr1  = 1;
+    res.nsg  = nsg;
+    res.smem = smem;
 
     return res;
 }

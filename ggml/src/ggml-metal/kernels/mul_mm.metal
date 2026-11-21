@@ -7,8 +7,9 @@ constant short FC_mul_mm_ne12  [[function_constant(FC_MUL_MM + 2)]];
 constant short FC_mul_mm_ne13  [[function_constant(FC_MUL_MM + 3)]];
 constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
-constant int32_t FC_mul_mm_id_map0_ne02 [[function_constant(FC_MUL_MM + 7)]];
-constant bool    FC_mul_mm_id_scale     [[function_constant(FC_MUL_MM + 8)]];
+constant int32_t  FC_mul_mm_id_map0_ne02  [[function_constant(FC_MUL_MM + 7)]];
+constant bool     FC_mul_mm_id_scale      [[function_constant(FC_MUL_MM + 8)]];
+constant int32_t  FC_mul_mm_id_map0_ntile [[function_constant(FC_MUL_MM + 9)]];
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -423,7 +424,7 @@ kernel void kernel_mul_mm_id_map0(
     // every slice is padded by one entry for the uniform dummy store of pass 2 - and emit the
     // entry tile descriptors of kernel_mul_mm_id: (expert, first entry, valid rows) per tile
     if (tpitg == 0) {
-        constexpr uint32_t NTILE = 32; // must match NR1 of kernel_mul_mm_id
+        const uint32_t NTILE = (uint32_t) FC_mul_mm_id_map0_ntile; // 32 for mul_mm_id, 4 for grouped mul_mv_id
 
         uint32_t base = 0;
         uint32_t tile = 0;
