@@ -3143,6 +3143,10 @@ uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
     return result <= (uint32_t) n_kv ? result : 0;
 }
 
+uint32_t llama_kv_cache_context::get_size() const {
+    return kv->get_size();
+}
+
 uint32_t llama_kv_cache_context::get_n_kv_rows() const {
     return n_kv_rows;
 }
