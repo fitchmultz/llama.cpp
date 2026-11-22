@@ -133,12 +133,10 @@ static bool ggml_metal_mul_mat_mma_type_ok(const struct ggml_tensor * op) {
 // the fewest src1 rows at which the few-row MMA kernels beat the mat-vec kernels (measured on an M3 Ultra)
 static int64_t ggml_metal_mul_mv_mma_rows_min(enum ggml_type type) {
     switch (type) {
-        case GGML_TYPE_F32:
-            return 6;
         case GGML_TYPE_TQ2_0:
             return 5;
+        case GGML_TYPE_F32:
         case GGML_TYPE_BF16:
-            return 4;
         case GGML_TYPE_F16:
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_K:
