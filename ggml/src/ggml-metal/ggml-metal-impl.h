@@ -1620,6 +1620,7 @@ typedef struct {
 
 typedef struct {
     int32_t  ne01;
+    int32_t  n_tokens;
     uint64_t nb_g1;
     uint64_t nb_f1;
     uint64_t nb_h1;

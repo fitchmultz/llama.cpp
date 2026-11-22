@@ -2809,8 +2809,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat_rms_norm(
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_loop_down_norm(ggml_metal_library_t lib, bool multi_tok) {
-    const char * name = multi_tok ? "kernel_loop_down_norm_bf16_f32_tn" : "kernel_loop_down_norm_bf16_f32_t1";
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_loop_down_norm(ggml_metal_library_t lib, int mode) {
+    const char * name = mode == 3 ? "kernel_loop_down_norm_bf16_f32_tensor_n16"
+                      : mode == 2 ? "kernel_loop_down_norm_bf16_f32_tensor_n8"
+                      : mode == 1 ? "kernel_loop_down_norm_bf16_f32_tn"
+                                  : "kernel_loop_down_norm_bf16_f32_t1";
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -2820,8 +2823,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_loop_down_norm(g
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_loop_control_mm(ggml_metal_library_t lib) {
-    const char * name = "kernel_loop_control_mm_bf16_f32";
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_loop_control_mm(ggml_metal_library_t lib, bool use_tensor) {
+    const char * name = use_tensor ? "kernel_loop_control_mm_bf16_f32_tensor" : "kernel_loop_control_mm_bf16_f32";
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {

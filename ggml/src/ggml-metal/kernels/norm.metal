@@ -701,6 +701,226 @@ kernel void kernel_loop_control_mm_bf16_f32(
         }
     }
 }
+
+#if defined(GGML_METAL_HAS_TENSOR)
+// Metal 4 Tensor fused LOOP_DOWN_NORM for prefill (T > 32):
+// Pulls per-token inv_rms outside the matmul: w_a*RMS(a) + w_b*RMS(b) = inv_a*(w_a*a) + inv_b*(w_b*b).
+// Eliminates the [2*D, T] CONCAT_RMS_NORM intermediate write & read completely (<= 8 KB shmem, NK=128).
+template <int NRB, int NK>
+kernel void kernel_loop_down_norm_bf16_f32_tensor_impl(
+        constant ggml_metal_kargs_loop_down_norm & args,
+        device const char * src_a,
+        device const char * src_b,
+        device const char * w,
+        device       char * dst,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    constexpr int NRA         = 64;
+    constexpr int LANES_ROW   = 128 / NRB;            // 16 for NRB=8, 8 for NRB=16
+    constexpr int VEC4_LANE   = (NK / 4) / LANES_ROW; // 2 for (8,128), 4 for (16,128)
+
+    static_assert(NRB == 8 || NRB == 16, "NRB must be 8 or 16");
+    static_assert((NK / 4) % LANES_ROW == 0, "NK/4 must be divisible by LANES_ROW");
+
+    const int ra    = (int) tgpig.x * NRA;
+    const int rb    = (int) tgpig.y * NRB;
+    const int tileM = min(NRA, args.ne01 - ra);
+    const int tileN = min(NRB, args.n_tokens - rb);
+    if (tileM <= 0 || tileN <= 0) {
+        return;
+    }
+
+    const int D        = args.ne00 * 4;
+    const int w_stride = (int) (args.nb_w1 / sizeof(bfloat));
+    const int d_stride = (int) (args.nb_d1 / sizeof(float));
+
+    const ushort tiitg = sgitg * 32 + tiisg;
+    const short  row   = tiitg / LANES_ROW; // 0..NRB-1 (all lanes of a row live in one simdgroup)
+    const short  lane  = tiitg % LANES_ROW; // 0..LANES_ROW-1
+
+    threadgroup bfloat sh_a[NRB * NK];
+    threadgroup bfloat sh_b[NRB * NK];
+    threadgroup float  s_inv_a[NRB];
+    threadgroup float  s_inv_b[NRB];
+
+    const bool row_valid = (rb + row) < args.n_tokens;
+    device const float4 * a_row4 = row_valid ? (device const float4 *) (src_a + (uint64_t) (rb + row) * args.nb_a2) : nullptr;
+    device const float4 * b_row4 = row_valid ? (device const float4 *) (src_b + (uint64_t) (rb + row) * args.nb_b2) : nullptr;
+
+    auto tXa0 = tensor(sh_a, dextents<int32_t, 2>(NK, NRB));
+    auto tWa0 = tensor((device bfloat *) w, dextents<int32_t, 2>(NK, NRA), array<int, 2>({1, w_stride}));
+
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(
+            NRB, NRA, static_cast<int>(dynamic_extent), false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+
+    auto cA = mm.template get_destination_cooperative_tensor<decltype(tXa0), decltype(tWa0), float>();
+    auto cB = mm.template get_destination_cooperative_tensor<decltype(tXa0), decltype(tWa0), float>();
+
+    FOR_UNROLL (short i = 0; i < cA.get_capacity(); ++i) {
+        if (cA.is_valid_element(i)) {
+            cA[i] = 0.0f;
+            cB[i] = 0.0f;
+        }
+    }
+
+    float ss_a = 0.0f;
+    float ss_b = 0.0f;
+
+    device bfloat * wa_base = (device bfloat *) (w + (uint64_t) ra * args.nb_w1);
+    device bfloat * wb_base = wa_base + D;
+
+    for (int loop_k = 0; loop_k < D; loop_k += NK) {
+        const int k4_base = (loop_k >> 2) + lane * VEC4_LANE;
+        threadgroup bfloat4 * dst_a4 = (threadgroup bfloat4 *) (sh_a + row * NK) + lane * VEC4_LANE;
+        threadgroup bfloat4 * dst_b4 = (threadgroup bfloat4 *) (sh_b + row * NK) + lane * VEC4_LANE;
+
+        FOR_UNROLL (int v = 0; v < VEC4_LANE; ++v) {
+            float4 av = float4(0.0f);
+            float4 bv = float4(0.0f);
+            if (row_valid && (k4_base + v) < args.ne00) {
+                av = a_row4[k4_base + v];
+                bv = b_row4[k4_base + v];
+                ss_a += dot(av, av);
+                ss_b += dot(bv, bv);
+            }
+            dst_a4[v] = bfloat4(av);
+            dst_b4[v] = bfloat4(bv);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const int kExt = min(NK, D - loop_k);
+        auto tXav = tensor(sh_a,             dextents<int32_t, 2>(kExt, tileN), array<int, 2>({1, NK}));
+        auto tXbv = tensor(sh_b,             dextents<int32_t, 2>(kExt, tileN), array<int, 2>({1, NK}));
+        auto tWav = tensor(wa_base + loop_k, dextents<int32_t, 2>(kExt, tileM), array<int, 2>({1, w_stride}));
+        auto tWbv = tensor(wb_base + loop_k, dextents<int32_t, 2>(kExt, tileM), array<int, 2>({1, w_stride}));
+
+        mm.run(tXav, tWav, cA);
+        mm.run(tXbv, tWbv, cB);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if constexpr (LANES_ROW == 16) {
+        ss_a += simd_shuffle_xor(ss_a, 8);
+        ss_b += simd_shuffle_xor(ss_b, 8);
+    }
+    ss_a += simd_shuffle_xor(ss_a, 4);
+    ss_a += simd_shuffle_xor(ss_a, 2);
+    ss_a += simd_shuffle_xor(ss_a, 1);
+
+    ss_b += simd_shuffle_xor(ss_b, 4);
+    ss_b += simd_shuffle_xor(ss_b, 2);
+    ss_b += simd_shuffle_xor(ss_b, 1);
+
+    if (lane == 0) {
+        const float inv_d = 1.0f / float(D);
+        s_inv_a[row] = rsqrt(ss_a * inv_d + args.eps);
+        s_inv_b[row] = rsqrt(ss_b * inv_d + args.eps);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    FOR_UNROLL (short i = 0; i < cA.get_capacity(); ++i) {
+        if (cA.is_valid_element(i)) {
+            const short t_loc = cA.get_multidimensional_index(i)[1];
+            cA[i] = cA[i] * s_inv_a[t_loc] + cB[i] * s_inv_b[t_loc];
+        }
+    }
+
+    device float * dst_tile = (device float *) (dst + (uint64_t) rb * args.nb_d1) + ra;
+    auto tD = tensor(dst_tile, dextents<int32_t, 2>(tileM, tileN), array<int, 2>({1, d_stride}));
+    cA.store(tD);
+}
+
+typedef decltype(kernel_loop_down_norm_bf16_f32_tensor_impl<16, 128>) kernel_loop_down_norm_tensor_t;
+template [[host_name("kernel_loop_down_norm_bf16_f32_tensor_n8")]]  kernel kernel_loop_down_norm_tensor_t kernel_loop_down_norm_bf16_f32_tensor_impl<8,  128>;
+template [[host_name("kernel_loop_down_norm_bf16_f32_tensor_n16")]] kernel kernel_loop_down_norm_tensor_t kernel_loop_down_norm_bf16_f32_tensor_impl<16, 128>;
+
+// Metal 4 Tensor fused LOOP_CONTROL_MM for prefill (n_tokens > 16):
+// Single K=64 tile (zero K-loop, 8 KB shmem) computing both w_gain*h and w_forget*h on Neural Accelerators
+// and applying (1 - tanh(f))*cur + tanh(g)*msg in registers, eliminating g_lin/f_lin DRAM traffic.
+kernel void kernel_loop_control_mm_bf16_f32_tensor(
+        constant ggml_metal_kargs_loop_control_mm & args,
+        device const char * w_gain,
+        device const char * w_forget,
+        device const char * h,
+        device const char * cur,
+        device const char * msg,
+        device       char * dst,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    constexpr int NRA = 64;
+    constexpr int NRB = 64;
+    constexpr int NK  = 64;
+
+    const int ra    = (int) tgpig.x * NRA;
+    const int rb    = (int) tgpig.y * NRB;
+    const int tileM = min(NRA, args.ne01 - ra);
+    const int tileN = min(NRB, args.n_tokens - rb);
+    if (tileM <= 0 || tileN <= 0) {
+        return;
+    }
+
+    const ushort tiitg = sgitg * 32 + tiisg;
+
+    threadgroup bfloat sh[NRB * NK]; // 8 KB
+
+    // 128 threads load 64x64 f32 -> bfloat (8 float4s per thread)
+    FOR_UNROLL (int iter = 0; iter < 8; ++iter) {
+        const int idx4 = iter * 128 + tiitg;
+        const int t    = idx4 >> 4; // 0..63
+        const int k4   = idx4 & 15; // 0..15
+        threadgroup bfloat4 * sh4 = (threadgroup bfloat4 *) sh;
+        if (rb + t < args.n_tokens) {
+            device const float4 * h4 = (device const float4 *) (h + (uint64_t) (rb + t) * args.nb_h1);
+            sh4[idx4] = bfloat4(h4[k4]);
+        } else {
+            sh4[idx4] = bfloat4(0.0bf);
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int wg_stride = (int) (args.nb_g1 / sizeof(bfloat));
+    const int wf_stride = (int) (args.nb_f1 / sizeof(bfloat));
+
+    auto tH  = tensor(sh, dextents<int32_t, 2>(NK, tileN), array<int, 2>({1, NK}));
+    auto tWg = tensor((device bfloat *) (w_gain   + (uint64_t) ra * args.nb_g1), dextents<int32_t, 2>(NK, tileM), array<int, 2>({1, wg_stride}));
+    auto tWf = tensor((device bfloat *) (w_forget + (uint64_t) ra * args.nb_f1), dextents<int32_t, 2>(NK, tileM), array<int, 2>({1, wf_stride}));
+
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(
+            NRB, NRA, NK, false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply),
+        execution_simdgroups<4>> mm;
+
+    auto cG = mm.template get_destination_cooperative_tensor<decltype(tH), decltype(tWg), float>();
+    auto cF = mm.template get_destination_cooperative_tensor<decltype(tH), decltype(tWf), float>();
+
+    mm.run(tH, tWg, cG);
+    mm.run(tH, tWf, cF);
+
+    FOR_UNROLL (short i = 0; i < cG.get_capacity(); ++i) {
+        if (cG.is_valid_element(i)) {
+            const auto idx = cG.get_multidimensional_index(i);
+            const int  r   = ra + idx[0];
+            const int  t   = rb + idx[1];
+            if (r < args.ne01 && t < args.n_tokens) {
+                const float cv = ((device const float *) (cur + (uint64_t) t * args.nb_c1))[r];
+                const float mv = ((device const float *) (msg + (uint64_t) t * args.nb_m1))[r];
+                ((device float *) (dst + (uint64_t) t * args.nb_d1))[r] =
+                    (1.0f - tanh(cF[i])) * cv + tanh(cG[i]) * mv;
+            }
+        }
+    }
+}
+#endif
 #endif
 
 constant bool FC_group_norm_flat [[function_constant(FC_GROUP_NORM + 0)]];

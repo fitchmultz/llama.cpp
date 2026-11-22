@@ -716,11 +716,6 @@ static bool ggml_metal_fusion_check_loop_down_norm(
         return false;
     }
 
-    // Small/medium batches (decode, speculative verify, pp32) fuse; larger prefill keeps tensor matmul
-    if (mode == GGML_METAL_FUSION_FULL && T > 32) {
-        return false;
-    }
-
     const int outputs[1] = { raw_end };
     if (!ggml_can_fuse_subgraph_ext(gf, raw_idxs, 4, fusion->ops_all.data(), outputs, 1)) {
         return false;
@@ -744,6 +739,8 @@ static bool ggml_metal_fusion_check_loop_control_mm(
         const int                     * node_idxs,
               int                       idx,
               ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
     const int raw_start = node_idxs[idx];
     const int raw_end   = node_idxs[idx + 7];
     if (raw_end - raw_start != 7) {
@@ -808,11 +805,6 @@ static bool ggml_metal_fusion_check_loop_control_mm(
     }
     if (!ggml_are_same_shape(cur, add) || !ggml_are_same_shape(msg, add) ||
         add->ne[0] != w_gain->ne[1] || add->ne[1] != h->ne[1] || add->ne[2] != 1 || add->ne[3] != 1) {
-        return false;
-    }
-
-    // In FULL mode, only fuse small batches (decode + speculative verify); prefill keeps M5 tensor matmul
-    if (mode == GGML_METAL_FUSION_FULL && h->ne[1] > 16) {
         return false;
     }
 
@@ -2456,7 +2448,9 @@ static bool ggml_metal_fusion_check_fwht_mul_sigmoid(
         if (!fwht->src[1]->data || !gate->data || !mul->data) {
             return false;
         }
-        if (ggml_metal_fusion_overlap(mul, fwht->src[1]) || ggml_metal_fusion_overlap(mul, gate)) {
+        // Kernel reads entire N_FWHT row into registers before writing same row -> exact in-place is safe
+        if ((mul->data != fwht->src[1]->data && ggml_metal_fusion_overlap(mul, fwht->src[1])) ||
+            (mul->data != gate->data         && ggml_metal_fusion_overlap(mul, gate))) {
             return false;
         }
     }
@@ -2695,14 +2689,6 @@ void ggml_metal_fusion_add_alloc_deps(
 
         for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
             if ((int) fusion.ops_all.size() <= best_raw) {
-                continue;
-            }
-            // skip decode-only supersets on prefill so fallback sub-fusions (LOOP_CONTROL, CONCAT_RMS_NORM)
-            // still receive alloc deps on their own external inputs
-            if (fusion.id == GGML_METAL_FUSION_LOOP_CONTROL_MM && gf->nodes[i]->ne[1] > 16) {
-                continue;
-            }
-            if (fusion.id == GGML_METAL_FUSION_LOOP_DOWN_NORM && gf->nodes[i]->ne[2] > 32) {
                 continue;
             }
             if (ggml_metal_fusion_match_raw_pattern(gf, i, fusion.ops_all)) {
