@@ -411,6 +411,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
     ggml_tensor * tau = ggml_scale_bias(ctx0, ggml_cast(ctx0, inp_pos, GGML_TYPE_F32), 1.0f, 1.0f);
     tau = ggml_log(ctx0, ggml_clamp(ctx0, ggml_scale(ctx0, tau, 1.0f/hparams.n_log_scale_floor), 1.0f, INFINITY));
     tau = ggml_reshape_3d(ctx0, ggml_scale_bias(ctx0, tau, hparams.f_log_scale_alpha, 1.0f), 1, 1, n_tokens);
+    ggml_build_forward_expand(gf, tau);
 
     ggml_tensor * cur = build_inp_embd(model.tok_embd);
 
@@ -577,8 +578,8 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 }
                 ggml_build_forward_expand(gf, Qcur);
                 ggml_build_forward_expand(gf, Kcur);
-                ggml_build_forward_expand(gf, Vcur);
                 ggml_build_forward_expand(gf, cache_cur->cpy_k(ctx0, Kcur, is_swa ? attn->get_k_idxs_swa() : attn->get_k_idxs(), il));
+                ggml_build_forward_expand(gf, Vcur);
                 ggml_build_forward_expand(gf, cache_cur->cpy_v(ctx0, Vcur, is_swa ? attn->get_v_idxs_swa() : attn->get_v_idxs(), il));
 
                 const int64_t n_seq_tokens = n_tokens / n_stream;
@@ -617,8 +618,8 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 }
                 ggml_build_forward_expand(gf, Qcur);
                 ggml_build_forward_expand(gf, Kcur);
-                ggml_build_forward_expand(gf, Vcur);
                 ggml_build_forward_expand(gf, cache->cpy_k(ctx0, Kcur, is_swa ? attn->get_k_idxs_swa() : attn->get_k_idxs(), il));
+                ggml_build_forward_expand(gf, Vcur);
                 ggml_build_forward_expand(gf, cache->cpy_v(ctx0, Vcur, is_swa ? attn->get_v_idxs_swa() : attn->get_v_idxs(), il));
 
                 const int64_t n_kv_b = inp->n_kv_banded[is_swa];

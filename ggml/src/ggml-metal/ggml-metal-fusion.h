@@ -58,6 +58,10 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_SOFTCAP,       // SCALE(1/cap) + TANH + SCALE(cap) (logit softcapping)
     GGML_METAL_FUSION_MOE_REDUCE_CONV_ADD, // MOE_REDUCE + SSM_CONV_FULL + ADD (register-resident FFN epilogue)
     GGML_METAL_FUSION_FA_BANDED_REL, // MUL_MAT(rel_w[16,E], rel_q) [+ RESHAPE] + FLASH_ATTN_EXT_BANDED
+    GGML_METAL_FUSION_L2_CLIP_FWHT,          // L2_CLIP_SCALE [+ MUL(tau)] + RESHAPE + FWHT (Q head)
+    GGML_METAL_FUSION_L2_CLIP_FWHT_SET_ROWS, // L2_CLIP + RESHAPE + FWHT + RESHAPE + VIEW + [RESHAPE] + SET_ROWS(q8_0) (K head)
+    GGML_METAL_FUSION_RMS_NORM_FWHT_SET_ROWS,// RMS_NORM + RESHAPE + FWHT + RESHAPE + VIEW + [RESHAPE] + SET_ROWS(q8_0) (V head)
+    GGML_METAL_FUSION_FWHT_MUL_SIGMOID,      // FWHT + RESHAPE + SIGMOID + MUL (kqv_out gate)
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp

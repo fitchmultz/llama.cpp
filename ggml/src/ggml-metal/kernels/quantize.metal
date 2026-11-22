@@ -489,3 +489,88 @@ typedef decltype(kernel_set_rows_q<float, int64_t, QK_K, block_tq2_0, quantize_t
 template [[host_name("kernel_set_rows_f32_i64_tq2_0")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int64_t, QK_K, block_tq2_0, quantize_tq2_0>;
 template [[host_name("kernel_set_rows_f32_i32_tq2_0")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int32_t, QK_K, block_tq2_0, quantize_tq2_0>;
 
+// Coalesced 32-lane SIMD q8_0 quantization: matches quantize_q8_0 bit-for-bit.
+static inline void quantize_q8_0_simd(float v, ushort lane, device block_q8_0 & dst) {
+#pragma METAL fp math_mode(safe)
+    const float amax = simd_max(fabs(v));
+    const float d    = amax / 127.0f;
+    const float id   = d ? (1.0f / d) : 0.0f;
+    if (lane == 0) {
+        dst.d = (half) d;
+    }
+    dst.qs[lane] = (int8_t) round(v * id);
+}
+
+// Fused K/V head -> q8_0 KV cache: (L2_CLIP or RMS_NORM) + FWHT(64|128) + SIMD q8_0 SET_ROWS in registers.
+template <int N_FWHT, bool IS_RMS>
+kernel void kernel_head_fwht_set_rows_q8_0_impl(
+        constant ggml_metal_kargs_head_fwht & args,
+        device const char    * src0,
+        device const int64_t * idxs,
+        device       char    * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int sg_per_tg = ntg.x >> 5;
+    const int64_t r = (int64_t) tgpig.x * sg_per_tg + sgitg;
+    if (r >= (int64_t) args.n_head * args.n_tok) {
+        return;
+    }
+
+    const int64_t tok = r / args.n_head;
+    const int64_t h   = r - tok * args.n_head;
+
+    device const float * xp = (device const float *) (src0 + (uint64_t) tok * args.nb02 + (uint64_t) h * args.nb01);
+
+    float reg[4];
+    float ss = 0.0f;
+    FOR_UNROLL (int b = 0; b < 4; ++b) {
+        const float v = xp[b * 32 + tiisg];
+        reg[b] = v;
+        ss += v * v;
+    }
+
+    const float sumf    = simd_sum(ss);
+    const float fwht_sc = 1.0f / sqrt((float) N_FWHT);
+    const float factor  = IS_RMS
+        ? (rsqrt(sumf * (1.0f / 128.0f) + args.eps) * fwht_sc)
+        : (clamp(args.threshold / (sqrt(sumf) + args.eps), 0.0f, 1.0f) * fwht_sc);
+
+    FOR_UNROLL (int b = 0; b < 4; ++b) {
+        reg[b] *= factor;
+    }
+
+    FOR_UNROLL (int i = 1; i < 32; i *= 2) {
+        FOR_UNROLL (int j = 0; j < 4; ++j) {
+            const float v  = reg[j];
+            const float v2 = simd_shuffle_xor(v, i);
+            reg[j] = v2 - v + 2.0f * ((tiisg & i) == 0) * v;
+        }
+    }
+    {
+        const float x0 = reg[0], y0 = reg[1];
+        reg[0] = x0 + y0; reg[1] = x0 - y0;
+        const float x1 = reg[2], y1 = reg[3];
+        reg[2] = x1 + y1; reg[3] = x1 - y1;
+    }
+    if (N_FWHT == 128) {
+        const float x0 = reg[0], y0 = reg[2];
+        reg[0] = x0 + y0; reg[2] = x0 - y0;
+        const float x1 = reg[1], y1 = reg[3];
+        reg[1] = x1 + y1; reg[3] = x1 - y1;
+    }
+
+    const int64_t row_dst = idxs[tok];
+    device block_q8_0 * blk = (device block_q8_0 *) (dst + (uint64_t) row_dst * args.dst_nb1) + h * 4;
+    FOR_UNROLL (int b = 0; b < 4; ++b) {
+        quantize_q8_0_simd(reg[b], tiisg, blk[b]);
+    }
+}
+
+typedef decltype(kernel_head_fwht_set_rows_q8_0_impl<128, false>) kernel_head_fwht_set_rows_q8_0_t;
+template [[host_name("kernel_l2_clip_fwht_set_rows_q8_0_64")]]   kernel kernel_head_fwht_set_rows_q8_0_t kernel_head_fwht_set_rows_q8_0_impl<64,  false>;
+template [[host_name("kernel_l2_clip_fwht_set_rows_q8_0_128")]]  kernel kernel_head_fwht_set_rows_q8_0_t kernel_head_fwht_set_rows_q8_0_impl<128, false>;
+template [[host_name("kernel_rms_norm_fwht_set_rows_q8_0_64")]]  kernel kernel_head_fwht_set_rows_q8_0_t kernel_head_fwht_set_rows_q8_0_impl<64,  true>;
+template [[host_name("kernel_rms_norm_fwht_set_rows_q8_0_128")]] kernel kernel_head_fwht_set_rows_q8_0_t kernel_head_fwht_set_rows_q8_0_impl<128, true>;
+

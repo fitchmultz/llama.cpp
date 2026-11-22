@@ -1394,6 +1394,17 @@ typedef struct {
 } ggml_metal_kargs_fwht;
 
 typedef struct {
+    int32_t  n_head;
+    int32_t  n_tok;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb11;
+    uint64_t dst_nb1;
+    float    eps;
+    float    threshold;
+} ggml_metal_kargs_head_fwht;
+
+typedef struct {
     int64_t  ne0;
     float    start;
     float    step;

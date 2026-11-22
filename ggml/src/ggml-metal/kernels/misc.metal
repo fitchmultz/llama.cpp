@@ -913,6 +913,144 @@ template [[host_name("kernel_fwht_f16_2048")]] kernel kernel_fwht_f16_t kernel_f
 template [[host_name("kernel_fwht_f16_4096")]] kernel kernel_fwht_f16_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT, half>;
 template [[host_name("kernel_fwht_f16_8192")]] kernel kernel_fwht_f16_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT, half>;
 
+// In-register 128-dim head FWHT (N_FWHT in {64, 128}, 4 floats/lane in 32-lane simdgroup, 0 shmem, 0 barriers).
+// Caller folds 1/sqrt(N_FWHT) into the pre-FWHT scale factor.
+template <int N_FWHT>
+static inline void fwht_inreg_128(thread float (&reg)[4], ushort lane) {
+    FOR_UNROLL (int i = 1; i < 32; i *= 2) {
+        FOR_UNROLL (int j = 0; j < 4; ++j) {
+            const float v  = reg[j];
+            const float v2 = simd_shuffle_xor(v, i);
+            reg[j] = v2 - v + 2.0f * ((lane & i) == 0) * v;
+        }
+    }
+    {
+        const float x0 = reg[0], y0 = reg[1];
+        reg[0] = x0 + y0; reg[1] = x0 - y0;
+        const float x1 = reg[2], y1 = reg[3];
+        reg[2] = x1 + y1; reg[3] = x1 - y1;
+    }
+    if (N_FWHT == 128) {
+        const float x0 = reg[0], y0 = reg[2];
+        reg[0] = x0 + y0; reg[2] = x0 - y0;
+        const float x1 = reg[1], y1 = reg[3];
+        reg[1] = x1 + y1; reg[3] = x1 - y1;
+    }
+}
+
+// Fused Q head: L2_CLIP_SCALE [+ *tau] + FWHT(64|128) in registers (1 simdgroup per 128-dim head).
+template <int N_FWHT, bool HAS_TAU>
+kernel void kernel_l2_clip_fwht_128_impl(
+        constant ggml_metal_kargs_head_fwht & args,
+        device const char  * src0,
+        device const char  * scale,
+        device const float * tau,
+        device       float * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int sg_per_tg = ntg.x >> 5;
+    const int64_t r = (int64_t) tgpig.x * sg_per_tg + sgitg;
+    if (r >= (int64_t) args.n_head * args.n_tok) {
+        return;
+    }
+
+    const int64_t tok = r / args.n_head;
+    const int64_t h   = r - tok * args.n_head;
+
+    device const float * xp = (device const float *) (src0  + (uint64_t) tok * args.nb02 + (uint64_t) h * args.nb01);
+    device const float * sp = (device const float *) (scale + (uint64_t) h * args.nb11);
+
+    float reg[4];
+    float ss = 0.0f;
+    FOR_UNROLL (int b = 0; b < 4; ++b) {
+        const float v = xp[b * 32 + tiisg] * sp[b * 32 + tiisg];
+        reg[b] = v;
+        ss += v * v;
+    }
+
+    const float sumf  = simd_sum(ss);
+    const float fwht_sc = 1.0f / sqrt((float) N_FWHT);
+    float factor = clamp(args.threshold / (sqrt(sumf) + args.eps), 0.0f, 1.0f) * fwht_sc;
+    if (HAS_TAU) {
+        factor *= tau[tok];
+    }
+
+    FOR_UNROLL (int b = 0; b < 4; ++b) {
+        reg[b] *= factor;
+    }
+
+    fwht_inreg_128<N_FWHT>(reg, tiisg);
+
+    device float * dp = dst + r * 128;
+    FOR_UNROLL (int b = 0; b < 4; ++b) {
+        dp[b * 32 + tiisg] = reg[b];
+    }
+}
+
+typedef decltype(kernel_l2_clip_fwht_128_impl<128, false>) kernel_l2_clip_fwht_128_t;
+template [[host_name("kernel_l2_clip_fwht_128_64_f32")]]      kernel kernel_l2_clip_fwht_128_t kernel_l2_clip_fwht_128_impl<64,  false>;
+template [[host_name("kernel_l2_clip_fwht_128_128_f32")]]     kernel kernel_l2_clip_fwht_128_t kernel_l2_clip_fwht_128_impl<128, false>;
+template [[host_name("kernel_l2_clip_fwht_128_64_tau_f32")]]  kernel kernel_l2_clip_fwht_128_t kernel_l2_clip_fwht_128_impl<64,  true>;
+template [[host_name("kernel_l2_clip_fwht_128_128_tau_f32")]] kernel kernel_l2_clip_fwht_128_t kernel_l2_clip_fwht_128_impl<128, true>;
+
+// Fused kqv_out epilogue: FWHT(64|128) + x * sigmoid(gate) in registers.
+template <int N_FWHT>
+kernel void kernel_fwht_mul_sigmoid_f32_impl(
+        constant ggml_metal_kargs_fwht & args,
+        device const float * src,
+        device const float * gate,
+        device       float * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    constexpr int NE = N_FWHT / 32;
+    const int sg_per_tg = ntg.x >> 5;
+    const int64_t r = (int64_t) tgpig.x * sg_per_tg + sgitg;
+    if (r >= args.nrows) {
+        return;
+    }
+
+    const float scale = 1.0f / sqrt((float) N_FWHT);
+    src  += r * N_FWHT;
+    gate += r * N_FWHT;
+    dst  += r * N_FWHT;
+
+    float reg[NE];
+    FOR_UNROLL (int i = 0; i < NE; ++i) {
+        reg[i] = src[i * 32 + tiisg] * scale;
+    }
+    FOR_UNROLL (int i = 1; i < 32; i *= 2) {
+        FOR_UNROLL (int j = 0; j < NE; ++j) {
+            const float v  = reg[j];
+            const float v2 = simd_shuffle_xor(v, i);
+            reg[j] = v2 - v + 2.0f * ((tiisg & i) == 0) * v;
+        }
+    }
+    for (int i = 32; i < N_FWHT; i *= 2) {
+        const int step = i / 32;
+        for (int j = 0; j < NE; j += (2 * step)) {
+            for (int k = 0; k < step; ++k) {
+                const float x = reg[j + k];
+                const float y = reg[j + k + step];
+                reg[j + k]        = x + y;
+                reg[j + k + step] = x - y;
+            }
+        }
+    }
+
+    FOR_UNROLL (int i = 0; i < NE; ++i) {
+        const float g = gate[i * 32 + tiisg];
+        dst[i * 32 + tiisg] = reg[i] / (1.0f + exp(-g));
+    }
+}
+
+typedef decltype(kernel_fwht_mul_sigmoid_f32_impl<64>) kernel_fwht_mul_sigmoid_f32_t;
+template [[host_name("kernel_fwht_mul_sigmoid_f32_64")]]  kernel kernel_fwht_mul_sigmoid_f32_t kernel_fwht_mul_sigmoid_f32_impl<64>;
+template [[host_name("kernel_fwht_mul_sigmoid_f32_128")]] kernel kernel_fwht_mul_sigmoid_f32_t kernel_fwht_mul_sigmoid_f32_impl<128>;
+
 constant int FC_dsv4_hc_n_hc [[function_constant(FC_DSV4_HC + 0)]];
 
 kernel void kernel_dsv4_hc_comb_f32(

@@ -164,6 +164,10 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax_fi
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort           (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort_merge     (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht              (ggml_metal_library_t lib, int n, enum ggml_type tsrc);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_clip_fwht      (ggml_metal_library_t lib, int n_fwht, bool has_tau);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_clip_fwht_set_rows (ggml_metal_library_t lib, int n_fwht);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rms_norm_fwht_set_rows(ggml_metal_library_t lib, int n_fwht);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht_mul_sigmoid  (ggml_metal_library_t lib, int n_fwht);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k             (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_radix       (ggml_metal_library_t lib, const struct ggml_tensor * op);
