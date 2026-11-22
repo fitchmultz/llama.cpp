@@ -21,6 +21,7 @@ static int check_rejection_distribution(
         bool                grammar_first_ref,
         bool                grammar_first_test,
         bool                use_contig_f32,
+        bool                use_pruned_d2t,
         int                 n_trials,
         const char        * label) {
     // Reference sampler computes the exact target distribution.
@@ -62,8 +63,81 @@ static int check_rejection_distribution(
         }
     }
 
+    // Optional pruned draft vocabulary: keep every 4th token plus half of hot_tokens so BOTH in-d2t
+    // and out-of-d2t tokens with significant target mass are exercised.
+    std::vector<llama_token> d2t;
+    std::vector<int32_t>     t2d;
+    if (use_pruned_d2t) {
+        t2d.assign((size_t) n_vocab, -1);
+        std::vector<uint8_t> keep((size_t) n_vocab, 0);
+        for (int id = 0; id < n_vocab; id += 4) {
+            keep[(size_t) id] = 1;
+        }
+        for (size_t h = 0; h < hot_tokens.size(); ++h) {
+            // Keep even hot tokens, deliberately drop odd hot tokens so residual must recover them!
+            keep[(size_t) hot_tokens[h]] = (h % 2 == 0) ? 1 : 0;
+        }
+        for (int id = 0; id < n_vocab; ++id) {
+            if (keep[(size_t) id]) {
+                t2d[(size_t) id] = (int32_t) d2t.size();
+                d2t.push_back((llama_token) id);
+            }
+        }
+    }
+
     for (int trial = 0; trial < n_trials; ++trial) {
         float q_sum = 0.0f;
+
+        if (use_pruned_d2t) {
+            const int n_d2t = (int) d2t.size();
+            std::vector<float> q_f32((size_t) n_d2t, 0.0f);
+            if ((trial & 1) == 0 && !hot_tokens.empty()) {
+                for (int j = 0; j < n_d2t; ++j) {
+                    q_f32[(size_t) j] = 1e-6f;
+                    q_sum += 1e-6f;
+                }
+                for (llama_token id : hot_tokens) {
+                    const int32_t j = t2d[(size_t) id];
+                    if (j >= 0) {
+                        const float w = 0.05f + uni(rng);
+                        q_f32[(size_t) j] += w;
+                        q_sum += w;
+                    }
+                }
+                const int j_noise = (int) (rng() % (uint32_t) n_d2t);
+                q_f32[(size_t) j_noise] += 0.5f;
+                q_sum += 0.5f;
+            } else {
+                for (int j = 0; j < n_d2t; ++j) {
+                    const float w = uni(rng);
+                    q_f32[(size_t) j] = w;
+                    q_sum += w;
+                }
+            }
+            const float inv_sum = 1.0f / q_sum;
+            for (int j = 0; j < n_d2t; ++j) {
+                q_f32[(size_t) j] *= inv_sum;
+            }
+
+            float u = uni(rng);
+            llama_token draft_tok = d2t.back();
+            for (int j = 0; j < n_d2t; ++j) {
+                u -= q_f32[(size_t) j];
+                if (u <= 0.0f) {
+                    draft_tok = d2t[(size_t) j];
+                    break;
+                }
+            }
+
+            const llama_tokens draft = { draft_tok };
+            const std::vector<int> idxs = { -1, -1 };
+            const std::vector<std::vector<float>> draft_q_f32 = { std::move(q_f32) };
+            auto result = common_sampler_sample_and_accept_n_rejection(
+                    smpl_verify.get(), ctx_tgt, idxs, draft, draft_q_f32, grammar_first_test,
+                    d2t.data(), (int32_t) d2t.size(), t2d.data());
+            token_counts[result[0]]++;
+            continue;
+        }
 
         if ((trial & 1) == 0 && !hot_tokens.empty()) {
             // Concentrated draft Q around hot valid tokens + a few random tokens to exercise fast-accept heavily.
@@ -222,11 +296,15 @@ static int test_speculative_rejection_sampling(common_params & params, int n_tri
     sampling.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
     sampling.temp     = 1.0f;
 
-    if (check_rejection_distribution(model_tgt, ctx_tgt, sampling, false, false, false, n_trials, "unconstrained") != 0) {
+    if (check_rejection_distribution(model_tgt, ctx_tgt, sampling, false, false, false, false, n_trials, "unconstrained") != 0) {
         return 1;
     }
 
-    if (check_rejection_distribution(model_tgt, ctx_tgt, sampling, false, false, true, n_trials, "unconstrained-f32") != 0) {
+    if (check_rejection_distribution(model_tgt, ctx_tgt, sampling, false, false, true, false, n_trials, "unconstrained-f32") != 0) {
+        return 1;
+    }
+
+    if (check_rejection_distribution(model_tgt, ctx_tgt, sampling, false, false, true, true, n_trials, "unconstrained-pruned-f32") != 0) {
         return 1;
     }
 
@@ -235,11 +313,15 @@ static int test_speculative_rejection_sampling(common_params & params, int n_tri
     // never emits grammar-rejected tokens.
     common_params_sampling sampling_grmr = sampling;
     sampling_grmr.grammar = common_grammar(COMMON_GRAMMAR_TYPE_USER, "root ::= [a-zA-Z0-9 ]*");
-    if (check_rejection_distribution(model_tgt, ctx_tgt, sampling_grmr, true, false, false, n_trials, "grammar-masked") != 0) {
+    if (check_rejection_distribution(model_tgt, ctx_tgt, sampling_grmr, true, false, false, false, n_trials, "grammar-masked") != 0) {
         return 1;
     }
 
-    if (check_rejection_distribution(model_tgt, ctx_tgt, sampling_grmr, true, false, true, n_trials, "grammar-masked-f32") != 0) {
+    if (check_rejection_distribution(model_tgt, ctx_tgt, sampling_grmr, true, false, true, false, n_trials, "grammar-masked-f32") != 0) {
+        return 1;
+    }
+
+    if (check_rejection_distribution(model_tgt, ctx_tgt, sampling_grmr, true, false, true, true, n_trials, "grammar-masked-pruned-f32") != 0) {
         return 1;
     }
 

@@ -12,6 +12,7 @@
 #include <stdexcept>
 #ifdef __APPLE__
 #include <dispatch/dispatch.h>
+#include <sys/sysctl.h>
 #endif
 
 #define MAX_REPETITION_THRESHOLD 2000
@@ -1601,7 +1602,14 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
 
 #ifdef __APPLE__
         if (cur_p->size >= 4096) {
-            constexpr size_t n_chunks = 8;
+            static const size_t n_chunks = []() -> size_t {
+                int32_t v = 0;
+                size_t sz = sizeof(v);
+                if (sysctlbyname("hw.physicalcpu", &v, &sz, nullptr, 0) == 0 && v >= 4) {
+                    return (size_t) std::min<int32_t>(v, 12);
+                }
+                return 8;
+            }();
             const size_t n_total  = cur_p->size;
             const size_t chunk_sz = (n_total + n_chunks - 1) / n_chunks;
             struct grammar_apply_ctx {

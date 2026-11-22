@@ -1223,6 +1223,12 @@ extern "C" {
     // The paired context (llama_context_params::ctx_other), e.g. the target context of a draft context; may be nullptr
     LLAMA_API struct llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+    // DSpark pruned draft-vocabulary mapping (returns NULL if unpruned / full vocab):
+    //   d2t: length *n_d2t, maps draft index j in [0, *n_d2t) -> target token id
+    //   t2d: length *n_vocab, maps target token id -> draft index j (or -1 if outside draft vocab)
+    LLAMA_API const llama_token * llama_get_dspark_d2t(const struct llama_context * ctx, int32_t * n_d2t);
+    LLAMA_API const int32_t     * llama_get_dspark_t2d(const struct llama_context * ctx, int32_t * n_vocab);
+
     //
     // backend sampling API [EXPERIMENTAL]
     // note: use only if the llama_context was created with at least one llama_sampler_seq_config

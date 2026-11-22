@@ -746,14 +746,24 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
         balloc.split_reset();
 
         std::vector<llama_ubatch> ubatches;
-        while (true) {
-            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : embd_all ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
-
-            if (ubatch.n_tokens == 0) {
-                break;
+        if (n_stream > 1 && embd_all && balloc.get_n_tokens() <= n_ubatch) {
+            auto ubatch = balloc.split_equal(n_ubatch, true, 0);
+            if (ubatch.n_tokens > 0 && balloc.get_n_used() == balloc.get_n_tokens()) {
+                ubatches.push_back(std::move(ubatch)); // NOLINT
+            } else {
+                balloc.split_reset();
             }
+        }
+        if (ubatches.empty()) {
+            while (true) {
+                auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : embd_all ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
 
-            ubatches.push_back(std::move(ubatch)); // NOLINT
+                if (ubatch.n_tokens == 0) {
+                    break;
+                }
+
+                ubatches.push_back(std::move(ubatch)); // NOLINT
+            }
         }
 
         if (balloc.get_n_used() < balloc.get_n_tokens()) {

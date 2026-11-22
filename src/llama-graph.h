@@ -880,9 +880,10 @@ struct llm_graph_params {
     ggml_tensor * layer_inp_src = nullptr; // ctx_other's layer input device buffer (read)
     ggml_tensor * h_nextn_dev   = nullptr; // own h_nextn device buffer (write)
     ggml_tensor * h_nextn_src   = nullptr; // ctx_state_src's h_nextn device buffer (read)
-    ggml_tensor * dspark_base_lm     = nullptr; // precomputed draft-only quantized [n_embd, n_vocab_unpadded]
-    ggml_tensor * dspark_markov_lm   = nullptr; // precomputed [rank, n_vocab_unpadded]
-    ggml_tensor * dspark_markov_bias = nullptr; // precomputed F32 [n_vocab_unpadded]
+    ggml_tensor * dspark_base_lm     = nullptr; // precomputed draft-only quantized [n_embd, n_vocab_draft]
+    ggml_tensor * dspark_markov_lm   = nullptr; // precomputed [rank, n_vocab_draft]
+    ggml_tensor * dspark_markov_bias = nullptr; // precomputed F32 [n_vocab_draft]
+    ggml_tensor * dspark_d2t         = nullptr; // optional I32 [n_vocab_draft] pruned draft->target token map
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -983,6 +984,7 @@ struct llm_graph_params {
             dspark_base_lm     == other.dspark_base_lm     &&
             dspark_markov_lm   == other.dspark_markov_lm   &&
             dspark_markov_bias == other.dspark_markov_bias &&
+            dspark_d2t         == other.dspark_d2t         &&
             model == other.model &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1165,6 +1167,7 @@ struct llm_graph_context {
     ggml_tensor * dspark_base_lm;
     ggml_tensor * dspark_markov_lm;
     ggml_tensor * dspark_markov_bias;
+    ggml_tensor * dspark_d2t;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

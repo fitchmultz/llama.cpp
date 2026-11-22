@@ -96,6 +96,9 @@ struct llama_context {
     ggml_tensor * get_layer_inp_dev() const { return layer_inp_dev; }
     ggml_tensor * get_h_nextn_dev()   const { return h_nextn_dev; }
 
+    const llama_token * get_dspark_d2t(int32_t * n_d2t) const;
+    const int32_t     * get_dspark_t2d(int32_t * n_vocab) const;
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -445,6 +448,10 @@ private:
     ggml_tensor *           dspark_base_lm     = nullptr;
     ggml_tensor *           dspark_markov_lm   = nullptr;
     ggml_tensor *           dspark_markov_bias = nullptr;
+    ggml_tensor *           dspark_d2t         = nullptr;
+    std::vector<llama_token> dspark_d2t_host;
+    std::vector<int32_t>     dspark_t2d_host;
+    int64_t                  logits_n_vocab    = 0;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

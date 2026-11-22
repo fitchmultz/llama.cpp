@@ -4965,7 +4965,14 @@ private:
                 } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
                 } else if (use_rejection_f32) {
-                    accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q_f32);
+                    int32_t n_d2t = 0;
+                    const llama_token * d2t = ctx_dft ? llama_get_dspark_d2t(ctx_dft, &n_d2t) : nullptr;
+                    const int32_t     * t2d = (d2t && n_d2t > 0 && (size_t) n_d2t == slot.spec_draft_q_f32[0].size())
+                        ? llama_get_dspark_t2d(ctx_dft, nullptr)
+                        : nullptr;
+                    accepted = common_sampler_sample_and_accept_n_rejection(
+                            slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q_f32,
+                            false, t2d ? d2t : nullptr, t2d ? n_d2t : 0, t2d);
                 } else if (use_rejection) {
                     accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q);
                 } else {

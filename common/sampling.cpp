@@ -18,6 +18,8 @@
 
 #if defined(__APPLE__)
 #include <Accelerate/Accelerate.h>
+#include <dispatch/dispatch.h>
+#include <sys/sysctl.h>
 #endif
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
@@ -134,6 +136,8 @@ struct common_sampler {
 
     // true when the configured chain reduces to pure softmax(logits / temp) (no truncators, penalties, biases, suppress tokens, or logprobs)
     bool simple_softmax_chain = false;
+    // true when the configured chain reduces to pure greedy argmax(logits)
+    bool simple_greedy_chain  = false;
 
     void reset() {
         prev.clear();
@@ -449,8 +453,9 @@ struct common_sampler * common_sampler_init(
         params.backend_sampling = false;
     }
 
-    // Determine if the sampling chain reduces mathematically to pure softmax(logits / temp).
+    // Determine if the sampling chain reduces mathematically to pure softmax(logits / temp) or pure greedy argmax(logits).
     bool simple_softmax_chain = false;
+    bool simple_greedy_chain  = false;
     {
         int32_t n_suppress = 0;
         (void) llama_vocab_get_suppress_tokens(vocab, &n_suppress);
@@ -458,63 +463,66 @@ struct common_sampler * common_sampler_init(
 
         if (params.mirostat == 0 &&
             params.n_probs == 0 &&
-            params.temp > 0.0f &&
             params.dynatemp_range == 0.0f &&
             params.logit_bias.empty() &&
             n_suppress == 0) {
-            simple_softmax_chain = true;
+            bool simple_chain = true;
             for (const auto & cnstr : params.samplers) {
                 switch (cnstr) {
                     case COMMON_SAMPLER_TYPE_TEMPERATURE:
                         break;
                     case COMMON_SAMPLER_TYPE_TOP_K:
                         if (params.top_k > 0 && params.top_k < n_vocab) {
-                            simple_softmax_chain = false;
+                            simple_chain = false;
                         }
                         break;
                     case COMMON_SAMPLER_TYPE_TOP_P:
                         if (params.top_p < 1.0f) {
-                            simple_softmax_chain = false;
+                            simple_chain = false;
                         }
                         break;
                     case COMMON_SAMPLER_TYPE_MIN_P:
                         if (params.min_p > 0.0f) {
-                            simple_softmax_chain = false;
+                            simple_chain = false;
                         }
                         break;
                     case COMMON_SAMPLER_TYPE_TYPICAL_P:
                         if (params.typ_p < 1.0f) {
-                            simple_softmax_chain = false;
+                            simple_chain = false;
                         }
                         break;
                     case COMMON_SAMPLER_TYPE_XTC:
                         if (params.xtc_probability > 0.0f && params.xtc_threshold <= 0.5f) {
-                            simple_softmax_chain = false;
+                            simple_chain = false;
                         }
                         break;
                     case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
                         if (params.top_n_sigma > 0.0f) {
-                            simple_softmax_chain = false;
+                            simple_chain = false;
                         }
                         break;
                     case COMMON_SAMPLER_TYPE_DRY:
                         if (params.dry_multiplier != 0.0f) {
-                            simple_softmax_chain = false;
+                            simple_chain = false;
                         }
                         break;
                     case COMMON_SAMPLER_TYPE_PENALTIES:
                         if (params.penalty_last_n != 0 &&
                             (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f)) {
-                            simple_softmax_chain = false;
+                            simple_chain = false;
                         }
                         break;
                     default:
-                        simple_softmax_chain = false;
+                        simple_chain = false;
                         break;
                 }
-                if (!simple_softmax_chain) {
+                if (!simple_chain) {
                     break;
                 }
+            }
+            if (simple_chain) {
+                simple_softmax_chain = params.temp > 0.0f;
+                simple_greedy_chain  = params.temp <= 0.0f;
             }
         }
     }
@@ -533,6 +541,7 @@ struct common_sampler * common_sampler_init(
         // mix it, the chain and the draft are seeded from this one too
         /* .rng                  = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
         /* .simple_softmax_chain = */ simple_softmax_chain,
+        /* .simple_greedy_chain  = */ simple_greedy_chain,
     };
 
     return result;
@@ -621,6 +630,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur_p                = */ gsmpl->cur_p,
         /* .rng                  = */ gsmpl->rng,
         /* .simple_softmax_chain = */ gsmpl->simple_softmax_chain,
+        /* .simple_greedy_chain  = */ gsmpl->simple_greedy_chain,
     };
 }
 
@@ -643,6 +653,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p.data           = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->rng                  = src->rng;
     dst->simple_softmax_chain = src->simple_softmax_chain;
+    dst->simple_greedy_chain  = src->simple_greedy_chain;
     dst->t_total_us           = src->t_total_us;
 }
 
@@ -784,17 +795,82 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
+static bool grammar_allows_token(struct llama_sampler * grmr, llama_token id);
+
+#if defined(__APPLE__)
+static size_t apple_pcore_count() {
+    static const size_t n_pcores = []() -> size_t {
+        int32_t v = 0;
+        size_t sz = sizeof(v);
+        if (sysctlbyname("hw.perflevel0.physicalcpu", &v, &sz, nullptr, 0) == 0 && v >= 2) {
+            return (size_t) std::min<int32_t>(v, 16);
+        }
+        return 6;
+    }();
+    return n_pcores;
+}
+#endif
+
+static llama_token try_fast_greedy_argmax(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first, int n_vocab) {
+    if (!gsmpl->simple_greedy_chain || grammar_first || n_vocab <= 0) {
+        return LLAMA_TOKEN_NULL;
+    }
+    if (gsmpl->rbudget && common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_FORCING) {
+        return LLAMA_TOKEN_NULL;
+    }
+    if (llama_get_sampled_token_ith(ctx, idx) != LLAMA_TOKEN_NULL ||
+        llama_get_sampled_probs_ith(ctx, idx) != nullptr ||
+        llama_get_sampled_logits_ith(ctx, idx) != nullptr) {
+        return LLAMA_TOKEN_NULL;
+    }
+    const float * logits = llama_get_logits_ith(ctx, idx);
+    if (!logits) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    float max_val = logits[0];
+    llama_token best_id = 0;
+#if defined(__APPLE__)
+    if (n_vocab >= 1024 && n_vocab <= INT_MAX) {
+        vDSP_Length max_idx = 0;
+        vDSP_maxvi(logits, 1, &max_val, &max_idx, (vDSP_Length) n_vocab);
+        best_id = (llama_token) max_idx;
+    } else
+#endif
+    {
+        for (int k = 1; k < n_vocab; ++k) {
+            if (logits[k] > max_val) {
+                max_val = logits[k];
+                best_id = (llama_token) k;
+            }
+        }
+    }
+    if (!std::isfinite(max_val)) {
+        return LLAMA_TOKEN_NULL;
+    }
+    if (grammar_should_apply(gsmpl) && !grammar_allows_token(gsmpl->grmr, best_id)) {
+        return LLAMA_TOKEN_NULL;
+    }
+    return best_id;
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    llama_synchronize(ctx);
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    const int n_vocab = llama_vocab_n_tokens(vocab);
 
     size_t i = 0;
     for (; i < draft.size(); i++) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        llama_token id = try_fast_greedy_argmax(gsmpl, ctx, idxs[i], grammar_first, n_vocab);
+        if (id == LLAMA_TOKEN_NULL) {
+            id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        }
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -808,7 +884,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     if (i == draft.size()) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        llama_token id = try_fast_greedy_argmax(gsmpl, ctx, idxs[i], grammar_first, n_vocab);
+        if (id == LLAMA_TOKEN_NULL) {
+            id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        }
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -1085,7 +1164,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     return result;
 }
 
-static bool compute_softmax_contig(const float * logits, int n_vocab, float temp, std::vector<float> & p_out) {
+static bool compute_exp_sum_contig(const float * logits, int n_vocab, float temp, std::vector<float> & p_out, float & sum_out) {
     if (!logits || n_vocab <= 0 || !(temp > 0.0f)) {
         return false;
     }
@@ -1096,34 +1175,76 @@ static bool compute_softmax_contig(const float * logits, int n_vocab, float temp
     if (n_vocab >= 1024 && n_vocab <= INT_MAX) {
         const vDSP_Length n = (vDSP_Length) n_vocab;
         float max_l = -INFINITY;
-        if (temp == 1.0f) {
-            vDSP_maxv(logits, 1, &max_l, n);
-            if (!std::isfinite(max_l)) {
-                return false;
-            }
-            const float neg_max = -max_l;
-            vDSP_vsadd(logits, 1, &neg_max, p, 1, n);
-        } else {
-            const float inv_t = 1.0f / temp;
-            vDSP_vsmul(logits, 1, &inv_t, p, 1, n);
-            vDSP_maxv(p, 1, &max_l, n);
-            if (!std::isfinite(max_l)) {
-                return false;
-            }
-            const float neg_max = -max_l;
-            vDSP_vsadd(p, 1, &neg_max, p, 1, n);
+        const float inv_t = (temp == 1.0f) ? 1.0f : (1.0f / temp);
+        vDSP_maxv(logits, 1, &max_l, n);
+        max_l *= inv_t;
+        if (!std::isfinite(max_l)) {
+            return false;
         }
 
+        if (n_vocab >= 32768) {
+            const size_t n_chunks = apple_pcore_count();
+            const size_t chunk_sz = ((size_t) n_vocab + n_chunks - 1) / n_chunks;
+            float partial_sums[16] = {};
+            struct exp_ctx {
+                const float * logits;
+                float       * p;
+                float       * partial_sums;
+                size_t        n_total;
+                size_t        chunk_sz;
+                float         inv_t;
+                float         neg_max;
+                bool          unit_temp;
+            } ectx = { logits, p, partial_sums, (size_t) n_vocab, chunk_sz, inv_t, -max_l, temp == 1.0f };
+
+            dispatch_apply_f(n_chunks, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &ectx, [](void * ptr, size_t c) {
+                const auto * ctx = (const exp_ctx *) ptr;
+                const size_t beg = c * ctx->chunk_sz;
+                const size_t end = std::min(beg + ctx->chunk_sz, ctx->n_total);
+                if (beg >= end) {
+                    return;
+                }
+                const vDSP_Length len = (vDSP_Length) (end - beg);
+                const float * src = ctx->logits + beg;
+                float       * dst = ctx->p + beg;
+                if (ctx->unit_temp) {
+                    vDSP_vsadd(src, 1, &ctx->neg_max, dst, 1, len);
+                } else {
+                    vDSP_vsmsa(src, 1, &ctx->inv_t, &ctx->neg_max, dst, 1, len);
+                }
+                int li = (int) len;
+                vvexpf(dst, dst, &li);
+                float s = 0.0f;
+                vDSP_sve(dst, 1, &s, len);
+                ctx->partial_sums[c] = s;
+            });
+
+            double sum_d = 0.0;
+            for (size_t c = 0; c < n_chunks; ++c) {
+                sum_d += (double) partial_sums[c];
+            }
+            const float sum_p = (float) sum_d;
+            if (!(sum_p > 0.0f) || !std::isfinite(sum_p)) {
+                return false;
+            }
+            sum_out = sum_p;
+            return true;
+        }
+
+        const float neg_max = -max_l;
+        if (temp == 1.0f) {
+            vDSP_vsadd(logits, 1, &neg_max, p, 1, n);
+        } else {
+            vDSP_vsmsa(logits, 1, &inv_t, &neg_max, p, 1, n);
+        }
         int ni = n_vocab;
         vvexpf(p, p, &ni);
-
         float sum_p = 0.0f;
         vDSP_sve(p, 1, &sum_p, n);
         if (!(sum_p > 0.0f) || !std::isfinite(sum_p)) {
             return false;
         }
-        const float inv_sum = 1.0f / sum_p;
-        vDSP_vsmul(p, 1, &inv_sum, p, 1, n);
+        sum_out = sum_p;
         return true;
     }
 #endif
@@ -1148,16 +1269,13 @@ static bool compute_softmax_contig(const float * logits, int n_vocab, float temp
     if (!(sum_p > 0.0) || !std::isfinite(sum_p)) {
         return false;
     }
-    const float inv_sum = (float) (1.0 / sum_p);
-    for (int i = 0; i < n_vocab; ++i) {
-        p[i] *= inv_sum;
-    }
+    sum_out = (float) sum_p;
     return true;
 }
 
-static llama_token sample_from_probs_contig(const float * p, int n_vocab, std::mt19937 & rng) {
+static llama_token sample_from_probs_contig(const float * p, int n_vocab, std::mt19937 & rng, double total_mass = 1.0) {
     std::uniform_real_distribution<double> uni(0.0, 1.0);
-    double u = uni(rng);
+    double u = uni(rng) * total_mass;
     llama_token last_pos = n_vocab - 1;
     for (int i = 0; i < n_vocab; ++i) {
         const float pi = p[i];
@@ -1177,43 +1295,73 @@ static llama_token sample_residual_contig(
         int n_vocab,
         const std::vector<float> & q,
         std::vector<float> & resid_buf,
-        std::mt19937 & rng) {
+        std::mt19937 & rng,
+        const llama_token * draft_d2t = nullptr,
+        int32_t draft_n_d2t = 0) {
     resid_buf.resize((size_t) n_vocab);
     float * r = resid_buf.data();
-    const int n_common = (int) std::min<size_t>((size_t) n_vocab, q.size());
     float sum = 0.0f;
 
-#if defined(__APPLE__)
-    if (n_vocab >= 1024 && n_vocab <= INT_MAX) {
-        if (n_common > 0) {
-            // vDSP_vsub(B, 1, A, 1, C, 1, N) computes C = A - B
-            vDSP_vsub(q.data(), 1, p, 1, r, 1, (vDSP_Length) n_common);
-        }
-        if (n_vocab > n_common) {
-            std::memcpy(r + n_common, p + n_common, (size_t) (n_vocab - n_common) * sizeof(float));
-        }
-        const float zero = 0.0f;
-        vDSP_vthres(r, 1, &zero, r, 1, (vDSP_Length) n_vocab);
-        vDSP_sve(r, 1, &sum, (vDSP_Length) n_vocab);
-    } else
-#endif
-    {
-        for (int i = 0; i < n_common; ++i) {
-            const float d = p[i] - q[i];
-            if (d > 0.0f) {
-                r[i] = d;
-                sum += d;
-            } else {
-                r[i] = 0.0f;
+    if (draft_d2t != nullptr && draft_n_d2t > 0) {
+        std::memcpy(r, p, (size_t) n_vocab * sizeof(float));
+        const int n_q = (int) std::min<size_t>((size_t) draft_n_d2t, q.size());
+        const float * q_data = q.data();
+        for (int j = 0; j < n_q; ++j) {
+            const llama_token tid = draft_d2t[j];
+            if (tid >= 0 && tid < n_vocab) {
+                r[tid] -= q_data[j];
             }
         }
-        for (int i = n_common; i < n_vocab; ++i) {
-            const float d = p[i];
-            if (d > 0.0f) {
-                r[i] = d;
-                sum += d;
-            } else {
-                r[i] = 0.0f;
+#if defined(__APPLE__)
+        if (n_vocab >= 1024 && n_vocab <= INT_MAX) {
+            const float zero = 0.0f;
+            vDSP_vthres(r, 1, &zero, r, 1, (vDSP_Length) n_vocab);
+            vDSP_sve(r, 1, &sum, (vDSP_Length) n_vocab);
+        } else
+#endif
+        {
+            for (int i = 0; i < n_vocab; ++i) {
+                if (r[i] > 0.0f) {
+                    sum += r[i];
+                } else {
+                    r[i] = 0.0f;
+                }
+            }
+        }
+    } else {
+        const int n_common = (int) std::min<size_t>((size_t) n_vocab, q.size());
+#if defined(__APPLE__)
+        if (n_vocab >= 1024 && n_vocab <= INT_MAX) {
+            if (n_common > 0) {
+                // vDSP_vsub(B, 1, A, 1, C, 1, N) computes C = A - B
+                vDSP_vsub(q.data(), 1, p, 1, r, 1, (vDSP_Length) n_common);
+            }
+            if (n_vocab > n_common) {
+                std::memcpy(r + n_common, p + n_common, (size_t) (n_vocab - n_common) * sizeof(float));
+            }
+            const float zero = 0.0f;
+            vDSP_vthres(r, 1, &zero, r, 1, (vDSP_Length) n_vocab);
+            vDSP_sve(r, 1, &sum, (vDSP_Length) n_vocab);
+        } else
+#endif
+        {
+            for (int i = 0; i < n_common; ++i) {
+                const float d = p[i] - q[i];
+                if (d > 0.0f) {
+                    r[i] = d;
+                    sum += d;
+                } else {
+                    r[i] = 0.0f;
+                }
+            }
+            for (int i = n_common; i < n_vocab; ++i) {
+                const float d = p[i];
+                if (d > 0.0f) {
+                    r[i] = d;
+                    sum += d;
+                } else {
+                    r[i] = 0.0f;
+                }
             }
         }
     }
@@ -1259,7 +1407,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(
         const std::vector<int> & idxs,
         const llama_tokens & draft,
         const std::vector<std::vector<float>> & draft_q,
-        bool grammar_first) {
+        bool grammar_first,
+        const llama_token * draft_d2t,
+        int32_t draft_n_d2t,
+        const int32_t * draft_t2d) {
     GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
 
@@ -1272,6 +1423,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(
 
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
     const int n_vocab = llama_vocab_n_tokens(vocab);
+    const bool pruned_q = (draft_d2t != nullptr && draft_n_d2t > 0 && draft_t2d != nullptr);
 
     auto & cand = gsmpl->cand_grmr;
 
@@ -1279,20 +1431,38 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(
     for (; i < draft.size(); i++) {
         const bool masked = !grammar_first && grammar_should_apply(gsmpl);
         const auto & q = draft_q[i];
+        const float * q_data = q.data();
+        const size_t  q_size = q.size();
+        auto lookup_q = [&](llama_token tok) -> float {
+            if (tok < 0) {
+                return 0.0f;
+            }
+            if (pruned_q) {
+                if (tok >= n_vocab) {
+                    return 0.0f;
+                }
+                const int32_t j = draft_t2d[tok];
+                return (j >= 0 && (size_t) j < q_size) ? q_data[j] : 0.0f;
+            }
+            return ((size_t) tok < q_size) ? q_data[tok] : 0.0f;
+        };
+
         const llama_token x = draft[i];
-        const float q_x = (x >= 0 && (size_t) x < q.size()) ? q[(size_t) x] : 0.0f;
+        const float q_x = lookup_q(x);
 
         bool fast_ok = false;
         const float * logits_raw = nullptr;
+        float exp_sum = 0.0f;
         if (can_use_fast_softmax(gsmpl, ctx, idxs[i], grammar_first)) {
             const auto tm = gsmpl->tm();
             logits_raw = llama_get_logits_ith(ctx, idxs[i]);
-            fast_ok = compute_softmax_contig(logits_raw, n_vocab, gsmpl->params.temp, gsmpl->p_buf);
+            fast_ok = compute_exp_sum_contig(logits_raw, n_vocab, gsmpl->params.temp, gsmpl->p_buf, exp_sum);
         }
 
         if (fast_ok) {
-            const float * p = gsmpl->p_buf.data();
-            const float p_raw_x = (x >= 0 && x < n_vocab) ? p[x] : 0.0f;
+            float * p_exp = gsmpl->p_buf.data();
+            const float inv_exp_sum = 1.0f / exp_sum;
+            const float p_raw_x = (x >= 0 && x < n_vocab) ? (p_exp[x] * inv_exp_sum) : 0.0f;
 
             if (!masked) {
                 if (q_x > 0.0f && (p_raw_x >= q_x || uni(gsmpl->rng) < p_raw_x / q_x)) {
@@ -1303,7 +1473,18 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(
 
                 const llama_token id = [&]() {
                     const auto tm = gsmpl->tm();
-                    return sample_residual_contig(p, n_vocab, q, gsmpl->resid_buf, gsmpl->rng);
+#if defined(__APPLE__)
+                    if (n_vocab >= 1024 && n_vocab <= INT_MAX) {
+                        vDSP_vsmul(p_exp, 1, &inv_exp_sum, p_exp, 1, (vDSP_Length) n_vocab);
+                    } else
+#endif
+                    {
+                        for (int k = 0; k < n_vocab; ++k) {
+                            p_exp[k] *= inv_exp_sum;
+                        }
+                    }
+                    return sample_residual_contig(p_exp, n_vocab, q, gsmpl->resid_buf, gsmpl->rng,
+                            pruned_q ? draft_d2t : nullptr, pruned_q ? draft_n_d2t : 0);
                 }();
                 common_sampler_accept(gsmpl, id, true);
                 result.push_back(id);
@@ -1332,52 +1513,75 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(
                 }
             }
 
-            // Slow path: mask full vocabulary once and compute exact renormalized p_V
+            // Slow path: mask full vocabulary once and compute exact renormalized p_V directly from p_exp
             {
                 const auto tm = gsmpl->tm();
                 cand.resize((size_t) n_vocab);
-                for (int k = 0; k < n_vocab; ++k) {
-                    cand[k] = { (llama_token) k, logits_raw[k], p[k] };
+#if defined(__APPLE__)
+                if (n_vocab >= 32768) {
+                    const size_t n_chunks = apple_pcore_count();
+                    const size_t chunk_sz = ((size_t) n_vocab + n_chunks - 1) / n_chunks;
+                    struct init_ctx {
+                        llama_token_data * cand;
+                        const float      * logits;
+                        size_t             n_total;
+                        size_t             chunk_sz;
+                    } ictx = { cand.data(), logits_raw, (size_t) n_vocab, chunk_sz };
+                    dispatch_apply_f(n_chunks, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &ictx, [](void * ptr, size_t c) {
+                        const auto * ctx = (const init_ctx *) ptr;
+                        const size_t beg = c * ctx->chunk_sz;
+                        const size_t end = std::min(beg + ctx->chunk_sz, ctx->n_total);
+                        for (size_t k = beg; k < end; ++k) {
+                            ctx->cand[k] = { (llama_token) k, ctx->logits[k], 0.0f };
+                        }
+                    });
+                } else
+#endif
+                {
+                    for (int k = 0; k < n_vocab; ++k) {
+                        cand[k] = { (llama_token) k, logits_raw[k], 0.0f };
+                    }
                 }
                 llama_token_data_array arr = { cand.data(), cand.size(), -1, false };
                 llama_sampler_apply(gsmpl->grmr, &arr);
             }
 
             float p_sum = 0.0f;
+            float best_valid_exp = -1.0f;
+            llama_token best_valid_id = LLAMA_TOKEN_NULL;
             for (int k = 0; k < n_vocab; ++k) {
                 if (cand[k].logit != -INFINITY) {
-                    p_sum += p[k];
+                    const float ek = p_exp[k];
+                    p_sum += ek;
+                    if (ek > best_valid_exp) {
+                        best_valid_exp = ek;
+                        best_valid_id = (llama_token) k;
+                    }
                 }
             }
 
             if (p_sum > 0.0f) {
                 const float p_norm = 1.0f / p_sum;
-                const float p_x = draft_valid ? p_raw_x * p_norm : 0.0f;
+                const float p_x = (draft_valid && x >= 0 && x < n_vocab) ? (p_exp[x] * p_norm) : 0.0f;
                 if (draft_valid && q_x > 0.0f && (p_x >= q_x || (drew_u ? (u * q_x < p_x) : (uni(gsmpl->rng) * q_x < p_x)))) {
                     common_sampler_accept(gsmpl, x, true);
                     result.push_back(x);
                     continue;
                 }
 
-                const size_t q_size = q.size();
                 float sum = 0.0f;
-                float best_valid_p = -1.0f;
-                llama_token best_valid_id = LLAMA_TOKEN_NULL;
                 llama_token last_pos_id = LLAMA_TOKEN_NULL;
                 for (int k = 0; k < n_vocab; ++k) {
                     if (cand[k].logit == -INFINITY) {
                         continue;
                     }
-                    const float pk = p[k] * p_norm;
-                    if (pk > best_valid_p) {
-                        best_valid_p = pk;
-                        best_valid_id = (llama_token) k;
-                    }
-                    const float qk = ((size_t) k < q_size) ? q[(size_t) k] : 0.0f;
-                    const float r = pk - qk;
+                    const float r = p_exp[k] * p_norm - lookup_q((llama_token) k);
                     if (r > 0.0f) {
+                        cand[k].p = r;
                         sum += r;
                         last_pos_id = (llama_token) k;
+                    } else {
+                        cand[k].p = 0.0f;
                     }
                 }
 
@@ -1389,8 +1593,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(
                         if (cand[k].logit == -INFINITY) {
                             continue;
                         }
-                        const float qk = ((size_t) k < q_size) ? q[(size_t) k] : 0.0f;
-                        const float r = p[k] * p_norm - qk;
+                        const float r = cand[k].p;
                         if (r > 0.0f) {
                             u_res -= r;
                             if (u_res <= 0.0f) {
@@ -1412,12 +1615,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(
         llama_token id_tgt = common_sampler_eval_chain(gsmpl, ctx, idxs[i], grammar_first || (fast_ok && masked));
 
         const auto * cur_p = common_sampler_get_candidates(gsmpl, false);
-        const float * q_data = q.data();
-        const size_t  q_size = q.size();
-
-        auto lookup_q = [&](llama_token tok) -> float {
-            return (tok >= 0 && (size_t) tok < q_size) ? q_data[tok] : 0.0f;
-        };
 
         auto lookup_raw_p = [&](const llama_token_data_array * arr, llama_token tok) -> float {
             if (tok >= 0 && (size_t) tok < arr->size && arr->data[tok].id == tok) {
@@ -1570,8 +1767,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(
         if (can_use_fast_softmax(gsmpl, ctx, idxs[i], grammar_first)) {
             const auto tm = gsmpl->tm();
             const float * logits_raw = llama_get_logits_ith(ctx, idxs[i]);
-            if (compute_softmax_contig(logits_raw, n_vocab, gsmpl->params.temp, gsmpl->p_buf)) {
-                const llama_token cand_id = sample_from_probs_contig(gsmpl->p_buf.data(), n_vocab, gsmpl->rng);
+            float bonus_sum = 0.0f;
+            if (compute_exp_sum_contig(logits_raw, n_vocab, gsmpl->params.temp, gsmpl->p_buf, bonus_sum)) {
+                const llama_token cand_id = sample_from_probs_contig(gsmpl->p_buf.data(), n_vocab, gsmpl->rng, (double) bonus_sum);
                 if (!grammar_should_apply(gsmpl) || grammar_allows_token(gsmpl->grmr, cand_id)) {
                     id = cand_id;
                 }

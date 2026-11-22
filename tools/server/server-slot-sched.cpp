@@ -299,16 +299,46 @@ void server_prompt_cache::update() {
 //
 
 static std::vector<const server_slot_info *> get_free_slot_infos(const std::vector<server_slot_info> & slots, size_t n_slots_needed, int exclude_id_slot) {
+    int min_act = INT_MAX;
+    int max_act = -1;
     std::vector<const server_slot_info *> free_slots;
     for (const auto & slot : slots) {
-        if (!slot.is_processing && slot.id != exclude_id_slot) {
+        if (slot.is_processing) {
+            min_act = std::min(min_act, slot.id);
+            max_act = std::max(max_act, slot.id);
+        } else if (slot.id != exclude_id_slot) {
             free_slots.push_back(&slot);
         }
     }
 
-    std::stable_sort(free_slots.begin(), free_slots.end(), [](const server_slot_info * a, const server_slot_info * b) {
-        if ((a->prompt->n_tokens() == 0) != (b->prompt->n_tokens() == 0)) {
-            return a->prompt->n_tokens() == 0;
+    const bool has_act = max_act >= 0;
+    auto contig_dist = [&](int id) -> int {
+        if (id > min_act && id < max_act) {
+            return 0; // fills an interior hole between active slots
+        }
+        return std::min(std::abs(id - min_act), std::abs(id - max_act));
+    };
+
+    std::stable_sort(free_slots.begin(), free_slots.end(), [&](const server_slot_info * a, const server_slot_info * b) {
+        const bool a_empty = a->prompt->n_tokens() == 0;
+        const bool b_empty = b->prompt->n_tokens() == 0;
+        if (has_act) {
+            // Keep active slot IDs contiguous for --no-kv-unified multi-seq batching without evicting warm caches (>1K tok)
+            const bool a_disp = a->prompt->n_tokens() <= 1024;
+            const bool b_disp = b->prompt->n_tokens() <= 1024;
+            if (a_disp != b_disp) {
+                return a_disp;
+            }
+            if (a_disp && b_disp) {
+                const int da = contig_dist(a->id);
+                const int db = contig_dist(b->id);
+                if (da != db) {
+                    return da < db;
+                }
+            }
+        }
+        if (a_empty != b_empty) {
+            return a_empty;
         }
         return a->t_last_used < b->t_last_used;
     });
