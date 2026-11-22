@@ -13548,7 +13548,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t n_q : { 4, 8 }) {
             test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, 1024, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, 2, false, rel_pos));
             test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, 1041, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, 2, false, rel_pos));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, 1536, 1024, 2, GGML_TYPE_Q8_0, GGML_TYPE_F32, 2, false, rel_pos));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, 4096, 1024, 2, GGML_TYPE_Q8_0, GGML_TYPE_F32, 2, false, rel_pos));
             test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, 4096, 1024, 1, GGML_TYPE_Q4_0, GGML_TYPE_F32, 2, false, rel_pos));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, 4096, 1024, 2, GGML_TYPE_Q4_0, GGML_TYPE_F32, 2, false, rel_pos));
             test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, 4113, 1024, 1, GGML_TYPE_Q4_0, GGML_TYPE_F32, 2, false, rel_pos));
         }
     }

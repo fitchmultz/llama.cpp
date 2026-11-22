@@ -962,7 +962,10 @@ kernel void kernel_flash_attn_ext_vec_tensor_q8_0_gqa(
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            if ((s_ctl[0] | s_ctl[1] | s_ctl[2] | s_ctl[3]) == 0) {
+            const bool any_fin = (s_ctl[0] | s_ctl[1] | s_ctl[2] | s_ctl[3]) != 0;
+            if (!any_fin) {
+                // Barrier before continue so all simdgroups finish reading s_ctl before the next iteration overwrites it.
+                threadgroup_barrier(mem_flags::mem_threadgroup);
                 continue;
             }
         } else if (is_pad) {
