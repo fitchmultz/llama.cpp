@@ -1002,7 +1002,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
     const bool can_small = has_tensor &&
         tsrc1 == GGML_TYPE_F32 &&
-        (tsrc0 == GGML_TYPE_BF16 || tsrc0 == GGML_TYPE_F32);
+        (tsrc0 == GGML_TYPE_BF16 || tsrc0 == GGML_TYPE_F32 || tsrc0 == GGML_TYPE_Q8_0);
 
     int small_mode = 0; // 0 = default 64x128, 1 = 16x32, 2 = 32x32
     if (can_small) {
@@ -1357,8 +1357,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(g
         ggml_metal_cv_free(cv);
     }
 
-    // per expert: entry count + base offset, followed by the staging of the ids of ntg tokens
-    res.smem = 2*(size_t) ne02*sizeof(uint32_t) + (size_t) ne02*ne20*sizeof(uint16_t);
+    // per expert: atomic cnt + atomic cur, plus 32-simdgroup prefix sums (sg_n[32], sg_t[32])
+    res.smem = (2*(size_t) ne02 + 64)*sizeof(uint32_t);
     res.smem = GGML_PAD(res.smem, 16);
 
     return res;
@@ -2119,6 +2119,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_t
         int32_t q_blk,
         int32_t c_blk,
         int32_t nsg,
+        int32_t nwg,
         bool has_mask,
         bool has_sinks,
         bool has_bias,
@@ -2135,8 +2136,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_t
     const int32_t dv = (int32_t) op->src[2]->ne[0];
 
     snprintf(base, 256, "kernel_flash_attn_ext_tensor_f16_dk%d_dv%d_q%d_c%d_nsg%d", dk, dv, q_blk, c_blk, nsg);
-    snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_banded=%d_kvpad=%d_relpos=%d",
-            base, has_mask, has_sinks, has_bias, has_scap, has_banded, has_kvpad, has_rel_pos);
+    snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_banded=%d_kvpad=%d_relpos=%d_nwg=%d",
+            base, has_mask, has_sinks, has_bias, has_scap, has_banded, has_kvpad, has_rel_pos, nwg);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -2149,6 +2150,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_t
         ggml_metal_cv_set_bool(cv, has_banded,  FC_FLASH_ATTN_EXT_TENSOR + 4);
         ggml_metal_cv_set_bool(cv, has_kvpad,   FC_FLASH_ATTN_EXT_TENSOR + 5);
         ggml_metal_cv_set_bool(cv, has_rel_pos, FC_FLASH_ATTN_EXT_TENSOR + 6);
+        ggml_metal_cv_set_int32(cv, nwg,        FC_FLASH_ATTN_EXT_TENSOR + 7);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -2413,6 +2415,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         bool    has_banded,
         bool    has_rel_pos,
         int32_t nhptg,
+        bool    is_q4_0,
         int32_t nwg) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
 
@@ -2422,7 +2425,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     const int32_t dk = (int32_t) op->src[1]->ne[0];
     const int32_t dv = (int32_t) op->src[2]->ne[0];
 
-    snprintf(base, 256, "kernel_flash_attn_ext_vec_tensor_q8_0_gqa_dk%d_dv%d_q4_h%d", dk, dv, nhptg);
+    snprintf(base, 256, "kernel_flash_attn_ext_vec_tensor_%s_gqa_dk%d_dv%d_q4_h%d",
+            is_q4_0 ? "q4_0" : "q8_0", dk, dv, nhptg);
     snprintf(name, 256, "%s_mask=%d_sink=%d_scap=%d_kvpad=%d_banded=%d_relpos=%d_nwg=%d",
             base, has_mask, has_sinks, has_scap, has_kvpad, has_banded, has_rel_pos, nwg);
 

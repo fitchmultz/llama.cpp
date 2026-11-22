@@ -7,7 +7,7 @@
 template <
     typename block_t,
     short QK,
-    void (*deq_t4x4)(device const block_t *, short, thread float4x4 &)>
+    void (*deq_t4x4)(device const block_t *, short, thread half4x4 &)>
 kernel void kernel_flash_attn_ext_kv_f16(
         constant ggml_metal_kargs_flash_attn_ext_kv_f16 & args,
         device const char * x,
@@ -31,12 +31,12 @@ kernel void kernel_flash_attn_ext_kv_f16(
     device half4 * dst = (device half4 *) x_dst + (QK/4)*gid;
 
     for (short i = 0; i < QK/16; ++i) {
-        float4x4 reg;
+        half4x4 reg;
         deq_t4x4(src, i, reg);
-        dst[4*i + 0] = (half4) reg[0];
-        dst[4*i + 1] = (half4) reg[1];
-        dst[4*i + 2] = (half4) reg[2];
-        dst[4*i + 3] = (half4) reg[3];
+        dst[4*i + 0] = reg[0];
+        dst[4*i + 1] = reg[1];
+        dst[4*i + 2] = reg[2];
+        dst[4*i + 3] = reg[3];
     }
 }
 

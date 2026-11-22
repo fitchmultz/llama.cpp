@@ -6,7 +6,7 @@
 // TODO: become function constants
 
 #define SZ_SIMDGROUP 16
-#define N_MM_NK 2
+#define N_MM_NK 4
 #define N_MM_NK_TOTAL (SZ_SIMDGROUP * N_MM_NK)
 
 #define N_MM_BLOCK_X 4

@@ -570,28 +570,18 @@ void kernel_mul_mv_q8_0_f32_impl(
         }
 
         float sumf2[2] = { 0.f, 0.f };
-        float yl[NQ];
         device const float * yb = y + ix*QK8_0 + il*NQ;
 
         for (int ib = ix; ib < nb; ib += 4) {
-            FOR_UNROLL (short i = 0; i < NQ; ++i) {
-                yl[i] = yb[i];
-            }
+            const float4 y0 = float4(*(device const packed_float4 *) (yb + 0));
+            const float4 y1 = float4(*(device const packed_float4 *) (yb + 4));
 
             FOR_UNROLL (short r = 0; r < 2; ++r) {
                 device const block_q8_0 & xb = ax2[r][ib];
-                // block_q8_0 is 34 bytes (2-byte aligned); char2 loads are always aligned
-                device const char2 * q2 = (device const char2 *) (xb.qs + il*NQ);
-                const char2 c0 = q2[0];
-                const char2 c1 = q2[1];
-                const char2 c2 = q2[2];
-                const char2 c3 = q2[3];
-
-                const float sumq = (fma((float) c0.x, yl[0], (float) c0.y * yl[1]) +
-                                    fma((float) c1.x, yl[2], (float) c1.y * yl[3])) +
-                                   (fma((float) c2.x, yl[4], (float) c2.y * yl[5]) +
-                                    fma((float) c3.x, yl[6], (float) c3.y * yl[7]));
-                sumf2[r] += sumq * (float) xb.d;
+                device const packed_char4 * q4 = (device const packed_char4 *) (xb.qs + il*NQ);
+                const float4 f0 = float4(q4[0]);
+                const float4 f1 = float4(q4[1]);
+                sumf2[r] += (dot(f0, y0) + dot(f1, y1)) * (float) xb.d;
             }
 
             yb += 4*QK8_0;
@@ -622,27 +612,18 @@ void kernel_mul_mv_q8_0_f32_impl(
     const short ix = tiisg >> 2; // 0..7
     const short il = tiisg & 3;  // 0..3
 
-    float yl[NQ];
     device const float * yb = y + ix*QK8_0 + il*NQ;
 
     for (int ib = ix; ib < nb; ib += 8) {
-        FOR_UNROLL (short i = 0; i < NQ; ++i) {
-            yl[i] = yb[i];
-        }
+        const float4 y0 = float4(*(device const packed_float4 *) (yb + 0));
+        const float4 y1 = float4(*(device const packed_float4 *) (yb + 4));
 
         FOR_UNROLL (short row = 0; row < NR0; ++row) {
             device const block_q8_0 & xb = ax[row][ib];
-            device const char2 * q2 = (device const char2 *) (xb.qs + il*NQ);
-            const char2 c0 = q2[0];
-            const char2 c1 = q2[1];
-            const char2 c2 = q2[2];
-            const char2 c3 = q2[3];
-
-            const float sumq = (fma((float) c0.x, yl[0], (float) c0.y * yl[1]) +
-                                fma((float) c1.x, yl[2], (float) c1.y * yl[3])) +
-                               (fma((float) c2.x, yl[4], (float) c2.y * yl[5]) +
-                                fma((float) c3.x, yl[6], (float) c3.y * yl[7]));
-            sumf[row] += sumq * (float) xb.d;
+            device const packed_char4 * q4 = (device const packed_char4 *) (xb.qs + il*NQ);
+            const float4 f0 = float4(q4[0]);
+            const float4 f1 = float4(q4[1]);
+            sumf[row] += (dot(f0, y0) + dot(f1, y1)) * (float) xb.d;
         }
 
         yb += 8*QK8_0;
@@ -3997,45 +3978,34 @@ static inline void kernel_mul_mv_id_q8_0_grouped_core(
         for (int ib = ix; ib < nb; ib += 4) {
             const int y_off = ib * QK8_0 + il * NQ;
             if (CNT <= 2) {
-                float yl[CNT][NQ];
+                float4 y0[CNT], y1[CNT];
                 FOR_UNROLL (int k = 0; k < CNT; ++k) {
                     device const float * yb = y_base[k] + y_off;
-                    FOR_UNROLL (short i = 0; i < NQ; ++i) {
-                        yl[k][i] = yb[i];
-                    }
+                    y0[k] = float4(*(device const packed_float4 *) (yb + 0));
+                    y1[k] = float4(*(device const packed_float4 *) (yb + 4));
                 }
                 FOR_UNROLL (int r = 0; r < 2; ++r) {
                     device const block_q8_0 & xb = ax2[r][ib];
-                    device const char2 * q2 = (device const char2 *) (xb.qs + il * NQ);
-                    const char2 c0 = q2[0];
-                    const char2 c1 = q2[1];
-                    const char2 c2 = q2[2];
-                    const char2 c3 = q2[3];
+                    device const packed_char4 * q4 = (device const packed_char4 *) (xb.qs + il * NQ);
+                    const float4 f0 = float4(q4[0]);
+                    const float4 f1 = float4(q4[1]);
                     const float d  = (float) xb.d;
                     FOR_UNROLL (int k = 0; k < CNT; ++k) {
-                        const float sumq = (fma((float) c0.x, yl[k][0], (float) c0.y * yl[k][1]) +
-                                            fma((float) c1.x, yl[k][2], (float) c1.y * yl[k][3])) +
-                                           (fma((float) c2.x, yl[k][4], (float) c2.y * yl[k][5]) +
-                                            fma((float) c3.x, yl[k][6], (float) c3.y * yl[k][7]));
-                        sumf2[r][k] += sumq * d;
+                        sumf2[r][k] += (dot(f0, y0[k]) + dot(f1, y1[k])) * d;
                     }
                 }
             } else {
                 FOR_UNROLL (int r = 0; r < 2; ++r) {
                     device const block_q8_0 & xb = ax2[r][ib];
-                    device const char2 * q2 = (device const char2 *) (xb.qs + il * NQ);
-                    const char2 c0 = q2[0];
-                    const char2 c1 = q2[1];
-                    const char2 c2 = q2[2];
-                    const char2 c3 = q2[3];
+                    device const packed_char4 * q4 = (device const packed_char4 *) (xb.qs + il * NQ);
+                    const float4 f0 = float4(q4[0]);
+                    const float4 f1 = float4(q4[1]);
                     const float d  = (float) xb.d;
                     FOR_UNROLL (int k = 0; k < CNT; ++k) {
                         device const float * yb = y_base[k] + y_off;
-                        const float sumq = (fma((float) c0.x, yb[0], (float) c0.y * yb[1]) +
-                                            fma((float) c1.x, yb[2], (float) c1.y * yb[3])) +
-                                           (fma((float) c2.x, yb[4], (float) c2.y * yb[5]) +
-                                            fma((float) c3.x, yb[6], (float) c3.y * yb[7]));
-                        sumf2[r][k] += sumq * d;
+                        const float4 y0 = float4(*(device const packed_float4 *) (yb + 0));
+                        const float4 y1 = float4(*(device const packed_float4 *) (yb + 4));
+                        sumf2[r][k] += (dot(f0, y0) + dot(f1, y1)) * d;
                     }
                 }
             }
@@ -4077,45 +4047,34 @@ static inline void kernel_mul_mv_id_q8_0_grouped_core(
     for (int ib = ix; ib < nb; ib += 8) {
         const int y_off = ib * QK8_0 + il * NQ;
         if (CNT <= 2) {
-            float yl[CNT][NQ];
+            float4 y0[CNT], y1[CNT];
             FOR_UNROLL (int k = 0; k < CNT; ++k) {
                 device const float * yb = y_base[k] + y_off;
-                FOR_UNROLL (short i = 0; i < NQ; ++i) {
-                    yl[k][i] = yb[i];
-                }
+                y0[k] = float4(*(device const packed_float4 *) (yb + 0));
+                y1[k] = float4(*(device const packed_float4 *) (yb + 4));
             }
             FOR_UNROLL (int row = 0; row < NR0; ++row) {
                 device const block_q8_0 & xb = ax[row][ib];
-                device const char2 * q2 = (device const char2 *) (xb.qs + il * NQ);
-                const char2 c0 = q2[0];
-                const char2 c1 = q2[1];
-                const char2 c2 = q2[2];
-                const char2 c3 = q2[3];
+                device const packed_char4 * q4 = (device const packed_char4 *) (xb.qs + il * NQ);
+                const float4 f0 = float4(q4[0]);
+                const float4 f1 = float4(q4[1]);
                 const float d  = (float) xb.d;
                 FOR_UNROLL (int k = 0; k < CNT; ++k) {
-                    const float sumq = (fma((float) c0.x, yl[k][0], (float) c0.y * yl[k][1]) +
-                                        fma((float) c1.x, yl[k][2], (float) c1.y * yl[k][3])) +
-                                       (fma((float) c2.x, yl[k][4], (float) c2.y * yl[k][5]) +
-                                        fma((float) c3.x, yl[k][6], (float) c3.y * yl[k][7]));
-                    sumf[row][k] += sumq * d;
+                    sumf[row][k] += (dot(f0, y0[k]) + dot(f1, y1[k])) * d;
                 }
             }
         } else {
             FOR_UNROLL (int row = 0; row < NR0; ++row) {
                 device const block_q8_0 & xb = ax[row][ib];
-                device const char2 * q2 = (device const char2 *) (xb.qs + il * NQ);
-                const char2 c0 = q2[0];
-                const char2 c1 = q2[1];
-                const char2 c2 = q2[2];
-                const char2 c3 = q2[3];
+                device const packed_char4 * q4 = (device const packed_char4 *) (xb.qs + il * NQ);
+                const float4 f0 = float4(q4[0]);
+                const float4 f1 = float4(q4[1]);
                 const float d  = (float) xb.d;
                 FOR_UNROLL (int k = 0; k < CNT; ++k) {
                     device const float * yb = y_base[k] + y_off;
-                    const float sumq = (fma((float) c0.x, yb[0], (float) c0.y * yb[1]) +
-                                        fma((float) c1.x, yb[2], (float) c1.y * yb[3])) +
-                                       (fma((float) c2.x, yb[4], (float) c2.y * yb[5]) +
-                                        fma((float) c3.x, yb[6], (float) c3.y * yb[7]));
-                    sumf[row][k] += sumq * d;
+                    const float4 y0 = float4(*(device const packed_float4 *) (yb + 0));
+                    const float4 y1 = float4(*(device const packed_float4 *) (yb + 4));
+                    sumf[row][k] += (dot(f0, y0) + dot(f1, y1)) * d;
                 }
             }
         }

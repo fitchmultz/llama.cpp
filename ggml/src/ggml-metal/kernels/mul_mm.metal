@@ -487,138 +487,91 @@ kernel void kernel_mul_mm_id_map0(
         device        char * hids,
         threadgroup   char * shmem [[threadgroup(0)]],
         ushort tpitg[[thread_position_in_threadgroup]],
-        ushort   ntg[[threads_per_threadgroup]]) {
-    const short ide = tpitg; // expert id
+        ushort   ntg[[threads_per_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short ide = tpitg; // expert id (0 .. ne02 - 1)
+    const ushort n_sg = (ntg + N_SIMDWIDTH - 1) / N_SIMDWIDTH;
 
-    // per expert: entry count (pass 1), replaced by the base offset of the slice (pass 2)
-    threadgroup uint32_t * cnt = (threadgroup uint32_t *) (shmem);
-    threadgroup uint32_t * bas = cnt + FC_mul_mm_id_map0_ne02;
+    threadgroup atomic_uint * cnt  = (threadgroup atomic_uint *) shmem;
+    threadgroup atomic_uint * cur  = cnt + FC_mul_mm_id_map0_ne02;
+    threadgroup uint32_t    * sg_n = (threadgroup uint32_t *) (cur + FC_mul_mm_id_map0_ne02);
+    threadgroup uint32_t    * sg_t = sg_n + 32;
 
-    // staging of the ids of ntg tokens
-    threadgroup uint16_t * sids = (threadgroup uint16_t *) (bas + FC_mul_mm_id_map0_ne02);
+    atomic_store_explicit(&cnt[ide], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // pass 1: count the entries of this expert - every occurrence of this expert within the
-    // ids is an entry (duplicate ids produce multiple entries for the same token)
-    uint32_t n_all = 0;
-
-    for (int i21 = 0; i21 < args.ne21; i21 += ntg) { // n_tokens
-        if (i21 + tpitg < args.ne21) {
-            device const int32_t * src2_i32 = (device const int32_t *) (src2 + (i21 + tpitg)*args.nb21);
-
-            // 0xFFFF marks a skipped slot, it never matches an expert since ne02 fits in a threadgroup
-            FOR_UNROLL (short i20 = 0; i20 < ne20; i20++) {
-                const int32_t id = src2_i32[i20];
-                sids[tpitg*ne20 + i20] = id == -1 ? 0xFFFF : (uint16_t) id;
+    // pass 1: parallel count across all tokens (O(ne21*ne20/ntg) per thread)
+    for (int i21 = tpitg; i21 < args.ne21; i21 += ntg) {
+        device const int32_t * src2_i32 = (device const int32_t *) (src2 + (uint64_t) i21 * args.nb21);
+        FOR_UNROLL (short i20 = 0; i20 < ne20; ++i20) {
+            const int32_t id = src2_i32[i20];
+            if (id >= 0 && id < FC_mul_mm_id_map0_ne02) {
+                atomic_fetch_add_explicit(&cnt[id], 1u, memory_order_relaxed);
             }
         }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (short t = 0; t < ntg; t++) {
-            if (i21 + t >= args.ne21) {
-                break;
-            }
-
-            threadgroup const uint16_t * sids_t = sids + t*ne20;
-
-            FOR_UNROLL (short i20 = 0; i20 < ne20; i20++) {
-                n_all += sids_t[i20] == ide;
-            }
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-
-    cnt[ide] = n_all;
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // exclusive prefix sum over the counts: the entries of this expert start at bas[ide] -
-    // every slice is padded by one entry for the uniform dummy store of pass 2 - and emit the
-    // entry tile descriptors of kernel_mul_mm_id: (expert, first entry, valid rows) per tile
+    // 2-level SIMD exclusive prefix sum for slice bases and tile offsets + parallel tile emission
+    const uint32_t NTILE = (uint32_t) FC_mul_mm_id_map0_ntile;
+    const uint32_t n     = atomic_load_explicit(&cnt[ide], memory_order_relaxed);
+    const uint32_t nt    = (n + NTILE - 1) / NTILE;
+
+    const uint32_t loc_n = simd_prefix_exclusive_sum(n);
+    const uint32_t loc_t = simd_prefix_exclusive_sum(nt);
+    const uint32_t tot_n = simd_sum(n);
+    const uint32_t tot_t = simd_sum(nt);
+
+    if (tiisg == 0) {
+        sg_n[sgitg] = tot_n;
+        sg_t[sgitg] = tot_t;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device uint32_t * tpe_u32 = (device uint32_t *) htpe;
     if (tpitg == 0) {
-        const uint32_t NTILE = (uint32_t) FC_mul_mm_id_map0_ntile; // 32 for mul_mm_id, 4 for grouped mul_mv_id
-
-        uint32_t base = 0;
-        uint32_t tile = 0;
-
-        device uint32_t * tpe_u32 = (device uint32_t *) (htpe);
-
-        for (int e = 0; e < FC_mul_mm_id_map0_ne02; ++e) {
-            const uint32_t n = cnt[e];
-
-            bas[e] = base;
-
-            for (uint32_t k = 0; k < n; k += NTILE) {
-                tpe_u32[1 + 3*tile    ] = e;
-                tpe_u32[1 + 3*tile + 1] = base + k;
-                tpe_u32[1 + 3*tile + 2] = n - k < NTILE ? n - k : NTILE;
-
-                tile++;
-            }
-
-            base += n + 1;
+        uint32_t bn = 0;
+        uint32_t bt = 0;
+        for (ushort s = 0; s < n_sg; ++s) {
+            const uint32_t vn = sg_n[s];
+            const uint32_t vt = sg_t[s];
+            sg_n[s] = bn;
+            sg_t[s] = bt;
+            bn += vn;
+            bt += vt;
         }
-
-        tpe_u32[0] = tile;
+        tpe_u32[0] = bt;
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // pass 2: write the entries of this expert into its slice of the compact list
-    device int32_t * ids_i32 = (device int32_t *) (hids);
+    const uint32_t base = sg_n[sgitg] + loc_n;
+    const uint32_t t0   = sg_t[sgitg] + loc_t;
+    atomic_store_explicit(&cur[ide], base, memory_order_relaxed);
 
-    uint32_t ient = bas[ide];
+    for (uint32_t k = 0, ti = 0; k < n; k += NTILE, ++ti) {
+        const uint32_t idx_t = 1 + 3 * (t0 + ti);
+        tpe_u32[idx_t + 0] = (uint32_t) ide;
+        tpe_u32[idx_t + 1] = base + k;
+        tpe_u32[idx_t + 2] = (n - k < NTILE) ? (n - k) : NTILE;
+    }
 
-    for (int i21 = 0; i21 < args.ne21; i21 += ntg) { // n_tokens
-        if (i21 + tpitg < args.ne21) {
-            device const int32_t * src2_i32 = (device const int32_t *) (src2 + (i21 + tpitg)*args.nb21);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            FOR_UNROLL (short i20 = 0; i20 < ne20; i20++) {
-                sids[tpitg*ne20 + i20] = src2_i32[i20];
+    // pass 2: parallel scatter into compact per-expert slices (zero dummy writes)
+    device int32_t * ids_i32 = (device int32_t *) hids;
+    for (int i21 = tpitg; i21 < args.ne21; i21 += ntg) {
+        device const int32_t * src2_i32 = (device const int32_t *) (src2 + (uint64_t) i21 * args.nb21);
+        FOR_UNROLL (short i20 = 0; i20 < ne20; ++i20) {
+            const int32_t id = src2_i32[i20];
+            if (id >= 0 && id < FC_mul_mm_id_map0_ne02) {
+                const uint32_t pos = atomic_fetch_add_explicit(&cur[id], 1u, memory_order_relaxed);
+                ids_i32[pos] = i21 * ne20 + i20;
             }
         }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (short t = 0; t < ntg; t++) {
-            if (i21 + t >= args.ne21) {
-                break;
-            }
-
-            threadgroup const uint16_t * sids_t = sids + t*ne20;
-
-            short first = -1;
-            short n_ents = 0;
-
-            FOR_UNROLL (short i20 = 0; i20 < ne20; i20++) {
-                const short hit = sids_t[i20] == ide;
-
-                first = hit && first < 0 ? i20 : first;
-                n_ents += hit;
-            }
-
-            // one store per token for every thread, regardless of the match - conditional
-            // stores of the divergent lanes are very slow - the dummy value of the tokens
-            // without a match lands on the padding slot of this slice and is never read
-            ids_i32[ient] = first >= 0 ? (i21 + t)*ne20 + first : 0;
-
-            if (n_ents > 1) {
-                // duplicate ids: the remaining matches of this token
-                short j = 1;
-
-                FOR_UNROLL (short i20 = 0; i20 < ne20; i20++) {
-                    if (sids_t[i20] == ide && i20 != first) {
-                        ids_i32[ient + j] = (i21 + t)*ne20 + i20;
-                        j += 1;
-                    }
-                }
-            }
-
-            ient += n_ents;
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
@@ -1154,8 +1107,10 @@ template [[host_name("kernel_mul_mm_tq2_0_f16")]]   kernel mul_mm_t kernel_mul_m
 #ifdef GGML_METAL_HAS_TENSOR
 typedef decltype(kernel_mul_mm_small<half, half4x4, float4x4, 1, dequantize_f32, float, float4x4, float, 16, 32, 2, 64>) mul_mm_small_t;
 
-template [[host_name("kernel_mul_mm_s16x32_f32_f32")]]   kernel mul_mm_small_t kernel_mul_mm_small<half,   half4x4,   float4x4,  1, dequantize_f32,  float,  float4x4,  float,  16, 32, 2, 64>;
-template [[host_name("kernel_mul_mm_s32x32_f32_f32")]]   kernel mul_mm_small_t kernel_mul_mm_small<half,   half4x4,   float4x4,  1, dequantize_f32,  float,  float4x4,  float,  32, 32, 2, 64>;
+template [[host_name("kernel_mul_mm_s16x32_f32_f32")]]   kernel mul_mm_small_t kernel_mul_mm_small<half,   half4x4,   float4x4,   1, dequantize_f32,  float,  float4x4,  float,  16, 32, 2, 64>;
+template [[host_name("kernel_mul_mm_s32x32_f32_f32")]]   kernel mul_mm_small_t kernel_mul_mm_small<half,   half4x4,   float4x4,   1, dequantize_f32,  float,  float4x4,  float,  32, 32, 2, 64>;
+template [[host_name("kernel_mul_mm_s16x32_q8_0_f32")]]  kernel mul_mm_small_t kernel_mul_mm_small<half,   half4x4,   block_q8_0, 2, dequantize_q8_0, float,  float4x4,  float,  16, 32, 2, 64>;
+template [[host_name("kernel_mul_mm_s32x32_q8_0_f32")]]  kernel mul_mm_small_t kernel_mul_mm_small<half,   half4x4,   block_q8_0, 2, dequantize_q8_0, float,  float4x4,  float,  32, 32, 2, 64>;
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_mul_mm_s16x32_bf16_f32")]]  kernel mul_mm_small_t kernel_mul_mm_small<bfloat, bfloat4x4, bfloat4x4, 1, dequantize_bf16, bfloat, bfloat4x4, float,  16, 32, 2, 64>;
 template [[host_name("kernel_mul_mm_s32x32_bf16_f32")]]  kernel mul_mm_small_t kernel_mul_mm_small<bfloat, bfloat4x4, bfloat4x4, 1, dequantize_bf16, bfloat, bfloat4x4, float,  32, 32, 2, 64>;

@@ -325,6 +325,16 @@ void dequantize_q5_1_t4(device const block_q5_1 * xb, short il, thread type4 & r
 template <typename type4x4>
 void dequantize_q8_0(device const block_q8_0 *xb, short il, thread type4x4 & reg) {
     device const packed_char4 * qs = (device const packed_char4 *) xb->qs;
+    if (is_same<type4x4, half4x4>::value) {
+        const half d = xb->d;
+        half4x4 reg_h;
+        FOR_UNROLL (short i = 0; i < 4; ++i) {
+            reg_h[i] = half4(qs[4*il + i]) * d;
+        }
+        reg = (type4x4) reg_h;
+        return;
+    }
+
     const float d = xb->d;
 
     float4x4 reg_f;

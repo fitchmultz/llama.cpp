@@ -401,8 +401,10 @@ template [[host_name("kernel_flash_attn_ext_tensor_bf16_dk256_dv256")]] kernel f
 template [[host_name("kernel_flash_attn_ext_tensor_bf16_dk512_dv512")]] kernel flash_attn_ext_tensor_t kernel_flash_attn_ext_tensor<bfloat, bfloat4, 512, 512, OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE>;
 template [[host_name("kernel_flash_attn_ext_tensor_bf16_dk576_dv512")]] kernel flash_attn_ext_tensor_t kernel_flash_attn_ext_tensor<bfloat, bfloat4, 576, 512, OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE>;
 
+constant int32_t FC_flash_attn_ext_tensor_nwg [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 7)]];
+
 // High-throughput F16 Metal 4 tensor FlashAttention with pre-packed device Q (zero Q shmem),
-// hardware exp2 softmax, tile-level k_pos skip, and larger Q/C MMA tiles (Q=64xC=64 or Q=32xC=128).
+// hardware exp2 softmax, tile-level k_pos skip, Split-KV (NWG), and wide Q=32xC=128 MMA tiles.
 template<
     short DK,
     short DV,
@@ -429,12 +431,16 @@ kernel void kernel_flash_attn_ext_tensor_f16_wide(
     constexpr short NW = N_SIMDWIDTH;
     constexpr short NQ = Q / NSG;
     constexpr short NC = C / NW;
+    constexpr short DV4 = DV / 4;
     constexpr float LOG2E = 1.4426950408889634f;
+    constexpr float LN2   = 0.6931471805599453f;
 
     static_assert(Q % NSG == 0, "Q must be divisible by NSG");
     static_assert(C % NW  == 0, "C must be divisible by NW");
 
-    const int iq3     = tgpig[2];
+    const int NWG     = FC_flash_attn_ext_tensor_nwg;
+    const int iwg     = tgpig[2] % NWG;
+    const int iq3     = tgpig[2] / NWG;
     const int iq2     = tgpig[1];
     const int iq1_blk = tgpig[0];
     const int iq1     = iq1_blk * Q;
@@ -530,6 +536,9 @@ kernel void kernel_flash_attn_ext_tensor_f16_wide(
         }
     }
 
+    if (tiitg < Q) {
+        sr[tiitg] = 1.0f;
+    }
     if (tiitg == 0) {
         sf[0] = 0;
     }
@@ -538,7 +547,11 @@ kernel void kernel_flash_attn_ext_tensor_f16_wide(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (int ic0 = 0, ic = 0; ic < args.ne11; ++ic0, ic += C) {
+    for (int ic0 = iwg; ; ic0 += NWG) {
+        const int ic = ic0 * C;
+        if (ic >= args.ne11) {
+            break;
+        }
         char blk_cur = 1;
         if (FC_flash_attn_ext_tensor_has_mask) {
             blk_cur = blk[ic0];
@@ -694,44 +707,73 @@ kernel void kernel_flash_attn_ext_tensor_f16_wide(
         const short j = jj * NSG + sgitg;
         float ms = 1.0f;
 
-        if (FC_flash_attn_ext_tensor_has_sinks) {
+        if (FC_flash_attn_ext_tensor_has_sinks && iwg == 0) {
             const int iq1_s = min(iq1 + j, args.ne01 - 1);
             const float s_val = ((device const float *) sinks)[iq2 + iq1_s * args.sinks_s1 + iq3 * args.sinks_s2] * LOG2E;
             const float m = max(M[jj], s_val);
 
-            ms = exp2(M[jj] - m);
+            ms    = exp2(M[jj] - m);
+            M[jj] = m;
             S[jj] = S[jj] * ms + exp2(s_val - m);
         }
 
         if (tiisg == 0) {
-            sr[j] = S[jj] == 0.0f ? 0.0f : ms / S[jj];
+            sr[j] = (NWG == 1) ? (S[jj] == 0.0f ? 0.0f : ms / S[jj]) : ms;
         }
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    FOR_UNROLL (short i = 0; i < co.get_capacity(); ++i) {
-        if (co.is_valid_element(i)) {
-            co[i] *= sr[co.get_multidimensional_index(i)[1]];
+    if (NWG == 1) {
+        FOR_UNROLL (short i = 0; i < co.get_capacity(); ++i) {
+            if (co.is_valid_element(i)) {
+                co[i] *= sr[co.get_multidimensional_index(i)[1]];
+            }
+        }
+
+        device float * pdst = (device float *) dst + ((uint64_t) iq3 * args.ne2 * args.ne1 + iq2 + (uint64_t) iq1 * args.ne1) * DV;
+        auto td = tensor(pdst, dextents<int32_t, 2>(DV, args.ne01 - iq1), array<int, 2>({1, args.ne1 * DV}));
+        co.store(td);
+    } else {
+        const uint64_t nrows = (uint64_t) args.ne3 * args.ne2 * args.ne1;
+        device float * dst_f = (device float *) dst;
+        device float * dst1  = dst_f + nrows * DV * NWG;
+        FOR_UNROLL (short i = 0; i < co.get_capacity(); ++i) {
+            if (co.is_valid_element(i)) {
+                const auto idx = co.get_multidimensional_index(i);
+                const short d  = idx[0];
+                const short r  = idx[1];
+                const int iq1_o = iq1 + r;
+                if (iq1_o < args.ne01) {
+                    const uint64_t rid   = (uint64_t) iq3 * args.ne2 * args.ne1 + iq2 + (uint64_t) iq1_o * args.ne1;
+                    const uint64_t f_off = ((rid * DV4 * NWG + (uint64_t) (d >> 2) * NWG + (uint64_t) iwg) << 2) + (d & 3);
+                    dst_f[f_off] = co[i] * sr[r];
+                }
+            }
+        }
+        if (tiisg == 0) {
+            FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                const short j   = jj * NSG + sgitg;
+                const int iq1_o = iq1 + j;
+                if (iq1_o < args.ne01) {
+                    const uint64_t rid = (uint64_t) iq3 * args.ne2 * args.ne1 + iq2 + (uint64_t) iq1_o * args.ne1;
+                    dst1[rid * (2 * NWG) + 2 * iwg + 0] = S[jj];
+                    dst1[rid * (2 * NWG) + 2 * iwg + 1] = M[jj] * LN2;
+                }
+            }
         }
     }
-
-    device float * pdst = (device float *) dst + ((uint64_t) iq3 * args.ne2 * args.ne1 + iq2 + (uint64_t) iq1 * args.ne1) * DV;
-    auto td = tensor(pdst, dextents<int32_t, 2>(DV, args.ne01 - iq1), array<int, 2>({1, args.ne1 * DV}));
-    co.store(td);
 }
 
 typedef decltype(kernel_flash_attn_ext_tensor_f16_wide<128, 128, 32, 128, 4>) flash_attn_ext_tensor_f16_wide_t;
 
 template [[host_name("kernel_flash_attn_ext_tensor_f16_dk128_dv128_q32_c128_nsg4")]] kernel flash_attn_ext_tensor_f16_wide_t kernel_flash_attn_ext_tensor_f16_wide<128, 128, 32, 128, 4>;
 
-// Split-KV Metal 4 Tensor inline-Q8_0 GQA FlashAttention for speculative verification & small-batch decode
-// (ne01 = 2..19, DK = DV = 128, Q_TOK = 4, H = 3 -> 12 active rows padded to M = 16, C = 64, NSG = 4, NWG = 32).
-// Runs Q*K^T and P*V on M5 Neural Accelerators while reading Q8_0 KV inline once (zero kv_f16 / q_f16 scratch)
+// Split-KV Metal 4 Tensor inline-Q8_0/Q4_0 GQA FlashAttention for speculative verification & small-batch decode
+// (ne01 = 2..19, DK = DV = 128, Q_TOK = 4, H = 2/3/4 -> padded to M = 16, C = 64, NSG = 4, adaptive NWG).
+// Runs Q*K^T and P*V on M5 Neural Accelerators while reading Q8_0/Q4_0 KV inline once (zero kv_f16 / q_f16 scratch)
 // and writing partial outputs to bid_tmp for the existing kernel_flash_attn_ext_vec_reduce.
-constant int32_t FC_flash_attn_ext_tensor_nwg [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 7)]];
-
-template<short Q_TOK, short H, short M_PAD>
+template<short Q_TOK, short H, short M_PAD, bool IS_Q4_0 = false>
 kernel void kernel_flash_attn_ext_vec_tensor_q8_0_gqa(
         constant ggml_metal_kargs_flash_attn_ext_vec & args,
         device const char * q,
@@ -937,14 +979,19 @@ kernel void kernel_flash_attn_ext_vec_tensor_q8_0_gqa(
                          + (uint64_t) (ikv2 + ikv3 * args.ne_12_2) * args.nb21 * C;
         }
 
-        // Inline Q8_0 K dequantize into skv (64*8 = 512 half-blocks / 128 threads = 4/thread)
+        // Inline Q8_0/Q4_0 K dequantize into skv (64*8 = 512 half-blocks / 128 threads = 4/thread)
         FOR_UNROLL (short kit = 0; kit < 4; ++kit) {
             const short work = kit * NT + tiitg;
             const short row  = work / DK16;
             const short i16  = work % DK16;
-            device const block_q8_0 * kb = (device const block_q8_0 *) (k_tile + (uint64_t) row * args.nb11) + (i16 / 2);
             half4x4 tmp;
-            dequantize_q8_0(kb, i16 % 2, tmp);
+            if constexpr (IS_Q4_0) {
+                device const block_q4_0 * kb = (device const block_q4_0 *) (k_tile + (uint64_t) row * args.nb11) + (i16 / 2);
+                dequantize_q4_0(kb, i16 % 2, tmp);
+            } else {
+                device const block_q8_0 * kb = (device const block_q8_0 *) (k_tile + (uint64_t) row * args.nb11) + (i16 / 2);
+                dequantize_q8_0(kb, i16 % 2, tmp);
+            }
             threadgroup half4 * dst_k = (threadgroup half4 *) (skv + row * DK + i16 * 16);
             dst_k[0] = tmp[0];
             dst_k[1] = tmp[1];
@@ -1034,14 +1081,19 @@ kernel void kernel_flash_attn_ext_vec_tensor_q8_0_gqa(
             }
         }
 
-        // Inline Q8_0 V dequantize into skv (free after mm_qk barrier)
+        // Inline Q8_0/Q4_0 V dequantize into skv (free after mm_qk barrier)
         FOR_UNROLL (short vit = 0; vit < 4; ++vit) {
             const short work = vit * NT + tiitg;
             const short row  = work / DK16;
             const short i16  = work % DK16;
-            device const block_q8_0 * vb = (device const block_q8_0 *) (v_tile + (uint64_t) row * args.nb21) + (i16 / 2);
             half4x4 tmp;
-            dequantize_q8_0(vb, i16 % 2, tmp);
+            if constexpr (IS_Q4_0) {
+                device const block_q4_0 * vb = (device const block_q4_0 *) (v_tile + (uint64_t) row * args.nb21) + (i16 / 2);
+                dequantize_q4_0(vb, i16 % 2, tmp);
+            } else {
+                device const block_q8_0 * vb = (device const block_q8_0 *) (v_tile + (uint64_t) row * args.nb21) + (i16 / 2);
+                dequantize_q8_0(vb, i16 % 2, tmp);
+            }
             threadgroup half4 * dst_v = (threadgroup half4 *) (skv + row * DV + i16 * 16);
             dst_v[0] = tmp[0];
             dst_v[1] = tmp[1];
@@ -1108,10 +1160,13 @@ kernel void kernel_flash_attn_ext_vec_tensor_q8_0_gqa(
     }
 }
 
-typedef decltype(kernel_flash_attn_ext_vec_tensor_q8_0_gqa<4, 3, 16>) flash_attn_ext_vec_tensor_q8_0_gqa_t;
+typedef decltype(kernel_flash_attn_ext_vec_tensor_q8_0_gqa<4, 3, 16, false>) flash_attn_ext_vec_tensor_q8_0_gqa_t;
 
-template [[host_name("kernel_flash_attn_ext_vec_tensor_q8_0_gqa_dk128_dv128_q4_h3")]] kernel flash_attn_ext_vec_tensor_q8_0_gqa_t kernel_flash_attn_ext_vec_tensor_q8_0_gqa<4, 3, 16>;
-template [[host_name("kernel_flash_attn_ext_vec_tensor_q8_0_gqa_dk128_dv128_q4_h4")]] kernel flash_attn_ext_vec_tensor_q8_0_gqa_t kernel_flash_attn_ext_vec_tensor_q8_0_gqa<4, 4, 16>;
-template [[host_name("kernel_flash_attn_ext_vec_tensor_q8_0_gqa_dk128_dv128_q4_h2")]] kernel flash_attn_ext_vec_tensor_q8_0_gqa_t kernel_flash_attn_ext_vec_tensor_q8_0_gqa<4, 2, 16>;
+template [[host_name("kernel_flash_attn_ext_vec_tensor_q8_0_gqa_dk128_dv128_q4_h3")]] kernel flash_attn_ext_vec_tensor_q8_0_gqa_t kernel_flash_attn_ext_vec_tensor_q8_0_gqa<4, 3, 16, false>;
+template [[host_name("kernel_flash_attn_ext_vec_tensor_q8_0_gqa_dk128_dv128_q4_h4")]] kernel flash_attn_ext_vec_tensor_q8_0_gqa_t kernel_flash_attn_ext_vec_tensor_q8_0_gqa<4, 4, 16, false>;
+template [[host_name("kernel_flash_attn_ext_vec_tensor_q8_0_gqa_dk128_dv128_q4_h2")]] kernel flash_attn_ext_vec_tensor_q8_0_gqa_t kernel_flash_attn_ext_vec_tensor_q8_0_gqa<4, 2, 16, false>;
+template [[host_name("kernel_flash_attn_ext_vec_tensor_q4_0_gqa_dk128_dv128_q4_h3")]] kernel flash_attn_ext_vec_tensor_q8_0_gqa_t kernel_flash_attn_ext_vec_tensor_q8_0_gqa<4, 3, 16, true>;
+template [[host_name("kernel_flash_attn_ext_vec_tensor_q4_0_gqa_dk128_dv128_q4_h4")]] kernel flash_attn_ext_vec_tensor_q8_0_gqa_t kernel_flash_attn_ext_vec_tensor_q8_0_gqa<4, 4, 16, true>;
+template [[host_name("kernel_flash_attn_ext_vec_tensor_q4_0_gqa_dk128_dv128_q4_h2")]] kernel flash_attn_ext_vec_tensor_q8_0_gqa_t kernel_flash_attn_ext_vec_tensor_q8_0_gqa<4, 2, 16, true>;
 
 #endif // GGML_METAL_HAS_TENSOR

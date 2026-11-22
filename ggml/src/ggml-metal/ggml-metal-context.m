@@ -65,6 +65,10 @@ struct ggml_metal {
     // n_cb command buffers + 1 used by the main thread
     struct ggml_metal_command_buffer cmd_bufs[GGML_METAL_MAX_COMMAND_BUFFERS + 1];
 
+    // dedicated private scratch buffers for MoE map0 (tpe + ids) so gallocr never overlaps cached maps
+    id<MTLBuffer> map0_bufs[GGML_METAL_MAX_COMMAND_BUFFERS + 1];
+    size_t        map0_buf_size;
+
     // extra command buffers for things like getting, setting and copying tensors
     NSMutableArray * cmd_bufs_ext;
 
@@ -177,9 +181,11 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
         res->gf = nil;
         res->encode_async = nil;
-        for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
+        for (int i = 0; i <= GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
             res->cmd_bufs[i].obj = nil;
+            res->map0_bufs[i]    = nil;
         }
+        res->map0_buf_size = 262144;
 
         res->cmd_bufs_ext = [[NSMutableArray alloc] init];
         res->buf_refs     = [[NSMutableArray alloc] init];
@@ -195,9 +201,12 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 void ggml_metal_free(ggml_metal_t ctx) {
     GGML_LOG_INFO("%s: deallocating\n", __func__);
 
-    for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
+    for (int i = 0; i <= GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
         if (ctx->cmd_bufs[i].obj) {
             [ctx->cmd_bufs[i].obj release];
+        }
+        if (ctx->map0_bufs[i]) {
+            [ctx->map0_bufs[i] release];
         }
     }
 
@@ -760,6 +769,13 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
 
         id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
 
+        if (!ctx->map0_bufs[cb_idx]) {
+            id<MTLDevice> dev = ggml_metal_device_get_obj(ctx->dev);
+            ctx->map0_bufs[cb_idx] = [dev newBufferWithLength:ctx->map0_buf_size options:MTLResourceStorageModePrivate];
+        }
+
+        struct ggml_metal_buffer_id map0_bid = { ctx->map0_bufs[cb_idx], 0 };
+
         ggml_metal_op_t ctx_op = ggml_metal_op_init(
             ctx->dev,
             cmd_buf,
@@ -769,7 +785,9 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             idx_end,
             ctx->use_concurrency,
             ctx->capture_compute == 0,
-            ctx->debug_graph);
+            ctx->debug_graph,
+            map0_bid,
+            ctx->map0_buf_size);
 
         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
             const int res = ggml_metal_op_encode(ctx_op, idx);
