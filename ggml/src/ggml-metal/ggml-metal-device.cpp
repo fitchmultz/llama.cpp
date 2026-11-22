@@ -993,12 +993,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const ggml_type tsrc0 = op->src[0]->type;
     const ggml_type tsrc1 = op->src[1]->type;
 
-    const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
+    const bool has_tensor = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor;
+
+    const bool bc_inp = op->src[0]->ne[0] % (has_tensor ? N_MM_NK_TOTAL : 32) != 0;
 
     constexpr int NRA = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;
     constexpr int NRB = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;
-
-    const bool has_tensor = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor;
 
     const bool can_small = has_tensor &&
         tsrc1 == GGML_TYPE_F32 &&
@@ -1397,17 +1397,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_gather
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_contig(ggml_metal_library_t lib, ggml_type tsrc0, int nrb, bool bc_inp) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_contig(ggml_metal_library_t lib, ggml_type tsrc0, int nrb, bool bc_inp, bool bc_out) {
     char base[256];
     char name[256];
 
     snprintf(base, 256, "kernel_mul_mm_id_contigAdapt%d_%s_f16", nrb, ggml_type_name(tsrc0));
-    snprintf(name, 256, "%s_bci=%d", base, bc_inp);
+    snprintf(name, 256, "%s_bci=%d_bco=%d", base, bc_inp, bc_out);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
         ggml_metal_cv_set_bool(cv, bc_inp, FC_MUL_MM + 0);
+        ggml_metal_cv_set_bool(cv, bc_out, FC_MUL_MM + 1);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 

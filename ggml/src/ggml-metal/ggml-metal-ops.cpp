@@ -4296,8 +4296,9 @@ static int ggml_metal_op_mul_mat_id_try_moe_contig(
 
     // 3. gate_up projection (dense-equivalent direct-device Metal 4 tensor MMA -> expert-contiguous f32)
     {
-        const bool bc_inp = (ne00 % 32 != 0);
-        auto pipe = ggml_metal_library_get_pipeline_mul_mm_id_contig(lib, op_gu->src[0]->type, nrb, bc_inp);
+        const bool bc_inp = (ne00 % 64 != 0);
+        const bool bc_out = (ne01 % 64 != 0);
+        auto pipe = ggml_metal_library_get_pipeline_mul_mm_id_contig(lib, op_gu->src[0]->type, nrb, bc_inp, bc_out);
         ggml_metal_kargs_mul_mm_id_contig args = {
             /*.K        =*/ ne00,
             /*.M        =*/ ne01,
@@ -4345,8 +4346,9 @@ static int ggml_metal_op_mul_mat_id_try_moe_contig(
     // 5. down projection (dense-equivalent direct-device Metal 4 tensor MMA reading f16 situ_out -> expert-contiguous f32)
     {
         const int32_t m_dn = (int32_t) op_dn->src[0]->ne[1];
-        const bool bc_inp  = (n_ff % 32 != 0);
-        auto pipe = ggml_metal_library_get_pipeline_mul_mm_id_contig(lib, op_dn->src[0]->type, nrb, bc_inp);
+        const bool bc_inp  = (n_ff % 64 != 0);
+        const bool bc_out  = (m_dn % 64 != 0);
+        auto pipe = ggml_metal_library_get_pipeline_mul_mm_id_contig(lib, op_dn->src[0]->type, nrb, bc_inp, bc_out);
         ggml_metal_kargs_mul_mm_id_contig args = {
             /*.K        =*/ n_ff,
             /*.M        =*/ m_dn,

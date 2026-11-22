@@ -65,9 +65,95 @@ kernel void kernel_mul_mm(
     const int strideB = args.nb11 / sizeof(T1);
     auto tB = tensor(ptrB, dextents<int32_t, 2>(K, N), array<int, 2>({1, strideB}));
 
-    // Configure matmul operation
-    // note: K is dynamic_extent (clamped to the valid range in PHASE 2), since a static
-    //       N_MM_NK_TOTAL K tile would read src1 out of bounds when K % N_MM_NK_TOTAL != 0
+    if (!FC_mul_mm_bc_inp) {
+        // Compile-time static K = N_MM_NK_TOTAL (64) when K % 64 == 0 eliminates runtime K-loop
+        // and clamping overhead inside matmul2d, and hoists row pointers out of the K loop.
+        mpp::tensor_ops::matmul2d<
+            mpp::tensor_ops::matmul2d_descriptor(
+                NRB, NRA, N_MM_NK_TOTAL, false, true, true,
+                mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+            execution_simdgroups<N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y>> mm;
+
+        auto cT = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+
+        static_assert(A_WORK_ITEMS == 2 * NUM_THREADS, "expected 2 A-tile chunks per thread");
+        const int   row0    = tiitg / N_MM_NK;
+        const int   row1    = row0 + (NUM_THREADS / N_MM_NK);
+        const int   k_chunk = tiitg % N_MM_NK;
+        const short k_base  = k_chunk * 16;
+        const bool  v0      = !FC_mul_mm_bc_out || (ra + row0 < M);
+        const bool  v1      = !FC_mul_mm_bc_out || (ra + row1 < M);
+
+        device const block_q * pA0 = v0 ? (device const block_q *)(srcA + args.nb01 * (ra + row0) + offset0) : nullptr;
+        device const block_q * pA1 = v1 ? (device const block_q *)(srcA + args.nb01 * (ra + row1) + offset0) : nullptr;
+        threadgroup vec<SA, 4> * dst_sa0 = (threadgroup vec<SA, 4> *)(sa + row0 * N_MM_NK_TOTAL + k_base);
+        threadgroup vec<SA, 4> * dst_sa1 = (threadgroup vec<SA, 4> *)(sa + row1 * N_MM_NK_TOTAL + k_base);
+
+        if (!v0) {
+            dst_sa0[0] = vec<SA, 4>(0); dst_sa0[1] = vec<SA, 4>(0);
+            dst_sa0[2] = vec<SA, 4>(0); dst_sa0[3] = vec<SA, 4>(0);
+        }
+        if (!v1) {
+            dst_sa1[0] = vec<SA, 4>(0); dst_sa1[1] = vec<SA, 4>(0);
+            dst_sa1[2] = vec<SA, 4>(0); dst_sa1[3] = vec<SA, 4>(0);
+        }
+
+        const short il_const = k_chunk % nl;
+        if constexpr (nl <= N_MM_NK) {
+            if (v0) { pA0 += k_chunk / nl; }
+            if (v1) { pA1 += k_chunk / nl; }
+        }
+        constexpr int blk_step = (nl <= N_MM_NK) ? (N_MM_NK / nl) : 0;
+
+        device T1 * ptrB_rb = ptrB + (uint64_t) rb * strideB;
+        const int tileN_b = FC_mul_mm_bc_out ? min(NRB, N - rb) : NRB;
+
+        for (int loop_k = 0; loop_k < K; loop_k += N_MM_NK_TOTAL) {
+            if constexpr (nl <= N_MM_NK) {
+                if (v0) {
+                    SA_4x4 t0;
+                    dequantize_func(pA0, il_const, t0);
+                    dst_sa0[0] = t0[0]; dst_sa0[1] = t0[1]; dst_sa0[2] = t0[2]; dst_sa0[3] = t0[3];
+                    pA0 += blk_step;
+                }
+                if (v1) {
+                    SA_4x4 t1;
+                    dequantize_func(pA1, il_const, t1);
+                    dst_sa1[0] = t1[0]; dst_sa1[1] = t1[1]; dst_sa1[2] = t1[2]; dst_sa1[3] = t1[3];
+                    pA1 += blk_step;
+                }
+            } else {
+                const int   k_pos     = loop_k + k_base;
+                const int   block_idx = k_pos / (16 * nl);
+                const short il        = (k_pos / 16) % nl;
+                if (v0) {
+                    SA_4x4 t0;
+                    dequantize_func(pA0 + block_idx, il, t0);
+                    dst_sa0[0] = t0[0]; dst_sa0[1] = t0[1]; dst_sa0[2] = t0[2]; dst_sa0[3] = t0[3];
+                }
+                if (v1) {
+                    SA_4x4 t1;
+                    dequantize_func(pA1 + block_idx, il, t1);
+                    dst_sa1[0] = t1[0]; dst_sa1[1] = t1[1]; dst_sa1[2] = t1[2]; dst_sa1[3] = t1[3];
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            auto tBv = tensor(ptrB_rb + loop_k, dextents<int32_t, 2>(N_MM_NK_TOTAL, tileN_b), array<int, 2>({1, strideB}));
+            mm.run(tBv, tA, cT);
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        const int tileM = FC_mul_mm_bc_out ? min(NRA, M - ra) : NRA;
+        device float * dstTile = (device float *)dst + (uint64_t) im * N * M + (uint64_t) rb * M + ra;
+        auto tD = tensor(dstTile, dextents<int32_t, 2>(tileM, tileN_b), array<int, 2>({1, M}));
+        cT.store(tD);
+        return;
+    }
+
+    // Configure matmul operation (dynamic K fallback when K % N_MM_NK_TOTAL != 0)
     // ref: https://github.com/ggml-org/llama.cpp/pull/27064
     mpp::tensor_ops::matmul2d<
         mpp::tensor_ops::matmul2d_descriptor(
@@ -197,6 +283,88 @@ kernel void kernel_mul_mm_small(
 
     auto tA = tensor(sa, dextents<int32_t, 2>(NK_T, NRA_T));
     auto tB = tensor(ptrB, dextents<int32_t, 2>(K, N), array<int, 2>({1, strideB}));
+
+    if (!FC_mul_mm_bc_inp) {
+        mpp::tensor_ops::matmul2d<
+            mpp::tensor_ops::matmul2d_descriptor(
+                NRB_T, NRA_T, NK_T, false, true, true,
+                mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+            execution_simdgroups<NSG_T>> mm;
+
+        auto cT = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+
+        static_assert(A_WORK_ITEMS % NUM_THREADS == 0, "A_WORK_ITEMS must be divisible by NUM_THREADS");
+        constexpr int N_IT     = A_WORK_ITEMS / NUM_THREADS;
+        constexpr int ROW_STEP = NUM_THREADS / N_NK_CHUNKS;
+        constexpr int blk_step = (nl <= N_NK_CHUNKS) ? (N_NK_CHUNKS / nl) : 0;
+
+        const int   row_base = tiitg / N_NK_CHUNKS;
+        const int   k_chunk  = tiitg % N_NK_CHUNKS;
+        const short k_base   = k_chunk * 16;
+        const short il_const = k_chunk % nl;
+
+        bool v[N_IT];
+        device const block_q * pA[N_IT];
+        threadgroup vec<SA, 4> * dst_sa[N_IT];
+
+        FOR_UNROLL (int it = 0; it < N_IT; ++it) {
+            const int row = row_base + it * ROW_STEP;
+            v[it]      = !FC_mul_mm_bc_out || (ra + row < M);
+            dst_sa[it] = (threadgroup vec<SA, 4> *)(sa + row * NK_T + k_base);
+            if (v[it]) {
+                pA[it] = (device const block_q *)(srcA + args.nb01 * (ra + row) + offset0);
+                if constexpr (nl <= N_NK_CHUNKS) {
+                    pA[it] += k_chunk / nl;
+                }
+            } else {
+                pA[it] = nullptr;
+                dst_sa[it][0] = vec<SA, 4>(0); dst_sa[it][1] = vec<SA, 4>(0);
+                dst_sa[it][2] = vec<SA, 4>(0); dst_sa[it][3] = vec<SA, 4>(0);
+            }
+        }
+
+        device T1 * ptrB_rb = ptrB + (uint64_t) rb * strideB;
+        const int tileN_b = FC_mul_mm_bc_out ? min(NRB_T, N - rb) : NRB_T;
+
+        for (int loop_k = 0; loop_k < K; loop_k += NK_T) {
+            if constexpr (nl <= N_NK_CHUNKS) {
+                FOR_UNROLL (int it = 0; it < N_IT; ++it) {
+                    if (v[it]) {
+                        SA_4x4 tmp;
+                        dequantize_func(pA[it], il_const, tmp);
+                        dst_sa[it][0] = tmp[0]; dst_sa[it][1] = tmp[1];
+                        dst_sa[it][2] = tmp[2]; dst_sa[it][3] = tmp[3];
+                        pA[it] += blk_step;
+                    }
+                }
+            } else {
+                const int   k_pos     = loop_k + k_base;
+                const int   block_idx = k_pos / (16 * nl);
+                const short il        = (k_pos / 16) % nl;
+                FOR_UNROLL (int it = 0; it < N_IT; ++it) {
+                    if (v[it]) {
+                        SA_4x4 tmp;
+                        dequantize_func(pA[it] + block_idx, il, tmp);
+                        dst_sa[it][0] = tmp[0]; dst_sa[it][1] = tmp[1];
+                        dst_sa[it][2] = tmp[2]; dst_sa[it][3] = tmp[3];
+                    }
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            auto tBv = tensor(ptrB_rb + loop_k, dextents<int32_t, 2>(NK_T, tileN_b), array<int, 2>({1, strideB}));
+            mm.run(tBv, tA, cT);
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        const int tileM = FC_mul_mm_bc_out ? min(NRA_T, M - ra) : NRA_T;
+        device float * dstTile = (device float *)dst + (uint64_t) im * N * M + (uint64_t) rb * M + ra;
+        auto tD = tensor(dstTile, dextents<int32_t, 2>(tileM, tileN_b), array<int, 2>({1, M}));
+        cT.store(tD);
+        return;
+    }
 
     mpp::tensor_ops::matmul2d<
         mpp::tensor_ops::matmul2d_descriptor(
@@ -1507,6 +1675,87 @@ static inline void mul_mm_id_contig_run(
     auto tA = tensor(sa, dextents<int32_t, 2>(NK_T, NRA));
     device half * ptrB = (device half *) srcB + (uint64_t) idb * strideB;
     auto tB = tensor(ptrB, dextents<int32_t, 2>(K, nr1), array<int, 2>({1, strideB}));
+
+    if (!FC_mul_mm_bc_inp) {
+        mpp::tensor_ops::matmul2d<
+            mpp::tensor_ops::matmul2d_descriptor(
+                NRB, NRA, NK_T, false, true, true,
+                mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+            execution_simdgroups<4>> mm;
+
+        auto cT = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+
+        static_assert(A_WORK_ITEMS == 2 * NUM_THREADS, "expected 2 A-tile chunks per thread");
+        const int   row0    = tiitg / N_NK_CHUNKS;
+        const int   row1    = row0 + (NUM_THREADS / N_NK_CHUNKS);
+        const int   k_chunk = tiitg % N_NK_CHUNKS;
+        const short k_base  = k_chunk * 16;
+        const bool  v0      = !FC_mul_mm_bc_out || (ra + row0 < M);
+        const bool  v1      = !FC_mul_mm_bc_out || (ra + row1 < M);
+
+        device const block_q * pA0 = v0 ? (device const block_q *)(srcA + args.nb01 * (ra + row0) + offset0) : nullptr;
+        device const block_q * pA1 = v1 ? (device const block_q *)(srcA + args.nb01 * (ra + row1) + offset0) : nullptr;
+        threadgroup half4 * dst_sa0 = (threadgroup half4 *)(sa + row0 * NK_T + k_base);
+        threadgroup half4 * dst_sa1 = (threadgroup half4 *)(sa + row1 * NK_T + k_base);
+
+        if (!v0) {
+            dst_sa0[0] = half4(0); dst_sa0[1] = half4(0); dst_sa0[2] = half4(0); dst_sa0[3] = half4(0);
+        }
+        if (!v1) {
+            dst_sa1[0] = half4(0); dst_sa1[1] = half4(0); dst_sa1[2] = half4(0); dst_sa1[3] = half4(0);
+        }
+
+        const short il_const = k_chunk % nl;
+        if constexpr (nl <= N_NK_CHUNKS) {
+            if (v0) { pA0 += k_chunk / nl; }
+            if (v1) { pA1 += k_chunk / nl; }
+        }
+        constexpr int blk_step = (nl <= N_NK_CHUNKS) ? (N_NK_CHUNKS / nl) : 0;
+
+        for (int loop_k = 0; loop_k < K; loop_k += NK_T) {
+            if constexpr (nl <= N_NK_CHUNKS) {
+                if (v0) {
+                    half4x4 t0;
+                    dequantize_func(pA0, il_const, t0);
+                    dst_sa0[0] = t0[0]; dst_sa0[1] = t0[1]; dst_sa0[2] = t0[2]; dst_sa0[3] = t0[3];
+                    pA0 += blk_step;
+                }
+                if (v1) {
+                    half4x4 t1;
+                    dequantize_func(pA1, il_const, t1);
+                    dst_sa1[0] = t1[0]; dst_sa1[1] = t1[1]; dst_sa1[2] = t1[2]; dst_sa1[3] = t1[3];
+                    pA1 += blk_step;
+                }
+            } else {
+                const int   k_pos     = loop_k + k_base;
+                const int   block_idx = k_pos / (16 * nl);
+                const short il        = (k_pos / 16) % nl;
+                if (v0) {
+                    half4x4 t0;
+                    dequantize_func(pA0 + block_idx, il, t0);
+                    dst_sa0[0] = t0[0]; dst_sa0[1] = t0[1]; dst_sa0[2] = t0[2]; dst_sa0[3] = t0[3];
+                }
+                if (v1) {
+                    half4x4 t1;
+                    dequantize_func(pA1 + block_idx, il, t1);
+                    dst_sa1[0] = t1[0]; dst_sa1[1] = t1[1]; dst_sa1[2] = t1[2]; dst_sa1[3] = t1[3];
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            auto tBv = tensor(ptrB + loop_k, dextents<int32_t, 2>(NK_T, nr1), array<int, 2>({1, strideB}));
+            mm.run(tBv, tA, cT);
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        const int tileM = FC_mul_mm_bc_out ? min(NRA, M - ra) : NRA;
+        device float * dstTile = (device float *) dst + (uint64_t) idb * M + ra;
+        auto tD = tensor(dstTile, dextents<int32_t, 2>(tileM, nr1), array<int, 2>({1, M}));
+        cT.store(tD);
+        return;
+    }
 
     mpp::tensor_ops::matmul2d<
         mpp::tensor_ops::matmul2d_descriptor(
