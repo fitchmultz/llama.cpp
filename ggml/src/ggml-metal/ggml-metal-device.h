@@ -145,6 +145,12 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm   
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_k16        (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0    (ggml_metal_library_t lib, int ne02, int ne20, int ntile);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0_ext(ggml_metal_library_t lib, int ne02, int ne20, int ntile);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_gather  (ggml_metal_library_t lib);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_contig  (ggml_metal_library_t lib, enum ggml_type tsrc0, int nrb, bool bc_inp);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_situ_expert_f16   (ggml_metal_library_t lib);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_reduce_expert (ggml_metal_library_t lib, int32_t n_expert_used);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_full_moe_expert(ggml_metal_library_t lib, bool is_set_rows, bool has_scale);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_zero    (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id         (ggml_metal_library_t lib, const struct ggml_tensor * op, bool has_scale);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id         (ggml_metal_library_t lib, const struct ggml_tensor * op, bool has_scale);

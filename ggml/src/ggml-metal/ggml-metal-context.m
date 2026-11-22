@@ -65,9 +65,12 @@ struct ggml_metal {
     // n_cb command buffers + 1 used by the main thread
     struct ggml_metal_command_buffer cmd_bufs[GGML_METAL_MAX_COMMAND_BUFFERS + 1];
 
-    // dedicated private scratch buffers for MoE map0 (tpe + ids) so gallocr never overlaps cached maps
+    // dedicated private scratch buffers for MoE map0 (tpe + ids + inv + exp) and expert-contiguous gather
     id<MTLBuffer> map0_bufs[GGML_METAL_MAX_COMMAND_BUFFERS + 1];
     size_t        map0_buf_size;
+
+    id<MTLBuffer> gather_bufs[GGML_METAL_MAX_COMMAND_BUFFERS + 1];
+    size_t        gather_buf_size;
 
     // extra command buffers for things like getting, setting and copying tensors
     NSMutableArray * cmd_bufs_ext;
@@ -184,8 +187,10 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         for (int i = 0; i <= GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
             res->cmd_bufs[i].obj = nil;
             res->map0_bufs[i]    = nil;
+            res->gather_bufs[i]  = nil;
         }
-        res->map0_buf_size = 262144;
+        res->map0_buf_size   = 262144;
+        res->gather_buf_size = 0;
 
         res->cmd_bufs_ext = [[NSMutableArray alloc] init];
         res->buf_refs     = [[NSMutableArray alloc] init];
@@ -207,6 +212,9 @@ void ggml_metal_free(ggml_metal_t ctx) {
         }
         if (ctx->map0_bufs[i]) {
             [ctx->map0_bufs[i] release];
+        }
+        if (ctx->gather_bufs[i]) {
+            [ctx->gather_bufs[i] release];
         }
     }
 
@@ -569,6 +577,58 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             }
         }
 
+        // Pre-size per-CB MoE scratch buffers on the main thread when a large prefill graph has MUL_MAT_ID
+        {
+            const size_t max_gather_cap = 128ull * 1024ull * 1024ull;
+            size_t need_gather = 0;
+            size_t need_map0   = 0;
+            for (int i = 0; i < gf->n_nodes; ++i) {
+                const struct ggml_tensor * t = gf->nodes[i];
+                if (t->op == GGML_OP_MUL_MAT_ID && t->src[2] &&
+                    (int64_t) t->src[2]->ne[0] * t->src[2]->ne[1] >= 16 * t->src[0]->ne[2]) {
+                    const size_t n_rows = (size_t) t->src[2]->ne[0] * (size_t) t->src[2]->ne[1];
+                    const size_t k_pad  = GGML_PAD((size_t) t->src[0]->ne[0], 8);
+                    const size_t g_sz   = k_pad * n_rows * sizeof(uint16_t);
+                    if (g_sz <= max_gather_cap && g_sz > need_gather) {
+                        need_gather = g_sz;
+                    }
+                    const size_t m_sz = GGML_PAD(ggml_metal_op_mul_mat_id_extra_tpe(t), 16) +
+                                        GGML_PAD(ggml_metal_op_mul_mat_id_extra_ids(t), 16) +
+                                        GGML_PAD(n_rows * sizeof(int32_t), 16) +
+                                        GGML_PAD(n_rows * sizeof(uint16_t), 16);
+                    if (m_sz > need_map0) {
+                        need_map0 = m_sz;
+                    }
+                }
+            }
+            const bool grow_gather = need_gather > ctx->gather_buf_size;
+            const bool grow_map0   = need_map0   > ctx->map0_buf_size;
+            if (grow_gather || grow_map0) {
+                if (ctx->cmd_buf_last) {
+                    [ctx->cmd_buf_last waitUntilCompleted];
+                    ctx->cmd_buf_last = nil;
+                }
+                if (grow_gather) {
+                    for (int i = 0; i <= GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
+                        if (ctx->gather_bufs[i]) {
+                            [ctx->gather_bufs[i] release];
+                            ctx->gather_bufs[i] = nil;
+                        }
+                    }
+                    ctx->gather_buf_size = GGML_PAD(need_gather, 65536);
+                }
+                if (grow_map0) {
+                    for (int i = 0; i <= GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
+                        if (ctx->map0_bufs[i]) {
+                            [ctx->map0_bufs[i] release];
+                            ctx->map0_bufs[i] = nil;
+                        }
+                    }
+                    ctx->map0_buf_size = GGML_PAD(need_map0, 65536);
+                }
+            }
+        }
+
         // short-hand
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
 
@@ -773,8 +833,13 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             id<MTLDevice> dev = ggml_metal_device_get_obj(ctx->dev);
             ctx->map0_bufs[cb_idx] = [dev newBufferWithLength:ctx->map0_buf_size options:MTLResourceStorageModePrivate];
         }
+        if (ctx->gather_buf_size > 0 && !ctx->gather_bufs[cb_idx]) {
+            id<MTLDevice> dev = ggml_metal_device_get_obj(ctx->dev);
+            ctx->gather_bufs[cb_idx] = [dev newBufferWithLength:ctx->gather_buf_size options:MTLResourceStorageModePrivate];
+        }
 
-        struct ggml_metal_buffer_id map0_bid = { ctx->map0_bufs[cb_idx], 0 };
+        struct ggml_metal_buffer_id map0_bid   = { ctx->map0_bufs[cb_idx],   0 };
+        struct ggml_metal_buffer_id gather_bid = { ctx->gather_bufs[cb_idx], 0 };
 
         ggml_metal_op_t ctx_op = ggml_metal_op_init(
             ctx->dev,
@@ -787,7 +852,9 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             ctx->capture_compute == 0,
             ctx->debug_graph,
             map0_bid,
-            ctx->map0_buf_size);
+            ctx->map0_buf_size,
+            gather_bid,
+            ctx->gather_buf_size);
 
         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
             const int res = ggml_metal_op_encode(ctx_op, idx);

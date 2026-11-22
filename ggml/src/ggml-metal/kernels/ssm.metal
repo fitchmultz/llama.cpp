@@ -285,6 +285,148 @@ template [[host_name("kernel_ssm_conv_full_set_add_f32")]]     kernel kernel_ssm
 template [[host_name("kernel_ssm_conv_full_moe_cpy_add_f32")]] kernel kernel_ssm_conv_full_t kernel_ssm_conv_full_impl<false, false, true,  true>;
 template [[host_name("kernel_ssm_conv_full_moe_set_add_f32")]] kernel kernel_ssm_conv_full_t kernel_ssm_conv_full_impl<true,  false, true,  true>;
 
+template <bool HAS_SCALE>
+static inline float4 ssm_conv_read_cur_expert4(
+        device const float4   * cur4,
+        device const float    * wf_all,
+        device const int32_t  * hinv,
+        device const uint16_t * hexp,
+        device const float    * w_scale,
+        int64_t tok,
+        int64_t c4,
+        int64_t C4,
+        int64_t n_exp) {
+    const int64_t w_base = tok * n_exp;
+    device const float   * wf = wf_all + w_base;
+    device const int32_t * ip = hinv   + w_base;
+    if (n_exp == 8) {
+        const int32_t p0 = ip[0], p1 = ip[1], p2 = ip[2], p3 = ip[3];
+        const int32_t p4 = ip[4], p5 = ip[5], p6 = ip[6], p7 = ip[7];
+        const float w0 = HAS_SCALE ? wf[0] * w_scale[hexp[p0]] : wf[0];
+        const float w1 = HAS_SCALE ? wf[1] * w_scale[hexp[p1]] : wf[1];
+        const float w2 = HAS_SCALE ? wf[2] * w_scale[hexp[p2]] : wf[2];
+        const float w3 = HAS_SCALE ? wf[3] * w_scale[hexp[p3]] : wf[3];
+        const float w4 = HAS_SCALE ? wf[4] * w_scale[hexp[p4]] : wf[4];
+        const float w5 = HAS_SCALE ? wf[5] * w_scale[hexp[p5]] : wf[5];
+        const float w6 = HAS_SCALE ? wf[6] * w_scale[hexp[p6]] : wf[6];
+        const float w7 = HAS_SCALE ? wf[7] * w_scale[hexp[p7]] : wf[7];
+        return (cur4[(int64_t) p0 * C4 + c4] * w0 + cur4[(int64_t) p1 * C4 + c4] * w1) +
+               (cur4[(int64_t) p2 * C4 + c4] * w2 + cur4[(int64_t) p3 * C4 + c4] * w3) +
+               (cur4[(int64_t) p4 * C4 + c4] * w4 + cur4[(int64_t) p5 * C4 + c4] * w5) +
+               (cur4[(int64_t) p6 * C4 + c4] * w6 + cur4[(int64_t) p7 * C4 + c4] * w7);
+    }
+    float4 sum = float4(0.0f);
+    for (int64_t e = 0; e < n_exp; ++e) {
+        const int32_t p = ip[e];
+        const float   w = HAS_SCALE ? wf[e] * w_scale[hexp[p]] : wf[e];
+        sum += cur4[(int64_t) p * C4 + c4] * w;
+    }
+    return sum;
+}
+
+template <bool IS_SET_ROWS, bool HAS_SCALE>
+kernel void kernel_ssm_conv_full_moe_expert_impl(
+        constant ggml_metal_kargs_ssm_conv_full & args,
+        device const char     * past,
+        device const char     * cur,
+        device const char     * weight,
+        device       char     * state_dst,
+        device const char     * slot_order,
+        device const char     * moe_w,
+        device       char     * dst,
+        device const char     * res_add,
+        device const int32_t  * hinv,
+        device const uint16_t * hexp,
+        device const float    * w_scale,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        uint3  tpitg[[thread_position_in_threadgroup]],
+        uint3    ntg[[threads_per_threadgroup]]) {
+    const int64_t C  = args.n_channels;
+    const int64_t C4 = C >> 2;
+    const int64_t c4 = (int64_t) tgpig.x * ntg.x + tpitg.x;
+    if (c4 >= C4) {
+        return;
+    }
+    constexpr int64_t BT = 32;
+    const int64_t t0 = (int64_t) tgpig.y * BT;
+    const int64_t T  = args.n_seq_tokens;
+    if (t0 >= T) {
+        return;
+    }
+    const int64_t t_end    = min(t0 + BT, T);
+    const int64_t s        = tgpig.z;
+    const int64_t base_tok = s * T;
+    const int64_t c0       = c4 << 2;
+    const int64_t n_exp    = args.head_dim;
+
+    device const float4  * cur4   = (device const float4  *) cur;
+    device const float   * wf_all = (device const float   *) moe_w;
+    device       float4  * dst4   = (device       float4  *) dst;
+    device const float4  * add4   = (device const float4  *) res_add;
+    device const int32_t * sl_o   = IS_SET_ROWS ? (device const int32_t *) slot_order : nullptr;
+
+    const float4 w_c0 = *(device const float4 *) (weight + (c0 + 0) * args.nb_w1);
+    const float4 w_c1 = *(device const float4 *) (weight + (c0 + 1) * args.nb_w1);
+    const float4 w_c2 = *(device const float4 *) (weight + (c0 + 2) * args.nb_w1);
+    const float4 w_c3 = *(device const float4 *) (weight + (c0 + 3) * args.nb_w1);
+
+    const float4 wx = float4(w_c0.x, w_c1.x, w_c2.x, w_c3.x);
+    const float4 wy = float4(w_c0.y, w_c1.y, w_c2.y, w_c3.y);
+    const float4 wz = float4(w_c0.z, w_c1.z, w_c2.z, w_c3.z);
+    const float4 ww = float4(w_c0.w, w_c1.w, w_c2.w, w_c3.w);
+
+    auto load_past = [&](int64_t pidx) -> float4 {
+        device const char * pb = past + s * args.nb_p2;
+        return float4(
+            ((device const float *) (pb + (c0 + 0) * args.nb_p1))[pidx],
+            ((device const float *) (pb + (c0 + 1) * args.nb_p1))[pidx],
+            ((device const float *) (pb + (c0 + 2) * args.nb_p1))[pidx],
+            ((device const float *) (pb + (c0 + 3) * args.nb_p1))[pidx]);
+    };
+
+    float4 p0 = (t0 < 3) ? load_past(t0)     : ssm_conv_read_cur_expert4<HAS_SCALE>(cur4, wf_all, hinv, hexp, w_scale, base_tok + t0 - 3, c4, C4, n_exp);
+    float4 p1 = (t0 < 2) ? load_past(t0 + 1) : ssm_conv_read_cur_expert4<HAS_SCALE>(cur4, wf_all, hinv, hexp, w_scale, base_tok + t0 - 2, c4, C4, n_exp);
+    float4 p2 = (t0 < 1) ? load_past(t0 + 2) : ssm_conv_read_cur_expert4<HAS_SCALE>(cur4, wf_all, hinv, hexp, w_scale, base_tok + t0 - 1, c4, C4, n_exp);
+
+    for (int64_t t = t0; t < t_end; ++t) {
+        const float4 v = ssm_conv_read_cur_expert4<HAS_SCALE>(cur4, wf_all, hinv, hexp, w_scale, base_tok + t, c4, C4, n_exp);
+        const float4 y = (p0 * wx + p1 * wy + p2 * wz + v * ww + v) * args.res_scale + add4[(base_tok + t) * C4 + c4];
+        dst4[(base_tok + t) * C4 + c4] = y;
+
+        p0 = p1;
+        p1 = p2;
+        p2 = v;
+
+        if (IS_SET_ROWS) {
+            const int64_t w_idx = t - (T - args.kw);
+            if (w_idx >= 0) {
+                const int64_t sl = sl_o[w_idx];
+                FOR_UNROLL (int k = 0; k < 4; ++k) {
+                    device float * st = (device float *) (state_dst + s * args.nb_st3 + (c0 + k) * args.nb_st2 + sl * args.nb_st1);
+                    st[0] = p0[k];
+                    st[1] = p1[k];
+                    st[2] = p2[k];
+                }
+            }
+        }
+    }
+
+    if (!IS_SET_ROWS && t_end == T) {
+        FOR_UNROLL (int k = 0; k < 4; ++k) {
+            device float * st = (device float *) (state_dst + s * args.nb_st1 + (c0 + k) * 3 * sizeof(float));
+            st[0] = p0[k];
+            st[1] = p1[k];
+            st[2] = p2[k];
+        }
+    }
+}
+
+typedef decltype(kernel_ssm_conv_full_moe_expert_impl<false, false>) kernel_ssm_conv_full_moe_expert_t;
+template [[host_name("kernel_ssm_conv_full_moe_expert_cpy_f32")]]    kernel kernel_ssm_conv_full_moe_expert_t kernel_ssm_conv_full_moe_expert_impl<false, false>;
+template [[host_name("kernel_ssm_conv_full_moe_expert_set_f32")]]    kernel kernel_ssm_conv_full_moe_expert_t kernel_ssm_conv_full_moe_expert_impl<true,  false>;
+template [[host_name("kernel_ssm_conv_full_moe_expert_cpy_sc_f32")]] kernel kernel_ssm_conv_full_moe_expert_t kernel_ssm_conv_full_moe_expert_impl<false, true>;
+template [[host_name("kernel_ssm_conv_full_moe_expert_set_sc_f32")]] kernel kernel_ssm_conv_full_moe_expert_t kernel_ssm_conv_full_moe_expert_impl<true,  true>;
+
 // ref: ggml.c:ggml_compute_forward_ssm_scan_f32, Mamba-2 part
 // Optimized version: reduces redundant memory loads by having one thread load shared values
 // TAIL == false is the whole-sequence / decode path: token_offset folds away at compile time.

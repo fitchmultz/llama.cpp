@@ -644,6 +644,40 @@ typedef struct {
 } ggml_metal_kargs_mul_mm_id;
 
 typedef struct {
+    int32_t  K;
+    int32_t  K_pad;
+    int32_t  ne11;
+    uint64_t nb11;
+    uint64_t nb12;
+    int32_t  ne20;
+    int32_t  n_rows;
+} ggml_metal_kargs_mul_mm_id_gather;
+
+typedef struct {
+    int32_t  K;
+    int32_t  M;
+    int32_t  stride_b;
+    uint64_t nb01;
+    uint64_t nb02;
+} ggml_metal_kargs_mul_mm_id_contig;
+
+typedef struct {
+    int32_t  n_ff4;
+    int32_t  n_rows;
+    float    inv_beta;
+    float    beta;
+    float    inv_lb;
+    float    lb;
+    int32_t  has_scale;
+} ggml_metal_kargs_situ_expert;
+
+typedef struct {
+    int32_t  ne00_4;
+    int32_t  ne02;
+    int32_t  has_scale;
+} ggml_metal_kargs_moe_reduce_expert;
+
+typedef struct {
     int32_t  nei0;
     int32_t  nei1;
     uint64_t nbi1;

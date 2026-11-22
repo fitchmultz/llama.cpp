@@ -592,3 +592,37 @@ kernel void kernel_moe_reduce_f32(
     }
     dst[token * args.ne00 + col] = sum;
 }
+
+// vectorized expert-contiguous MoE output reduction: reads [C, n_rows] via hinv + optional per-expert scale.
+kernel void kernel_moe_reduce_expert_f32_4(
+        constant   ggml_metal_kargs_moe_reduce_expert & args,
+        device const float4   * experts4,
+        device const float    * weights,
+        device const int32_t  * hinv,
+        device const uint16_t * hexp,
+        device const float    * w_scale,
+        device       float4   * dst4,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int64_t token = tgpig.x;
+    const int64_t c4    = (int64_t) tgpig.y * ntg.x + tpitg.x;
+    const int64_t C4    = args.ne00_4;
+    if (token >= args.ne02 || c4 >= C4) {
+        return;
+    }
+
+    const int n_expert_used = FC_moe_reduce_n_expert_used;
+    const int64_t w_base = token * (int64_t) n_expert_used;
+
+    float4 sum = float4(0.0f);
+    FOR_UNROLL (int e = 0; e < n_expert_used; ++e) {
+        const int32_t pos = hinv[w_base + e];
+        float w = weights[w_base + e];
+        if (args.has_scale) {
+            w *= w_scale[hexp[pos]];
+        }
+        sum += experts4[(int64_t) pos * C4 + c4] * w;
+    }
+    dst4[token * C4 + c4] = sum;
+}

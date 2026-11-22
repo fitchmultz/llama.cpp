@@ -21,7 +21,9 @@ ggml_metal_op_t ggml_metal_op_init(
         bool use_capture,
         int  debug_graph,
         struct ggml_metal_buffer_id map0_buf,
-        size_t map0_buf_size);
+        size_t map0_buf_size,
+        struct ggml_metal_buffer_id gather_buf,
+        size_t gather_buf_size);
 
 void ggml_metal_op_free(ggml_metal_op_t ctx);
 
