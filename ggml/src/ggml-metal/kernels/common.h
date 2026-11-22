@@ -45,10 +45,9 @@ constexpr constant static float kvalues_mxfp4_f[16] = {
     0, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0, -.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f
 };
 
-// decode the E2M1 value in the low nibble of n, scaled by 2^-14, without a lookup table
+// decode the E2M1 value in the low nibble of n, scaled by 2^-14, branchless without a lookup table
 static inline half mxfp4_dq1(uint32_t n) {
-    const half c = as_type<half>(ushort((n & 7) << 9));
-    return (n & 8) ? -c : c;
+    return as_type<half>(ushort(((n & 8u) << 12) | ((n & 7u) << 9)));
 }
 static inline float4 mxfp4_lo4(uint32_t w) {
     return float4(mxfp4_dq1(w), mxfp4_dq1(w >> 8), mxfp4_dq1(w >> 16), mxfp4_dq1(w >> 24));

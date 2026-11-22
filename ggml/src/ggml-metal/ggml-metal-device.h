@@ -117,6 +117,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_diag     
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_repeat            (ggml_metal_library_t lib, enum ggml_type tsrc);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat            (ggml_metal_library_t lib, enum ggml_type tsrc);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_unary             (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_unary_op          (ggml_metal_library_t lib, const struct ggml_tensor * src0, const struct ggml_tensor * dst, int op_num);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_silu_back         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_glu               (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_sum               (ggml_metal_library_t lib, const struct ggml_tensor * op);
@@ -170,11 +171,11 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_clip  
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_loop_control      (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_situ              (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_sigmoid       (ggml_metal_library_t lib);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_depth_mix         (ggml_metal_library_t lib);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_depth_mix         (ggml_metal_library_t lib, bool has_norm);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat_rms_norm   (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_loop_down_norm    (ggml_metal_library_t lib, bool multi_tok);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_loop_control_mm   (ggml_metal_library_t lib);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_full     (ggml_metal_library_t lib, bool is_set_rows, bool has_dyn);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_full     (ggml_metal_library_t lib, bool is_set_rows, bool has_dyn, bool has_add, bool has_moe_reduce);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_group_norm        (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm              (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t n_fuse);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm_scale        (ggml_metal_library_t lib, const struct ggml_tensor * op);

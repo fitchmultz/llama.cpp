@@ -1834,6 +1834,28 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * 
                 }
             }
 
+            if (!alibi && !is_2d && !rows && !swa && !prev &&
+                cells.get_used() == cells.used_max_p1() &&
+                cells.seq_n_cells(seq_id) == cells.get_used()) {
+                const uint32_t n_used = std::min<uint32_t>((uint32_t) n_kv, cells.get_used());
+                if (!causal) {
+                    std::fill_n(data + idst, n_used, mask_keep);
+                    std::fill_n(data + idst + n_used, (uint32_t) n_kv - n_used, mask_drop);
+                } else {
+                    const llama_pos * pos_arr = cells.pos_data();
+                    const int32_t pos_thresh = seq_pos_min[seq_id] - (int32_t) (n_swa + 32);
+                    for (uint32_t jj = 0; jj < n_used; ++jj) {
+                        const llama_pos p0_cur = pos_arr[jj];
+                        if (p0_cur >= pos_thresh) {
+                            idxs.push_back(jj);
+                        }
+                        data[idst + jj] = (p0_cur > p1) ? mask_drop : mask_keep;
+                    }
+                    std::fill_n(data + idst + n_used, (uint32_t) n_kv - n_used, mask_drop);
+                }
+                continue;
+            }
+
             for (uint32_t jj = 0; jj < n_kv; ++jj) {
                 // column of the mask
                 uint32_t c = jj;
@@ -2108,14 +2130,31 @@ void llama_kv_cache::set_input_k_pos(ggml_tensor * dst, const llama_ubatch * uba
     const int64_t n_str = dst->ne[1];
     GGML_ASSERT(ubatch->n_tokens % n_str == 0);
     const int64_t n_tps = ubatch->n_tokens / n_str;
-    std::vector<int32_t> data(n_kv * n_str);
-    for (int64_t s = 0; s < n_str; ++s) {
-        const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[s * n_tps][0]));
-        for (int64_t j = 0; j < n_kv; ++j) {
-            data[s * n_kv + j] = cells.is_empty(j) ? -1000000000 : (int32_t) cells.pos_get(j);
+    const auto fill_k_pos = [&](int32_t * out) {
+        for (int64_t s = 0; s < n_str; ++s) {
+            const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[s * n_tps][0]));
+            const llama_pos * pos_arr = cells.pos_data();
+            int32_t * dst_s = out + s * n_kv;
+            if (cells.get_used() == cells.used_max_p1()) {
+                const int64_t n_used = std::min<int64_t>(n_kv, cells.get_used());
+                std::memcpy(dst_s, pos_arr, (size_t) n_used * sizeof(int32_t));
+                std::fill_n(dst_s + n_used, (size_t) (n_kv - n_used), -1000000000);
+            } else {
+                for (int64_t j = 0; j < n_kv; ++j) {
+                    const llama_pos p = pos_arr[j];
+                    dst_s[j] = (p == -1) ? -1000000000 : (int32_t) p;
+                }
+            }
         }
+    };
+    if (ggml_backend_buffer_is_host(dst->buffer)) {
+        fill_k_pos((int32_t *) dst->data);
+    } else {
+        thread_local std::vector<int32_t> data;
+        data.resize((size_t) (n_kv * n_str));
+        fill_k_pos(data.data());
+        ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
     }
-    ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
 }
 
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

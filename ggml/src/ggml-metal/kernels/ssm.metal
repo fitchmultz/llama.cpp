@@ -167,7 +167,33 @@ kernel void kernel_ssm_conv_f32_f32_batched_4(
     x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : (FC_ssm_conv_res ? (sumf + s[nc/4 - 1][3])*args.res_scale : sumf);
 }
 
-template <bool IS_SET_ROWS, bool HAS_DYN>
+template <bool HAS_MOE_REDUCE>
+static inline float ssm_conv_read_cur(
+        device const float * cur_f,
+        device const char  * dyn,
+        int64_t tok,
+        int64_t c,
+        int64_t C,
+        int64_t n_exp) {
+    if (HAS_MOE_REDUCE) {
+        device const float * wf = (device const float *) dyn + tok * n_exp;
+        const int64_t base = tok * n_exp * C + c;
+        if (n_exp == 8) {
+            return (cur_f[base + 0 * C] * wf[0] + cur_f[base + 1 * C] * wf[1]) +
+                   (cur_f[base + 2 * C] * wf[2] + cur_f[base + 3 * C] * wf[3]) +
+                   (cur_f[base + 4 * C] * wf[4] + cur_f[base + 5 * C] * wf[5]) +
+                   (cur_f[base + 6 * C] * wf[6] + cur_f[base + 7 * C] * wf[7]);
+        }
+        float sum = 0.0f;
+        for (int64_t e = 0; e < n_exp; ++e) {
+            sum += cur_f[base + e * C] * wf[e];
+        }
+        return sum;
+    }
+    return cur_f[tok * C + c];
+}
+
+template <bool IS_SET_ROWS, bool HAS_DYN, bool HAS_ADD, bool HAS_MOE_REDUCE>
 kernel void kernel_ssm_conv_full_impl(
         constant ggml_metal_kargs_ssm_conv_full & args,
         device const char * past,
@@ -177,6 +203,7 @@ kernel void kernel_ssm_conv_full_impl(
         device const char * slot_order,
         device const char * dyn,
         device       char * dst,
+        device const char * res_add,
         uint3  tgpig[[threadgroup_position_in_grid]],
         uint3  tpitg[[thread_position_in_threadgroup]],
         uint3    ntg[[threads_per_threadgroup]]) {
@@ -184,7 +211,7 @@ kernel void kernel_ssm_conv_full_impl(
     if (c >= args.n_channels) {
         return;
     }
-    constexpr int64_t BT = 4;
+    constexpr int64_t BT = 16;
     const int64_t t0 = (int64_t) tgpig.y * BT;
     const int64_t T  = args.n_seq_tokens;
     if (t0 >= T) {
@@ -199,23 +226,28 @@ kernel void kernel_ssm_conv_full_impl(
     device const float4  * w_ptr = (device const float4  *) (weight + c * args.nb_w1);
     device const float   * cur_f = (device const float   *) cur;
     device       float   * dst_f = (device       float   *) dst;
+    device const float   * add_f = HAS_ADD ? (device const float *) res_add : nullptr;
     device const int32_t * sl_o  = IS_SET_ROWS ? (device const int32_t *) slot_order : nullptr;
 
-    const float4  w = w_ptr[0];
-    const int64_t h = HAS_DYN ? (c / args.head_dim) : 0;
+    const float4  w     = w_ptr[0];
+    const int64_t h     = HAS_DYN ? (c / args.head_dim) : 0;
+    const int64_t n_exp = HAS_MOE_REDUCE ? args.head_dim : 1;
 
-    float p0 = (t0 < 3) ? p_ptr[t0]     : cur_f[(base_tok + t0 - 3) * C + c];
-    float p1 = (t0 < 2) ? p_ptr[t0 + 1] : cur_f[(base_tok + t0 - 2) * C + c];
-    float p2 = (t0 < 1) ? p_ptr[t0 + 2] : cur_f[(base_tok + t0 - 1) * C + c];
+    float p0 = (t0 < 3) ? p_ptr[t0]     : ssm_conv_read_cur<HAS_MOE_REDUCE>(cur_f, dyn, base_tok + t0 - 3, c, C, n_exp);
+    float p1 = (t0 < 2) ? p_ptr[t0 + 1] : ssm_conv_read_cur<HAS_MOE_REDUCE>(cur_f, dyn, base_tok + t0 - 2, c, C, n_exp);
+    float p2 = (t0 < 1) ? p_ptr[t0 + 2] : ssm_conv_read_cur<HAS_MOE_REDUCE>(cur_f, dyn, base_tok + t0 - 1, c, C, n_exp);
 
     for (int64_t t = t0; t < t_end; ++t) {
-        const float v = cur_f[(base_tok + t) * C + c];
+        const float v = ssm_conv_read_cur<HAS_MOE_REDUCE>(cur_f, dyn, base_tok + t, c, C, n_exp);
         float y;
         if (HAS_DYN) {
             const float4 d = ((device const float4 *) (dyn + (base_tok + t) * args.nb_d1))[h];
             y = (p0 * (w.x + d.w) + p1 * (w.y + d.z) + p2 * (w.z + d.y) + v * (w.w + d.x) + v) * args.res_scale;
         } else {
             y = (p0 * w.x + p1 * w.y + p2 * w.z + v * w.w + v) * args.res_scale;
+        }
+        if (HAS_ADD) {
+            y += add_f[(base_tok + t) * C + c];
         }
         dst_f[(base_tok + t) * C + c] = y;
 
@@ -243,11 +275,15 @@ kernel void kernel_ssm_conv_full_impl(
     }
 }
 
-typedef decltype(kernel_ssm_conv_full_impl<false, false>) kernel_ssm_conv_full_t;
-template [[host_name("kernel_ssm_conv_full_cpy_f32")]]     kernel kernel_ssm_conv_full_t kernel_ssm_conv_full_impl<false, false>;
-template [[host_name("kernel_ssm_conv_full_set_f32")]]     kernel kernel_ssm_conv_full_t kernel_ssm_conv_full_impl<true,  false>;
-template [[host_name("kernel_ssm_conv_full_dyn_cpy_f32")]] kernel kernel_ssm_conv_full_t kernel_ssm_conv_full_impl<false, true>;
-template [[host_name("kernel_ssm_conv_full_dyn_set_f32")]] kernel kernel_ssm_conv_full_t kernel_ssm_conv_full_impl<true,  true>;
+typedef decltype(kernel_ssm_conv_full_impl<false, false, false, false>) kernel_ssm_conv_full_t;
+template [[host_name("kernel_ssm_conv_full_cpy_f32")]]         kernel kernel_ssm_conv_full_t kernel_ssm_conv_full_impl<false, false, false, false>;
+template [[host_name("kernel_ssm_conv_full_set_f32")]]         kernel kernel_ssm_conv_full_t kernel_ssm_conv_full_impl<true,  false, false, false>;
+template [[host_name("kernel_ssm_conv_full_dyn_cpy_f32")]]     kernel kernel_ssm_conv_full_t kernel_ssm_conv_full_impl<false, true,  false, false>;
+template [[host_name("kernel_ssm_conv_full_dyn_set_f32")]]     kernel kernel_ssm_conv_full_t kernel_ssm_conv_full_impl<true,  true,  false, false>;
+template [[host_name("kernel_ssm_conv_full_cpy_add_f32")]]     kernel kernel_ssm_conv_full_t kernel_ssm_conv_full_impl<false, false, true,  false>;
+template [[host_name("kernel_ssm_conv_full_set_add_f32")]]     kernel kernel_ssm_conv_full_t kernel_ssm_conv_full_impl<true,  false, true,  false>;
+template [[host_name("kernel_ssm_conv_full_moe_cpy_add_f32")]] kernel kernel_ssm_conv_full_t kernel_ssm_conv_full_impl<false, false, true,  true>;
+template [[host_name("kernel_ssm_conv_full_moe_set_add_f32")]] kernel kernel_ssm_conv_full_t kernel_ssm_conv_full_impl<true,  false, true,  true>;
 
 // ref: ggml.c:ggml_compute_forward_ssm_scan_f32, Mamba-2 part
 // Optimized version: reduces redundant memory loads by having one thread load shared values

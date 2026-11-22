@@ -1084,6 +1084,7 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
         cur = ggml_concat(ctx0, cur, masks, 1);
     }
     cur = ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
+    attn->self_attn_mask.block_uniform = true;
     attn->self_attn_mask_swa.block_uniform = true;
     for (int il = 0; il < n_layer; ++il) {
         const auto & l = model.layers[il];
@@ -1119,12 +1120,17 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     const int64_t n_draft = n_out - 1;
     ggml_tensor * base_all = nullptr;
     if (use_factored) {
-        // Compute target.output @ (cur[1..n_out-1] + dspark_hidden_out_b) ONCE for all draft steps!
+        // Compute draft base logits ONCE for all draft steps (uses quantized draft-only dspark_base_lm when available)
         auto * cur_draft = ggml_view_3d(ctx0, cur, n_embd, n_draft, nb,
                 cur->nb[1], block * cur->nb[1], cur->nb[1]);
         cur_draft = ggml_reshape_2d(ctx0, ggml_cont(ctx0, cur_draft), n_embd, n_draft * nb);
         cur_draft = ggml_add(ctx0, cur_draft, model.dspark_hidden_out_b);
-        base_all = build_lora_mm(target->output, cur_draft, target->output_s);
+        ggml_tensor * output_w = dspark_base_lm != nullptr
+            ? dspark_base_lm
+            : ((hparams.n_vocab_unpadded > 0 && hparams.n_vocab_unpadded < target->output->ne[1])
+                ? ggml_view_2d(ctx0, target->output, target->output->ne[0], hparams.n_vocab_unpadded, target->output->nb[1], 0)
+                : target->output);
+        base_all = build_lora_mm(output_w, cur_draft, target->output_s);
         ggml_prec_set_acc(base_all, GGML_PREC_F32);
     }
     auto * state = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, rank, nb), 0.0f);
@@ -1181,6 +1187,10 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
             }
         }
     }
+    if (n_out < block) {
+        // h_nextn is read at every row
+        states = ggml_concat(ctx0, states, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, nb*(block - n_out)), 0.0f), 1);
+    }
     const auto block_order = [&](ggml_tensor * t, int64_t n) {
         if (nb == 1) {
             return t;
@@ -1188,10 +1198,6 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
         t = ggml_reshape_3d(ctx0, t, t->ne[0], nb, n);
         return ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, t, 0, 2, 1, 3)), t->ne[0], nb*n);
     };
-    if (n_out < block) {
-        // h_nextn is read at every row
-        states = ggml_concat(ctx0, states, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, nb*(block - n_out)), 0.0f), 1);
-    }
     res->t_h_nextn = block_order(states, block);
     cb(res->t_h_nextn, "dspark_chain_state", -1);
     ggml_build_forward_expand(gf, res->t_h_nextn);

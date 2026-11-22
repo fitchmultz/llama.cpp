@@ -10,6 +10,9 @@
 #include <set>
 #include <numeric>
 #include <stdexcept>
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+#endif
 
 #define MAX_REPETITION_THRESHOLD 2000
 #define GRAMMAR_RECURSIVE_LIMIT 256
@@ -1266,6 +1269,10 @@ static bool llama_grammar_reject_step(
         }
     }
 
+    if (next.empty()) {
+        return false;
+    }
+
     const auto * stack_pos_after = llama_grammar_match_char(stack_pos, 0).second;
 
     // update top of stack to next element, if any
@@ -1591,6 +1598,55 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
         const auto * entries = cache.entries.data();
         const size_t n_entries = cache.entries.size();
         const uint32_t * cp_base = cache.code_points.data();
+
+#ifdef __APPLE__
+        if (cur_p->size >= 4096) {
+            constexpr size_t n_chunks = 8;
+            const size_t n_total  = cur_p->size;
+            const size_t chunk_sz = (n_total + n_chunks - 1) / n_chunks;
+            struct grammar_apply_ctx {
+                const llama_grammar    * grammar;
+                llama_token_data_array * cur_p;
+                decltype(entries)        entries;
+                size_t                   n_entries;
+                const uint32_t         * cp_base;
+                size_t                   n_total;
+                size_t                   chunk_sz;
+                bool                     allow_eog;
+            } gctx = { &grammar, cur_p, entries, n_entries, cp_base, n_total, chunk_sz, allow_eog };
+
+            dispatch_apply_f(n_chunks, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &gctx, [](void * p, size_t c) {
+                const auto * ctx = (const grammar_apply_ctx *) p;
+                const size_t beg = c * ctx->chunk_sz;
+                const size_t end = std::min(beg + ctx->chunk_sz, ctx->n_total);
+                if (beg >= end) {
+                    return;
+                }
+                llama_grammar_candidates local_cands;
+                local_cands.reserve(end - beg);
+                for (size_t i = beg; i < end; ++i) {
+                    const llama_token id = ctx->cur_p->data[i].id;
+                    const auto & e = (id >= 0 && (size_t) id < ctx->n_entries) ? ctx->entries[id] : ctx->grammar->vocab->get_grammar_utf8_cache().entries.at(id);
+                    if (e.flags & 1) {
+                        if (!ctx->allow_eog) {
+                            ctx->cur_p->data[i].logit = -INFINITY;
+                        }
+                    } else if (e.flags & 2) {
+                        ctx->cur_p->data[i].logit = -INFINITY;
+                    } else {
+                        local_cands.push_back({ i, ctx->cp_base + e.offset, { e.partial_value, e.partial_remain }, id });
+                    }
+                }
+                if (!local_cands.empty()) {
+                    const auto rejects = llama_grammar_reject_candidates(*ctx->grammar->rules, ctx->grammar->stacks, local_cands);
+                    for (const auto & reject : rejects) {
+                        ctx->cur_p->data[reject.index].logit = -INFINITY;
+                    }
+                }
+            });
+            return;
+        }
+#endif
 
         for (size_t i = 0; i < cur_p->size; ++i) {
             const llama_token id = cur_p->data[i].id;

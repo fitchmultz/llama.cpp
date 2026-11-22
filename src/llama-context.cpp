@@ -3138,9 +3138,14 @@ void llama_context::init_dspark_markov_lm() {
         return;
     }
 
+    ggml_type markov_type = (rank % ggml_blck_size(GGML_TYPE_Q4_0) == 0) ? GGML_TYPE_Q4_0 : GGML_TYPE_F16;
+    ggml_type base_type   = (target->output->type != GGML_TYPE_Q4_0 && n_embd % ggml_blck_size(GGML_TYPE_Q4_0) == 0)
+        ? GGML_TYPE_Q4_0
+        : GGML_TYPE_COUNT;
+
     {
         struct ggml_init_params params = {
-            /*.mem_size   =*/ ggml_tensor_overhead() * 4,
+            /*.mem_size   =*/ ggml_tensor_overhead() * 6,
             /*.mem_buffer =*/ nullptr,
             /*.no_alloc   =*/ true,
         };
@@ -3148,14 +3153,19 @@ void llama_context::init_dspark_markov_lm() {
         if (!ctx_dspark_lm) {
             return;
         }
-        dspark_markov_lm   = ggml_new_tensor_2d(ctx_dspark_lm.get(), GGML_TYPE_F16, rank, n_vocab);
+        dspark_markov_lm   = ggml_new_tensor_2d(ctx_dspark_lm.get(), markov_type, rank, n_vocab);
         dspark_markov_bias = ggml_new_tensor_1d(ctx_dspark_lm.get(), GGML_TYPE_F32, n_vocab);
         ggml_set_name(dspark_markov_lm,   "dspark_markov_lm");
         ggml_set_name(dspark_markov_bias, "dspark_markov_bias");
+        if (base_type != GGML_TYPE_COUNT) {
+            dspark_base_lm = ggml_new_tensor_2d(ctx_dspark_lm.get(), base_type, n_embd, n_vocab);
+            ggml_set_name(dspark_base_lm, "dspark_base_lm");
+        }
 
         buf_dspark_lm.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_dspark_lm.get(), buft));
         if (!buf_dspark_lm) {
             LLAMA_LOG_WARN("%s: failed to allocate DSpark Markov LM head buffer, using unfactored head\n", __func__);
+            dspark_base_lm     = nullptr;
             dspark_markov_lm   = nullptr;
             dspark_markov_bias = nullptr;
             ctx_dspark_lm.reset();
@@ -3202,8 +3212,42 @@ void llama_context::init_dspark_markov_lm() {
         ggml_backend_sched_synchronize(tmp_sched.get());
     }
 
+    if (ok && dspark_base_lm != nullptr) {
+        // Quantize draft-only base LM head in 32K-row stripes (~288 MiB peak transient)
+        const int64_t stripe_rows = 32768;
+        bool base_ok = true;
+        for (int64_t row0 = 0; row0 < n_vocab && base_ok; row0 += stripe_rows) {
+            const int64_t nr = std::min(stripe_rows, n_vocab - row0);
+            struct ggml_init_params sparams = {
+                /*.mem_size   =*/ gbuf.size(),
+                /*.mem_buffer =*/ gbuf.data(),
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context_ptr sctx(ggml_init(sparams));
+            ggml_cgraph * sgf = ggml_new_graph_custom(sctx.get(), 32, false);
+            ggml_tensor * src_s = ggml_view_2d(sctx.get(), target->output, n_embd, nr,
+                    target->output->nb[1], (size_t) row0 * target->output->nb[1]);
+            ggml_tensor * f32_s = (target->output->type == GGML_TYPE_F32)
+                ? src_s
+                : ggml_cast(sctx.get(), src_s, GGML_TYPE_F32);
+            ggml_tensor * dst_s = ggml_view_2d(sctx.get(), dspark_base_lm, n_embd, nr,
+                    dspark_base_lm->nb[1], (size_t) row0 * dspark_base_lm->nb[1]);
+            ggml_build_forward_expand(sgf, ggml_cpy(sctx.get(), f32_s, dst_s));
+
+            ggml_backend_sched_reset(tmp_sched.get());
+            base_ok = ggml_backend_sched_alloc_graph(tmp_sched.get(), sgf) &&
+                      ggml_backend_sched_graph_compute(tmp_sched.get(), sgf) == GGML_STATUS_SUCCESS;
+            ggml_backend_sched_synchronize(tmp_sched.get());
+        }
+        if (!base_ok) {
+            LLAMA_LOG_WARN("%s: failed to quantize draft-only DSpark base LM head, using target output\n", __func__);
+            dspark_base_lm = nullptr;
+        }
+    }
+
     if (!ok) {
         LLAMA_LOG_WARN("%s: failed to precompute DSpark Markov LM head, using unfactored head\n", __func__);
+        dspark_base_lm     = nullptr;
         dspark_markov_lm   = nullptr;
         dspark_markov_bias = nullptr;
         buf_dspark_lm.reset();
@@ -3211,8 +3255,10 @@ void llama_context::init_dspark_markov_lm() {
         return;
     }
 
-    LLAMA_LOG_INFO("%s: precomputed DSpark rank-%lld Markov LM head (%.2f MiB F16)\n",
-        __func__, (long long) rank, ggml_backend_buffer_get_size(buf_dspark_lm.get()) / 1024.0 / 1024.0);
+    LLAMA_LOG_INFO("%s: precomputed DSpark LM heads (total %.2f MiB: markov=%s, base=%s)\n",
+        __func__, ggml_backend_buffer_get_size(buf_dspark_lm.get()) / 1024.0 / 1024.0,
+        ggml_type_name(dspark_markov_lm->type),
+        dspark_base_lm ? ggml_type_name(dspark_base_lm->type) : ggml_type_name(target->output->type));
 }
 
 llm_graph_params llama_context::graph_params(
@@ -3236,6 +3282,7 @@ llm_graph_params llama_context::graph_params(
         /*.layer_inp_src =*/ supports_embd_row() ? cparams.ctx_other->get_layer_inp_dev() : nullptr,
         /*.h_nextn_dev   =*/ cparams.embeddings_nextn_dev ? h_nextn_dev : nullptr,
         /*.h_nextn_src   =*/ supports_state_row() ? cparams.ctx_state_src->get_h_nextn_dev() : nullptr,
+        /*.dspark_base_lm     =*/ dspark_base_lm,
         /*.dspark_markov_lm   =*/ dspark_markov_lm,
         /*.dspark_markov_bias =*/ dspark_markov_bias,
         /*.samplers    =*/ sampling.samplers,

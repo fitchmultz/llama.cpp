@@ -770,6 +770,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         cb(cur, "ffn_out", il);
 
         cur = ggml_add(ctx0, ffn_inp, cur);
+        ggml_build_forward_expand(gf, cur);
         cb(cur, "l_out", il);
     }
 
@@ -785,8 +786,12 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    // lm_head
-    cur = build_lora_mm(model.output, cur);
+    // lm_head: slice padded vocabulary rows out while keeping 64-row alignment for vectorized MMA/softcap
+    const int64_t n_vocab_slice = GGML_PAD(hparams.n_vocab_unpadded, 64);
+    ggml_tensor * output_w = (loras->empty() && hparams.n_vocab_unpadded > 0 && n_vocab_slice < model.output->ne[1])
+        ? ggml_view_2d(ctx0, model.output, model.output->ne[0], n_vocab_slice, model.output->nb[1], 0)
+        : model.output;
+    cur = build_lora_mm(output_w, cur);
     ggml_prec_set_acc(cur, GGML_PREC_F32);
 
     if (hparams.f_final_logit_softcapping != 0.0f) {
@@ -795,8 +800,10 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         cur = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/cap)), cap);
     }
 
-    // drop the padded vocabulary
-    cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0));
+    // drop the padded vocabulary if full output weight was projected
+    if (cur->ne[0] != hparams.n_vocab_unpadded) {
+        cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0));
+    }
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;

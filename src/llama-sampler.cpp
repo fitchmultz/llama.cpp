@@ -290,6 +290,10 @@ static void llama_sampler_temp_impl(llama_token_data_array * cur_p, float temp) 
         return;
     }
 
+    if (temp == 1.0f) {
+        return;
+    }
+
     for (size_t i = 0; i < cur_p->size; ++i) {
         cur_p->data[i].logit /= temp;
     }
@@ -1216,6 +1220,60 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
         cur_p->data[0].p = 1.0f;
         return;
     }
+
+#if defined(__APPLE__)
+    const size_t n = cur_p->size;
+    if (n >= 1024 && n <= (size_t) INT_MAX) {
+        thread_local std::vector<float> buf;
+        buf.resize(n);
+        float * b = buf.data();
+        llama_token_data * d = cur_p->data;
+        for (size_t i = 0; i < n; ++i) {
+            b[i] = d[i].logit;
+        }
+
+        float max_l = d[0].logit;
+        if (!cur_p->sorted) {
+            vDSP_maxv(b, 1, &max_l, (vDSP_Length) n);
+        }
+
+        if (std::isfinite(max_l)) {
+            const float neg_max = -max_l;
+            vDSP_vsadd(b, 1, &neg_max, b, 1, (vDSP_Length) n);
+
+            int ni = (int) n;
+            vvexpf(b, b, &ni);
+
+            float sum_cum_f = 0.0f;
+            vDSP_sve(b, 1, &sum_cum_f, (vDSP_Length) n);
+
+            if (sum_cum_f > 0.0f && std::isfinite(sum_cum_f)) {
+                const double rnd = dist(ctx->rng);
+                const float inv_sum = 1.0f / sum_cum_f;
+                double sum_run = 0.0;
+                const double sum_tgt = (double) sum_cum_f * rnd;
+
+                bool found = false;
+                for (size_t i = 0; i < n; ++i) {
+                    const float p_raw = b[i];
+                    if (!found) {
+                        sum_run += p_raw;
+                        if (sum_run >= sum_tgt) {
+                            cur_p->selected = (int64_t) i;
+                            found = true;
+                        }
+                    }
+                    d[i].p = p_raw * inv_sum;
+                }
+
+                if (!found) {
+                    cur_p->selected = (int64_t) (n - 1);
+                }
+                return;
+            }
+        }
+    }
+#endif
 
     // max logit for numerical stability
     float max_l = cur_p->data[0].logit;

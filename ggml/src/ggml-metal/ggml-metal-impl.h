@@ -44,8 +44,8 @@
 #define N_R0_Q5_1 4
 #define N_SG_Q5_1 2
 
-#define N_R0_Q8_0 2
-#define N_SG_Q8_0 4
+#define N_R0_Q8_0 4
+#define N_SG_Q8_0 2
 
 #define N_R0_MXFP4 2
 #define N_SG_MXFP4 2
@@ -183,6 +183,7 @@
 #define OP_UNARY_NUM_ROUND       119
 #define OP_UNARY_NUM_TRUNC       120
 #define OP_UNARY_NUM_XIELU       121
+#define OP_UNARY_NUM_SOFTCAP     122
 
 #define OP_SUM_ROWS_NUM_SUM_ROWS 10
 #define OP_SUM_ROWS_NUM_MEAN     11
@@ -1549,6 +1550,7 @@ typedef struct {
     uint64_t nb2;
     float    eps;
     float    scale;
+    float    norm_eps;
 } ggml_metal_kargs_depth_mix;
 
 typedef struct {

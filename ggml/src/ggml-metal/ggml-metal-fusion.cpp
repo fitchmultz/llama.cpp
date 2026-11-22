@@ -496,7 +496,7 @@ static bool ggml_metal_fusion_check_mul_sigmoid(
     return true;
 }
 
-// DEPTH_MIX: RMS_NORM + CONCAT + TRANSPOSE + CONT + [REPEAT] + MUL_MAT + SOFT_MAX + MUL_MAT [+ PERMUTE + CONT]
+// DEPTH_MIX: RMS_NORM + CONCAT + TRANSPOSE + CONT + [REPEAT] + MUL_MAT + SOFT_MAX + MUL_MAT [+ PERMUTE + CONT | + RESHAPE + RMS_NORM + MUL]
 static bool ggml_metal_fusion_check_depth_mix(
         const ggml_metal_fusion       * fusion,
         const ggml_tensor * const     * nodes,
@@ -505,8 +505,9 @@ static bool ggml_metal_fusion_check_depth_mix(
               int                       idx,
               ggml_metal_fusion_mode    mode) {
     const int n_ops      = (int) fusion->ops.size();
-    const bool has_tr    = (n_ops == 8);
-    const bool has_rep   = (n_ops >= 7);
+    const bool has_norm  = (nodes[n_ops - 1]->op == GGML_OP_MUL);
+    const bool has_tr    = (nodes[n_ops - 1]->op == GGML_OP_CONT);
+    const bool has_rep   = (fusion->ops[3] == GGML_OP_REPEAT);
     const int raw_start  = node_idxs[idx];
     const int raw_end    = node_idxs[idx + n_ops - 1];
     const int raw_count  = raw_end - raw_start + 1;
@@ -514,7 +515,7 @@ static bool ggml_metal_fusion_check_depth_mix(
         return false;
     }
 
-    int raw_idxs[10];
+    int raw_idxs[12];
     for (int i = 0; i < raw_count; ++i) {
         raw_idxs[i] = raw_start + i;
         if (gf->nodes[raw_start + i]->op != fusion->ops_all[i]) {
@@ -530,7 +531,7 @@ static bool ggml_metal_fusion_check_depth_mix(
     const ggml_tensor * mm0 = nodes[has_rep ? 4 : 3];
     const ggml_tensor * sm  = nodes[has_rep ? 5 : 4];
     const ggml_tensor * mm1 = nodes[has_rep ? 6 : 5];
-    const ggml_tensor * dst = has_tr ? nodes[7] : mm1;
+    const ggml_tensor * dst = nodes[n_ops - 1];
 
     const ggml_tensor * cur    = rms->src[0];
     const ggml_tensor * blocks = cat->src[0];
@@ -564,6 +565,7 @@ static bool ggml_metal_fusion_check_depth_mix(
         mm1->ne[0] != D || mm1->ne[1] != n_q || mm1->ne[2] != T || mm1->ne[3] != 1) {
         return false;
     }
+    const ggml_tensor * norm_w = nullptr;
     if (has_tr) {
         const ggml_tensor * perm = gf->nodes[raw_start + 8];
         if (perm->op != GGML_OP_PERMUTE || perm->src[0] != mm1 || dst->op != GGML_OP_CONT || dst->src[0] != perm) {
@@ -572,6 +574,31 @@ static bool ggml_metal_fusion_check_depth_mix(
         if (perm->ne[0] != D || perm->ne[1] != T || perm->ne[2] != n_q || perm->ne[3] != 1 ||
             perm->nb[0] != mm1->nb[0] || perm->nb[1] != mm1->nb[2] || perm->nb[2] != mm1->nb[1] || perm->nb[3] != mm1->nb[3] ||
             dst->ne[0] != D || dst->ne[1] != T || dst->ne[2] != n_q || dst->ne[3] != 1) {
+            return false;
+        }
+    } else if (has_norm) {
+        if (n_q != 1 || D > 4096) {
+            return false;
+        }
+        const ggml_tensor * rsh     = gf->nodes[raw_end - 2];
+        const ggml_tensor * out_rms = nodes[n_ops - 2];
+        const ggml_tensor * out_mul = nodes[n_ops - 1];
+        if (rsh->op != GGML_OP_RESHAPE || rsh->src[0] != mm1 ||
+            rsh->ne[0] != D || rsh->ne[1] != T || rsh->ne[2] != 1 || rsh->ne[3] != 1) {
+            return false;
+        }
+        if (out_rms->op != GGML_OP_RMS_NORM || out_rms->src[0] != rsh || out_rms->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (out_mul->op != GGML_OP_MUL || (out_mul->src[0] != out_rms && out_mul->src[1] != out_rms)) {
+            return false;
+        }
+        norm_w = (out_mul->src[0] == out_rms) ? out_mul->src[1] : out_mul->src[0];
+        if (!norm_w || norm_w->type != GGML_TYPE_F32 || !ggml_is_contiguous(norm_w) ||
+            norm_w->ne[0] != D || norm_w->ne[1] != 1 || norm_w->ne[2] != 1 || norm_w->ne[3] != 1) {
+            return false;
+        }
+        if (dst->ne[0] != D || dst->ne[1] != T || dst->ne[2] != 1 || dst->ne[3] != 1) {
             return false;
         }
     }
@@ -591,6 +618,9 @@ static bool ggml_metal_fusion_check_depth_mix(
         if (!dst->data || !blocks->data || !cur->data || !query->data ||
             ggml_metal_fusion_overlap(dst, blocks) || ggml_metal_fusion_overlap(dst, cur) ||
             ggml_metal_fusion_overlap(dst, query)) {
+            return false;
+        }
+        if (has_norm && (!norm_w->data || ggml_metal_fusion_overlap(dst, norm_w))) {
             return false;
         }
     }
@@ -794,7 +824,7 @@ static bool ggml_metal_fusion_check_loop_control_mm(
     return ggml_can_fuse_subgraph_ext(gf, raw_idxs, 8, fusion->ops_all.data(), outputs, 1);
 }
 
-// CONCAT(past, tr(cur)) + CPY/SET_ROWS(state) + SSM_CONV + RESHAPE [+ dynamic 4-tap lags] + ADD(cur) + SCALE
+// CONCAT(past, tr(cur)) + CPY/SET_ROWS(state) + SSM_CONV + RESHAPE [+ dynamic 4-tap lags] + ADD(cur) + SCALE [+ ADD(residual)]
 static bool ggml_metal_fusion_check_ssm_conv_full(
         const ggml_metal_fusion       * fusion,
         const ggml_tensor * const     * nodes,
@@ -804,12 +834,14 @@ static bool ggml_metal_fusion_check_ssm_conv_full(
               ggml_metal_fusion_mode    mode) {
     const int  n_ops   = (int) fusion->ops.size();
     const bool has_dyn = (n_ops == 16);
+    const bool has_add = (n_ops == 6);
 
     const ggml_tensor * cat   = nodes[0];
     const ggml_tensor * store = nodes[1];
     const ggml_tensor * conv  = nodes[2];
     const ggml_tensor * add   = nodes[has_dyn ? 14 : 3];
     const ggml_tensor * sc    = nodes[has_dyn ? 15 : 4];
+    const ggml_tensor * out   = has_add ? nodes[5] : sc;
 
     if (cat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cat, 0) != 0) {
         return false;
@@ -827,6 +859,19 @@ static bool ggml_metal_fusion_check_ssm_conv_full(
     }
     if (sc->op != GGML_OP_SCALE || sc->src[0] != add || ggml_get_op_params_f32(sc, 1) != 0.0f) {
         return false;
+    }
+
+    const ggml_tensor * res_in = nullptr;
+    if (has_add) {
+        if (out->op != GGML_OP_ADD || (out->src[0] != sc && out->src[1] != sc)) {
+            return false;
+        }
+        res_in = (out->src[0] == sc) ? out->src[1] : out->src[0];
+        if (!res_in || res_in->type != GGML_TYPE_F32 || !ggml_is_contiguous(res_in) ||
+            !ggml_are_same_shape(res_in, sc) || out->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(out) || !ggml_are_same_shape(out, sc)) {
+            return false;
+        }
     }
 
     const ggml_tensor * past = cat->src[0];
@@ -975,17 +1020,23 @@ static bool ggml_metal_fusion_check_ssm_conv_full(
     }
 
     if (mode == GGML_METAL_FUSION_FULL) {
-        if (!past->data || !cur->data || !conv->src[1]->data || !store->data || !sc->data) {
+        if (!past->data || !cur->data || !conv->src[1]->data || !store->data || !out->data) {
             return false;
         }
         if (has_dyn && !dynamic->data) {
             return false;
         }
+        if (has_add && !res_in->data) {
+            return false;
+        }
         if (is_set && !store->src[1]->data) {
             return false;
         }
-        // for T > 4, multiple token tiles run concurrently so state_dst cannot alias past
-        if (n_seq_tokens > 4 && ggml_metal_fusion_overlap(store, past)) {
+        if (ggml_metal_fusion_overlap(out, cur) || ggml_metal_fusion_overlap(out, past)) {
+            return false;
+        }
+        // for T > 16, multiple token tiles run concurrently so state_dst cannot alias past
+        if (n_seq_tokens > 16 && ggml_metal_fusion_overlap(store, past)) {
             return false;
         }
     }
@@ -1679,8 +1730,14 @@ static const std::vector<ggml_op> ops_ssm_conv_res  = { GGML_OP_SSM_CONV, GGML_O
 static const std::vector<ggml_op> ops_ssm_conv_full_cpy = {
     GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE
 };
+static const std::vector<ggml_op> ops_ssm_conv_full_cpy_add = {
+    GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE, GGML_OP_ADD
+};
 static const std::vector<ggml_op> ops_ssm_conv_full_set = {
     GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_SET_ROWS, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE
+};
+static const std::vector<ggml_op> ops_ssm_conv_full_set_add = {
+    GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_SET_ROWS, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE, GGML_OP_ADD
 };
 static const std::vector<ggml_op> ops_ssm_conv_full_dyn_cpy = {
     GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY,
@@ -1728,9 +1785,17 @@ static const std::vector<ggml_op> ops_depth_mix_1 = {
     GGML_OP_RMS_NORM, GGML_OP_CONCAT, GGML_OP_TRANSPOSE, GGML_OP_CONT,
     GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT
 };
+static const std::vector<ggml_op> ops_depth_mix_1_norm = {
+    GGML_OP_RMS_NORM, GGML_OP_CONCAT, GGML_OP_TRANSPOSE, GGML_OP_CONT,
+    GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_RMS_NORM, GGML_OP_MUL
+};
 static const std::vector<ggml_op> ops_depth_mix_n = {
     GGML_OP_RMS_NORM, GGML_OP_CONCAT, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_REPEAT,
     GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT
+};
+static const std::vector<ggml_op> ops_depth_mix_n_norm = {
+    GGML_OP_RMS_NORM, GGML_OP_CONCAT, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_REPEAT,
+    GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_RMS_NORM, GGML_OP_MUL
 };
 static const std::vector<ggml_op> ops_depth_mix_n_tr = {
     GGML_OP_RMS_NORM, GGML_OP_CONCAT, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_REPEAT,
@@ -1777,8 +1842,208 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
     GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
 };
 
+static const std::vector<ggml_op> ops_moe_reduce_8_conv_cpy_add = {
+    GGML_OP_MUL,
+    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
+    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD,
+    GGML_OP_VIEW, GGML_OP_RESHAPE, GGML_OP_TRANSPOSE,
+    GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE, GGML_OP_ADD
+};
+
+static const std::vector<ggml_op> ops_moe_reduce_8_conv_set_add = {
+    GGML_OP_MUL,
+    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
+    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD,
+    GGML_OP_VIEW, GGML_OP_RESHAPE, GGML_OP_TRANSPOSE,
+    GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_SET_ROWS, GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE, GGML_OP_ADD
+};
+
+// MOE_REDUCE(8) + SSM_CONV_FULL(non-dyn) + ADD(residual)
+static bool ggml_metal_fusion_check_moe_reduce_conv_add(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const int n_ops     = (int) fusion->ops.size();
+    const int raw_start = node_idxs[idx];
+    const int raw_end   = node_idxs[idx + n_ops - 1];
+    const int raw_count = raw_end - raw_start + 1;
+    if (n_ops != 14 || raw_count != (int) fusion->ops_all.size() || raw_count > GGML_METAL_FUSION_MAX) {
+        return false;
+    }
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < raw_count; ++i) {
+        raw_idxs[i] = raw_start + i;
+        if (gf->nodes[raw_start + i]->op != fusion->ops_all[i]) {
+            return false;
+        }
+    }
+
+    ggml_metal_moe_reduce_match mr;
+    if (!ggml_metal_fusion_match_moe_reduce(gf, raw_start, ops_moe_reduce_8, &mr)) {
+        return false;
+    }
+
+    const ggml_tensor * past    = gf->nodes[raw_start + 16];
+    const ggml_tensor * cur_rsh = gf->nodes[raw_start + 17];
+    const ggml_tensor * tr      = gf->nodes[raw_start + 18];
+    const ggml_tensor * cat     = nodes[8];
+    const ggml_tensor * store   = nodes[9];
+    const ggml_tensor * conv    = nodes[10];
+    const ggml_tensor * c_add   = nodes[11];
+    const ggml_tensor * sc      = nodes[12];
+    const ggml_tensor * out     = nodes[13];
+
+    if (cat != gf->nodes[raw_start + 19] || cat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cat, 0) != 0) {
+        return false;
+    }
+    if (cat->src[0] != past || cat->src[1] != tr || tr->src[0] != cur_rsh || cur_rsh->src[0] != mr.dst) {
+        return false;
+    }
+
+    const bool is_set = (store->op == GGML_OP_SET_ROWS);
+    const bool is_cpy = (store->op == GGML_OP_CPY);
+    if (!is_set && !is_cpy) {
+        return false;
+    }
+    if (conv->op != GGML_OP_SSM_CONV || conv->src[0] != cat || !conv->src[1] ||
+        conv->src[1]->ne[0] != 4 || conv->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous_rows(conv->src[1])) {
+        return false;
+    }
+    if (sc->op != GGML_OP_SCALE || sc->src[0] != c_add || ggml_get_op_params_f32(sc, 1) != 0.0f) {
+        return false;
+    }
+    if (!((c_add->src[0] == mr.dst && c_add->src[1] && c_add->src[1]->op == GGML_OP_RESHAPE && c_add->src[1]->src[0] == conv) ||
+          (c_add->src[1] == mr.dst && c_add->src[0] && c_add->src[0]->op == GGML_OP_RESHAPE && c_add->src[0]->src[0] == conv))) {
+        return false;
+    }
+    if (out->op != GGML_OP_ADD || (out->src[0] != sc && out->src[1] != sc)) {
+        return false;
+    }
+    const ggml_tensor * res_in = (out->src[0] == sc) ? out->src[1] : out->src[0];
+    if (!res_in || res_in->type != GGML_TYPE_F32 || !ggml_is_contiguous(res_in) ||
+        !ggml_are_same_shape(res_in, sc) || out->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(out) || !ggml_are_same_shape(out, sc) || store->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const int64_t n_channels   = mr.dst->ne[0];
+    const int64_t n_seqs       = past->ne[2];
+    const int64_t n_seq_tokens = cat->ne[0] - 3;
+    const int64_t n_tokens     = n_seq_tokens * n_seqs;
+    if (past->ne[0] != 3 || past->type != GGML_TYPE_F32 || !ggml_is_contiguous_rows(past) ||
+        n_channels <= 0 || n_seqs <= 0 || n_seq_tokens <= 0 ||
+        past->ne[1] != n_channels || mr.dst->ne[1] != n_tokens ||
+        mr.dst->ne[2] != 1 || mr.dst->ne[3] != 1 || past->ne[3] != 1 ||
+        sc->type != GGML_TYPE_F32 || !ggml_is_contiguous(sc) || !ggml_are_same_shape(mr.dst, sc)) {
+        return false;
+    }
+
+    if (is_cpy) {
+        const ggml_tensor * last = store->src[0];
+        if (!last || last->op != GGML_OP_VIEW || last->view_src != cat ||
+            last->ne[0] != 3 || last->ne[1] != n_channels || last->ne[2] != n_seqs ||
+            last->view_offs != (size_t) n_seq_tokens * sizeof(float) ||
+            store->ne[0] != 3 * n_channels || store->ne[1] != n_seqs || store->ne[2] != 1 || store->ne[3] != 1 ||
+            store->nb[0] != sizeof(float)) {
+            return false;
+        }
+    } else {
+        const ggml_tensor * windows    = store->src[0];
+        const ggml_tensor * slot_order = store->src[1];
+        if (!windows || !slot_order || windows->op != GGML_OP_VIEW || windows->view_src != cat ||
+            slot_order->type != GGML_TYPE_I32 || !ggml_is_contiguous(slot_order)) {
+            return false;
+        }
+        const int64_t kw = windows->ne[1];
+        if (kw <= 0 || kw > n_seq_tokens || slot_order->ne[0] != kw ||
+            windows->ne[0] != 3 || windows->ne[2] != n_channels || windows->ne[3] != n_seqs ||
+            windows->view_offs != (size_t) (n_seq_tokens - (kw - 1)) * sizeof(float) ||
+            store->ne[0] != 3 || store->ne[2] != n_channels || store->ne[3] != n_seqs ||
+            store->nb[0] != sizeof(float)) {
+            return false;
+        }
+    }
+
+    const ggml_tensor * conv_rsh = (c_add->src[0] == mr.dst) ? c_add->src[1] : c_add->src[0];
+    if ((mr.dst->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(gf, raw_start + 15) != 2) {
+        return false;
+    }
+    if ((cat->flags & GGML_TENSOR_FLAG_OUTPUT) || (conv_rsh->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    if (ggml_node_get_use_count(gf, node_idxs[idx + 8]) != 2) {
+        return false;
+    }
+    for (int j = 10; j < n_ops - 1; ++j) {
+        if ((nodes[j]->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(gf, node_idxs[idx + j]) != 1) {
+            return false;
+        }
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        if (!mr.experts->data || !mr.weights->data || !past->data || !conv->src[1]->data ||
+            !store->data || !res_in->data || !out->data) {
+            return false;
+        }
+        if (is_set && !store->src[1]->data) {
+            return false;
+        }
+        if (ggml_metal_fusion_overlap(out, mr.experts) || ggml_metal_fusion_overlap(out, mr.weights) ||
+            ggml_metal_fusion_overlap(out, past)) {
+            return false;
+        }
+        if (n_seq_tokens > 16 && ggml_metal_fusion_overlap(store, past)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static const std::vector<ggml_op> ops_mul_mat_add  = { GGML_OP_MUL_MAT, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_mul_soft_max = { GGML_OP_MUL, GGML_OP_SOFT_MAX };
+static const std::vector<ggml_op> ops_softcap      = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE };
+
+static bool ggml_metal_fusion_check_softcap(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * sc0 = nodes[0];
+    const ggml_tensor * th  = nodes[1];
+    const ggml_tensor * sc1 = nodes[2];
+
+    if (!sc0->src[0] || th->src[0] != sc0 || sc1->src[0] != th) {
+        return false;
+    }
+    if (ggml_get_unary_op(th) != GGML_UNARY_OP_TANH) {
+        return false;
+    }
+    if (ggml_get_op_params_f32(sc0, 1) != 0.0f || ggml_get_op_params_f32(sc1, 1) != 0.0f) {
+        return false;
+    }
+    if (sc0->src[0]->type != GGML_TYPE_F32 || sc0->type != GGML_TYPE_F32 ||
+        th->type != GGML_TYPE_F32 || sc1->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous_rows(sc0->src[0]) || !ggml_is_contiguous_rows(sc1)) {
+        return false;
+    }
+
+    return true;
+}
 
 static bool ggml_metal_fusion_check_mul_soft_max(
         const ggml_metal_fusion       * fusion,
@@ -1876,6 +2141,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_TOPK_MOE, ops_topk_moe_sig_norm_bias,       {2}, true, ggml_metal_fusion_check_topk_moe },
     { GGML_METAL_FUSION_TOPK_MOE, ops_topk_moe_sig_norm_scale_bias, {2}, true, ggml_metal_fusion_check_topk_moe },
 
+    { GGML_METAL_FUSION_MOE_REDUCE_CONV_ADD, ops_moe_reduce_8_conv_cpy_add, {9}, true, ggml_metal_fusion_check_moe_reduce_conv_add },
+    { GGML_METAL_FUSION_MOE_REDUCE_CONV_ADD, ops_moe_reduce_8_conv_set_add, {9}, true, ggml_metal_fusion_check_moe_reduce_conv_add },
     { GGML_METAL_FUSION_MOE_REDUCE, ops_moe_reduce_2, {}, true, ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_MOE_REDUCE, ops_moe_reduce_3, {}, true, ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_MOE_REDUCE, ops_moe_reduce_4, {}, true, ggml_metal_fusion_check_moe_reduce },
@@ -1888,6 +2155,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_SSM_CONV_RES,    ops_ssm_conv_res,          {},  true,  ggml_metal_fusion_check_ssm_conv_res },
     { GGML_METAL_FUSION_SSM_CONV_FULL,   ops_ssm_conv_full_dyn_cpy, {1}, true,  ggml_metal_fusion_check_ssm_conv_full },
     { GGML_METAL_FUSION_SSM_CONV_FULL,   ops_ssm_conv_full_dyn_set, {1}, true,  ggml_metal_fusion_check_ssm_conv_full },
+    { GGML_METAL_FUSION_SSM_CONV_FULL,   ops_ssm_conv_full_cpy_add, {1}, true,  ggml_metal_fusion_check_ssm_conv_full },
+    { GGML_METAL_FUSION_SSM_CONV_FULL,   ops_ssm_conv_full_set_add, {1}, true,  ggml_metal_fusion_check_ssm_conv_full },
     { GGML_METAL_FUSION_SSM_CONV_FULL,   ops_ssm_conv_full_cpy,     {1}, true,  ggml_metal_fusion_check_ssm_conv_full },
     { GGML_METAL_FUSION_SSM_CONV_FULL,   ops_ssm_conv_full_set,     {1}, true,  ggml_metal_fusion_check_ssm_conv_full },
     { GGML_METAL_FUSION_L2_CLIP,         ops_l2_clip_scale,         {},  true,  ggml_metal_fusion_check_l2_clip },
@@ -1897,9 +2166,11 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_SITU,          ops_situ_view,     {}, true,  ggml_metal_fusion_check_situ },
     { GGML_METAL_FUSION_SITU,          ops_situ,          {}, true,  ggml_metal_fusion_check_situ },
     { GGML_METAL_FUSION_MUL_SIGMOID,   ops_mul_sigmoid,   {}, false, ggml_metal_fusion_check_mul_sigmoid },
-    { GGML_METAL_FUSION_DEPTH_MIX,       ops_depth_mix_n_tr, {}, true,  ggml_metal_fusion_check_depth_mix },
-    { GGML_METAL_FUSION_DEPTH_MIX,       ops_depth_mix_n,    {}, true,  ggml_metal_fusion_check_depth_mix },
-    { GGML_METAL_FUSION_DEPTH_MIX,       ops_depth_mix_1,    {}, true,  ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX,       ops_depth_mix_n_norm, {}, true,  ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX,       ops_depth_mix_1_norm, {}, true,  ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX,       ops_depth_mix_n_tr,   {}, true,  ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX,       ops_depth_mix_n,      {}, true,  ggml_metal_fusion_check_depth_mix },
+    { GGML_METAL_FUSION_DEPTH_MIX,       ops_depth_mix_1,      {}, true,  ggml_metal_fusion_check_depth_mix },
     { GGML_METAL_FUSION_LOOP_DOWN_NORM,   ops_loop_down_norm,   {}, true,  ggml_metal_fusion_check_loop_down_norm },
     { GGML_METAL_FUSION_CONCAT_RMS_NORM,  ops_concat_rms_norm,  {}, false, ggml_metal_fusion_check_concat_rms_norm },
     { GGML_METAL_FUSION_MUL_MAT_ID_SCALE, ops_mul_mat_id_scale_rsh, {}, true,  ggml_metal_fusion_check_mul_mat_id_scale },
@@ -1907,6 +2178,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
 
     { GGML_METAL_FUSION_MUL_MAT_ADD,  ops_mul_mat_add,  {}, false, ggml_metal_fusion_check_mul_mat_add },
     { GGML_METAL_FUSION_MUL_SOFT_MAX, ops_mul_soft_max, {}, false, ggml_metal_fusion_check_mul_soft_max },
+    { GGML_METAL_FUSION_SOFTCAP,      ops_softcap,      {}, false, ggml_metal_fusion_check_softcap },
 };
 
 // ---- alloc deps -----------------------------------------------------------

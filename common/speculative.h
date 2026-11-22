@@ -79,6 +79,12 @@ struct common_speculative_draft_params {
     // optional reusable backing pool for result_q buffers to avoid per-step 2+ MB allocations
     std::vector<std::vector<llama_token_data>> * result_q_pool = nullptr;
 
+    // optional contiguous probability vectors indexed by token id (preferred by Inkling2 draft-dspark)
+    std::vector<std::vector<float>> * result_q_f32 = nullptr;
+
+    // optional reusable backing pool for result_q_f32 buffers
+    std::vector<std::vector<float>> * result_q_f32_pool = nullptr;
+
     // the target's temp and seed, read only when the drafter samples probabilistically
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;

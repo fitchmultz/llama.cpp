@@ -249,6 +249,14 @@ kernel void kernel_soft_max_large_part(
         ? *(device const float *)(scale_buf + (uint64_t) row * args.nb_sc1)
         : args.scale;
 
+    if (args.has_row_scale && row_scale == 0.0f) {
+        if (tpitg.x == 0) {
+            tmp[(row * npart + part) * 2 + 0] = 0.0f;
+            tmp[(row * npart + part) * 2 + 1] = float(max(0, end - start));
+        }
+        return;
+    }
+
     float lmax = -INFINITY;
     for (int i = start + (int) tpitg.x; i < end; i += (int) tptg.x) {
         lmax = MAX(lmax, psrc[i] * row_scale);
@@ -312,6 +320,20 @@ kernel void kernel_soft_max_large_norm(
     const int start = part * chunk;
     const int end   = min(start + chunk, ne00);
 
+    const float row_scale = args.has_row_scale
+        ? *(device const float *)(scale_buf + (uint64_t) row * args.nb_sc1)
+        : args.scale;
+
+    device float * pdst = (device float *)(dst + (uint64_t) row * args.nb1);
+
+    if (args.has_row_scale && row_scale == 0.0f) {
+        const float inv_n = 1.0f / float(ne00);
+        for (int i = start + (int) tpitg.x; i < end; i += (int) tptg.x) {
+            pdst[i] = inv_n;
+        }
+        return;
+    }
+
     const float pm = ((int) tpitg.x < npart) ? tmp[(row * npart + (int) tpitg.x) * 2 + 0] : -INFINITY;
     const float ps = ((int) tpitg.x < npart) ? tmp[(row * npart + (int) tpitg.x) * 2 + 1] : 0.0f;
 
@@ -340,10 +362,6 @@ kernel void kernel_soft_max_large_norm(
 
     const float inv_sum = 1.0f / gsum;
     device const float * psrc = (device const float *)(src0 + (uint64_t) row * args.nb01);
-    device       float * pdst = (device       float *)(dst  + (uint64_t) row * args.nb1);
-    const float row_scale = args.has_row_scale
-        ? *(device const float *)(scale_buf + (uint64_t) row * args.nb_sc1)
-        : args.scale;
 
     for (int i = start + (int) tpitg.x; i < end; i += (int) tptg.x) {
         pdst[i] = exp(psrc[i] * row_scale - gmax) * inv_sum;

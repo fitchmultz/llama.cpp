@@ -880,7 +880,8 @@ struct llm_graph_params {
     ggml_tensor * layer_inp_src = nullptr; // ctx_other's layer input device buffer (read)
     ggml_tensor * h_nextn_dev   = nullptr; // own h_nextn device buffer (write)
     ggml_tensor * h_nextn_src   = nullptr; // ctx_state_src's h_nextn device buffer (read)
-    ggml_tensor * dspark_markov_lm   = nullptr; // precomputed F16 [rank, n_vocab_unpadded]
+    ggml_tensor * dspark_base_lm     = nullptr; // precomputed draft-only quantized [n_embd, n_vocab_unpadded]
+    ggml_tensor * dspark_markov_lm   = nullptr; // precomputed [rank, n_vocab_unpadded]
     ggml_tensor * dspark_markov_bias = nullptr; // precomputed F32 [n_vocab_unpadded]
 
     std::map<llama_seq_id, llama_sampler *> samplers;
@@ -979,6 +980,7 @@ struct llm_graph_params {
             layer_inp_src == other.layer_inp_src &&
             h_nextn_dev   == other.h_nextn_dev   &&
             h_nextn_src   == other.h_nextn_src   &&
+            dspark_base_lm     == other.dspark_base_lm     &&
             dspark_markov_lm   == other.dspark_markov_lm   &&
             dspark_markov_bias == other.dspark_markov_bias &&
             model == other.model &&
@@ -1160,6 +1162,7 @@ struct llm_graph_context {
     ggml_tensor * layer_inp_src;
     ggml_tensor * h_nextn_dev;
     ggml_tensor * h_nextn_src;
+    ggml_tensor * dspark_base_lm;
     ggml_tensor * dspark_markov_lm;
     ggml_tensor * dspark_markov_bias;
 

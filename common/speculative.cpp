@@ -1248,6 +1248,7 @@ public:
                                 __func__, rc, (int) n_chunk, (int) offset);
                         return false;
                     }
+                    store_context_features(seq_id, n_chunk);
                     continue;
                 }
 
@@ -1390,6 +1391,11 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
     std::vector<std::mt19937> rnn_rng;
     std::vector<int64_t>      rnn_seed;
 
+    // per-sequence adaptive draft length hysteresis ({adapt_min, n_max}) driven strictly by past committed steps
+    static constexpr int32_t adapt_min = 3;
+    std::vector<int32_t> adapt_n;
+    std::vector<int32_t> adapt_streak;
+
     common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl_draft_dflash(params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
     {
@@ -1433,15 +1439,17 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             rnn_rng.resize(n_seq);
             rnn_seed.assign(n_seq, -1);
         }
+        adapt_n.assign(n_seq, adapt_min);
+        adapt_streak.assign(n_seq, 0);
 
         LOG_INF("%s: - sample_from_anchor=%s, markov_rank=%d\n", __func__, sample_from_anchor ? "true" : "false", markov_rank);
 
         // anchor-first DSpark yields a full block_size draft tokens
-        // the recurrent head reads the context features back from h_nextn after a host copy injection
+        // the recurrent head reads target features via device buffer and keeps anchor context features from h_nextn
         init({
             /* .n_draft_max      = */ sample_from_anchor ? block_size : block_size - 1,
             /* .backend_sampling = */ !has_rnn_context,
-            /* .dev_features     = */ !has_rnn_context,
+            /* .dev_features     = */ true,
             /* .nextn_masked     = */ !has_rnn_context,
         });
 
@@ -1481,6 +1489,42 @@ protected:
     }
 
 public:
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            adapt_n[seq_id]      = adapt_min;
+            adapt_streak[seq_id] = 0;
+        }
+        common_speculative_impl_draft_dflash::begin(seq_id, prompt);
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        if (is_other || !params.adaptive || seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        const int32_t n_hi = std::min<int32_t>(params.n_max, n_max);
+        if (n_hi <= adapt_min) {
+            return;
+        }
+        if (adapt_n[seq_id] <= adapt_min) {
+            if (n_accepted >= adapt_min) {
+                if (++adapt_streak[seq_id] >= 2) {
+                    adapt_n[seq_id]      = n_hi;
+                    adapt_streak[seq_id] = 0;
+                }
+            } else {
+                adapt_streak[seq_id] = 0;
+            }
+        } else {
+            if (n_accepted <= 2) {
+                if (++adapt_streak[seq_id] >= 2) {
+                    adapt_n[seq_id]      = adapt_min;
+                    adapt_streak[seq_id] = 0;
+                }
+            } else {
+                adapt_streak[seq_id] = 0;
+            }
+        }
+    }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
@@ -1502,6 +1546,9 @@ public:
             int32_t nd = params.n_max;
             if (dp.n_max > 0) {
                 nd = std::min(nd, dp.n_max);
+            }
+            if (params.adaptive && dp.temp > 0.0f && nd > adapt_min) {
+                nd = std::min(nd, adapt_n[seq_id]);
             }
             nd = std::max<int32_t>(1, std::min<int32_t>(nd, n_max));
             n_draft_seq[seq_id] = nd;
@@ -1534,7 +1581,8 @@ public:
                 }
                 auto & cfg = sample_cfgs[seq_id];
                 cfg.assign((size_t) n_embd_dec, 0.0f);
-                const float inv_t = (dp.result_q && dp.temp > 0.0f) ? (1.0f / dp.temp) : 0.0f;
+                const bool want_q = dp.result_q || dp.result_q_f32;
+                const float inv_t = (want_q && dp.temp > 0.0f) ? (1.0f / dp.temp) : 0.0f;
                 for (int32_t s = 0; s < block_size - 1 && 2*s + 1 < n_embd_dec; ++s) {
                     cfg[2*s + 0] = inv_t;
                     const uint32_t seed_s = (inv_t > 0.0f) ? rnn_rng[seq_id]() : 0u;
@@ -1596,12 +1644,24 @@ public:
                     LOG_ERR("%s: DSpark chained probabilistic sampling missing h_nextn\n", __func__);
                     continue;
                 }
-                for (int32_t i = 1; i < std::min(n_block_tokens, n_draft + 1); ++i) {
+                const bool want_q = dp.result_q || dp.result_q_f32;
+                const int32_t n_keep = std::min(n_block_tokens - 1, n_draft);
+
+                for (int32_t i = 1; i <= n_keep; ++i) {
                     const int32_t row = beg + i;
+                    const float * probs = want_q ? llama_get_logits_ith(ctx_dft, row) : nullptr;
                     const llama_token tok = (llama_token) std::lround(h_nextn_rows[(size_t) row * n_embd_dec + markov_rank]);
                     result.push_back(tok);
-                    if (dp.result_q) {
-                        const float * probs = llama_get_logits_ith(ctx_dft, row);
+                    if (dp.result_q_f32) {
+                        std::vector<float> q;
+                        if (dp.result_q_f32_pool && !dp.result_q_f32_pool->empty()) {
+                            q = std::move(dp.result_q_f32_pool->back());
+                            dp.result_q_f32_pool->pop_back();
+                        }
+                        q.resize(n_vocab);
+                        std::memcpy(q.data(), probs, (size_t) n_vocab * sizeof(float));
+                        dp.result_q_f32->push_back(std::move(q));
+                    } else if (dp.result_q) {
                         std::vector<llama_token_data> q;
                         if (dp.result_q_pool && !dp.result_q_pool->empty()) {
                             q = std::move(dp.result_q_pool->back());
@@ -3736,6 +3796,9 @@ void common_speculative_draft(common_speculative * spec) {
                         // trim the candidates only if the drafter produced them (n-gram drafters do not)
                         if (dp.result_q && !dp.result_q->empty()) {
                             dp.result_q->resize(dp.n_max);
+                        }
+                        if (dp.result_q_f32 && !dp.result_q_f32->empty()) {
+                            dp.result_q_f32->resize(dp.n_max);
                         }
                     }
                 }

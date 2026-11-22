@@ -20,6 +20,7 @@ static int check_rejection_distribution(
         common_params_sampling sampling,
         bool                grammar_first_ref,
         bool                grammar_first_test,
+        bool                use_contig_f32,
         int                 n_trials,
         const char        * label) {
     // Reference sampler computes the exact target distribution.
@@ -105,11 +106,20 @@ static int check_rejection_distribution(
         // Both indices reuse the prompt's last output logits. The second entry
         // is the bonus draw slot; it is always stale and its result is ignored.
         const llama_tokens draft = { draft_tok };
-        const std::vector<std::vector<llama_token_data>> draft_q = { q };
         const std::vector<int> idxs = { -1, -1 };
 
-        const std::vector<llama_token> result =
-            common_sampler_sample_and_accept_n_rejection(smpl_verify.get(), ctx_tgt, idxs, draft, draft_q, grammar_first_test);
+        std::vector<llama_token> result;
+        if (use_contig_f32) {
+            std::vector<float> q_f32(n_vocab);
+            for (int k = 0; k < n_vocab; ++k) {
+                q_f32[k] = q[k].p;
+            }
+            const std::vector<std::vector<float>> draft_q_f32 = { std::move(q_f32) };
+            result = common_sampler_sample_and_accept_n_rejection(smpl_verify.get(), ctx_tgt, idxs, draft, draft_q_f32, grammar_first_test);
+        } else {
+            const std::vector<std::vector<llama_token_data>> draft_q = { q };
+            result = common_sampler_sample_and_accept_n_rejection(smpl_verify.get(), ctx_tgt, idxs, draft, draft_q, grammar_first_test);
+        }
 
         token_counts[result[0]]++;
     }
@@ -212,7 +222,11 @@ static int test_speculative_rejection_sampling(common_params & params, int n_tri
     sampling.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
     sampling.temp     = 1.0f;
 
-    if (check_rejection_distribution(model_tgt, ctx_tgt, sampling, false, false, n_trials, "unconstrained") != 0) {
+    if (check_rejection_distribution(model_tgt, ctx_tgt, sampling, false, false, false, n_trials, "unconstrained") != 0) {
+        return 1;
+    }
+
+    if (check_rejection_distribution(model_tgt, ctx_tgt, sampling, false, false, true, n_trials, "unconstrained-f32") != 0) {
         return 1;
     }
 
@@ -221,7 +235,11 @@ static int test_speculative_rejection_sampling(common_params & params, int n_tri
     // never emits grammar-rejected tokens.
     common_params_sampling sampling_grmr = sampling;
     sampling_grmr.grammar = common_grammar(COMMON_GRAMMAR_TYPE_USER, "root ::= [a-zA-Z0-9 ]*");
-    if (check_rejection_distribution(model_tgt, ctx_tgt, sampling_grmr, true, false, n_trials, "grammar-masked") != 0) {
+    if (check_rejection_distribution(model_tgt, ctx_tgt, sampling_grmr, true, false, false, n_trials, "grammar-masked") != 0) {
+        return 1;
+    }
+
+    if (check_rejection_distribution(model_tgt, ctx_tgt, sampling_grmr, true, false, true, n_trials, "grammar-masked-f32") != 0) {
         return 1;
     }
 

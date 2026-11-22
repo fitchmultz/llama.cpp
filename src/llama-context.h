@@ -439,9 +439,10 @@ private:
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
-    // Inkling2 DSpark precomputed low-rank Markov LM head (W_valid @ dspark_hidden_out)
+    // Inkling2 DSpark precomputed draft-only LM heads (W_valid quantized + W_valid @ dspark_hidden_out)
     ggml_context_ptr        ctx_dspark_lm;
     ggml_backend_buffer_ptr buf_dspark_lm;
+    ggml_tensor *           dspark_base_lm     = nullptr;
     ggml_tensor *           dspark_markov_lm   = nullptr;
     ggml_tensor *           dspark_markov_bias = nullptr;
 

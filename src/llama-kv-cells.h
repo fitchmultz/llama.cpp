@@ -131,6 +131,10 @@ public:
         return used.size();
     }
 
+    const llama_pos * pos_data() const {
+        return pos.data();
+    }
+
     // the index of the first cell that is used
     // return 0 if no cells are used
     uint32_t used_min() const {

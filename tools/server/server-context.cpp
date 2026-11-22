@@ -305,6 +305,9 @@ struct server_slot {
     // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
     std::vector<std::vector<llama_token_data>> spec_draft_q;
     std::vector<std::vector<llama_token_data>> spec_draft_q_pool;
+    // contiguous probability distributions indexed by token id (Inkling2 DSpark fast path)
+    std::vector<std::vector<float>> spec_draft_q_f32;
+    std::vector<std::vector<float>> spec_draft_q_f32_pool;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
@@ -452,6 +455,8 @@ struct server_slot {
             spec_draft.clear();
             spec_draft_q.clear();
             spec_draft_q_pool.clear();
+            spec_draft_q_f32.clear();
+            spec_draft_q_f32_pool.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -3864,6 +3869,10 @@ private:
                         slot.spec_draft_q_pool.push_back(std::move(q));
                     }
                     slot.spec_draft_q.clear();
+                    for (auto & q : slot.spec_draft_q_f32) {
+                        slot.spec_draft_q_f32_pool.push_back(std::move(q));
+                    }
+                    slot.spec_draft_q_f32.clear();
 
                     if (!slot.spec_draft.empty()) {
                         // we have a previous (partial) draft to reuse
@@ -3889,16 +3898,18 @@ private:
                         const bool spec_reject = slot.use_spec_rejection();
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
-                            /* .drafting      = */ true,
-                            /* .n_max         = */ n_draft_max,
-                            /* .pos0          = */ slot.prompt.tokens.pos_next(),
-                            /* .id_last       = */ slot.sampled,
-                            /* .prompt        = */ &slot.spec_prompt,
-                            /* .result        = */ &slot.spec_draft,
-                            /* .result_q      = */ spec_reject ? &slot.spec_draft_q : nullptr,
-                            /* .result_q_pool = */ spec_reject ? &slot.spec_draft_q_pool : nullptr,
-                            /* .temp          = */ slot.task->params.sampling.temp,
-                            /* .seed          = */ slot.task->params.sampling.seed,
+                            /* .drafting          = */ true,
+                            /* .n_max             = */ n_draft_max,
+                            /* .pos0              = */ slot.prompt.tokens.pos_next(),
+                            /* .id_last           = */ slot.sampled,
+                            /* .prompt            = */ &slot.spec_prompt,
+                            /* .result            = */ &slot.spec_draft,
+                            /* .result_q          = */ spec_reject ? &slot.spec_draft_q : nullptr,
+                            /* .result_q_pool     = */ spec_reject ? &slot.spec_draft_q_pool : nullptr,
+                            /* .result_q_f32      = */ spec_reject ? &slot.spec_draft_q_f32 : nullptr,
+                            /* .result_q_f32_pool = */ spec_reject ? &slot.spec_draft_q_f32_pool : nullptr,
+                            /* .temp              = */ slot.task->params.sampling.temp,
+                            /* .seed              = */ slot.task->params.sampling.seed,
                         };
 
                         drafting.push_back(&slot);
@@ -4937,11 +4948,13 @@ private:
                 common_sampler_ptr smpl_save(use_ckpt_tgt ? common_sampler_clone(slot.smpl.get()) : nullptr);
 
                 GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
-                GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
+                GGML_ASSERT(slot.spec_draft_q.empty()     || (slot.spec_draft_q.size()     == slot.spec_draft.size()));
+                GGML_ASSERT(slot.spec_draft_q_f32.empty() || (slot.spec_draft_q_f32.size() == slot.spec_draft.size()));
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
 
                 // drafters that fill no distribution fall back here
-                const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
+                const bool use_rejection_f32 = slot.use_spec_rejection() && !slot.spec_draft_q_f32.empty();
+                const bool use_rejection     = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
 
                 std::vector<llama_token> accepted;
                 if (!synth_probs.empty()) {
@@ -4951,6 +4964,8 @@ private:
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
                 } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
+                } else if (use_rejection_f32) {
+                    accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q_f32);
                 } else if (use_rejection) {
                     accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q);
                 } else {
