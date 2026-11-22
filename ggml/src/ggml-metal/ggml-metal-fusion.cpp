@@ -2004,9 +2004,111 @@ static bool ggml_metal_fusion_check_moe_reduce_conv_add(
     return true;
 }
 
-static const std::vector<ggml_op> ops_mul_mat_add  = { GGML_OP_MUL_MAT, GGML_OP_ADD };
-static const std::vector<ggml_op> ops_mul_soft_max = { GGML_OP_MUL, GGML_OP_SOFT_MAX };
-static const std::vector<ggml_op> ops_softcap      = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE };
+static const std::vector<ggml_op> ops_mul_mat_add     = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_mul_soft_max    = { GGML_OP_MUL, GGML_OP_SOFT_MAX };
+static const std::vector<ggml_op> ops_softcap         = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE };
+static const std::vector<ggml_op> ops_fa_banded_rel_rsh = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_FLASH_ATTN_EXT_BANDED };
+static const std::vector<ggml_op> ops_fa_banded_rel     = { GGML_OP_MUL_MAT, GGML_OP_FLASH_ATTN_EXT_BANDED };
+
+// MUL_MAT(rel_w[16, E], rel_q[16, H, T]) [+ RESHAPE] + FLASH_ATTN_EXT_BANDED
+static bool ggml_metal_fusion_check_fa_banded_rel(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const ggml_tensor * mm = nodes[0];
+    const ggml_tensor * fa = nodes[1];
+
+    const bool has_rsh   = fusion->ops_all.size() == 3;
+    const int  raw_start = node_idxs[idx];
+    const int  raw_end   = node_idxs[idx + 1];
+    if (raw_end - raw_start != (has_rsh ? 2 : 1)) {
+        return false;
+    }
+
+    const ggml_tensor * rel = fa->src[6];
+    if (!rel) {
+        return false;
+    }
+    if (has_rsh) {
+        if (gf->nodes[raw_start + 1] != rel || rel->op != GGML_OP_RESHAPE || rel->src[0] != mm) {
+            return false;
+        }
+    } else {
+        if (rel != mm) {
+            return false;
+        }
+    }
+
+    const ggml_tensor * rel_w = mm->src[0];
+    const ggml_tensor * rel_q = mm->src[1];
+    if (!rel_w || !rel_q || mm->type != GGML_TYPE_F32 ||
+        rel_w->type != GGML_TYPE_F32 || rel_q->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (rel_w->ne[0] != 16 || rel_q->ne[0] != 16 ||
+        rel_w->ne[2] != 1  || rel_w->ne[3] != 1  || rel_q->ne[3] != 1) {
+        return false;
+    }
+    if (!ggml_is_contiguous(rel_w) || !ggml_is_contiguous(rel_q)) {
+        return false;
+    }
+
+    const ggml_tensor * q = fa->src[0];
+    const ggml_tensor * k = fa->src[1];
+    const ggml_tensor * v = fa->src[2];
+    if (!q || !k || !v || q->ne[0] != 128 || k->ne[0] != 128 || v->ne[0] != 128) {
+        return false;
+    }
+    if (fa->src[5] != nullptr) {
+        return false;
+    }
+    int32_t n_kv_max = 0;
+    memcpy(&n_kv_max, ((const int32_t *) fa->op_params) + 4, sizeof(n_kv_max));
+    if (n_kv_max > 0) {
+        return false;
+    }
+    // Wide Metal 4 tensor path requires ne01 >= 32 (guarantees !use_vec and use_kv_f16 for quantized KV)
+    if (q->ne[1] < 32) {
+        return false;
+    }
+    switch (k->type) {
+        case GGML_TYPE_F16:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+            break;
+        default:
+            return false;
+    }
+
+    if (rel->ne[0] != rel_w->ne[1] ||
+        rel->ne[1] != q->ne[2]     || rel_q->ne[1] != q->ne[2] ||
+        rel->ne[2] != q->ne[1]     || rel->ne[3]   != q->ne[3] ||
+        rel_q->ne[2] != q->ne[1] * q->ne[3]) {
+        return false;
+    }
+
+    int raw_idxs[3] = { raw_start, raw_start + 1, raw_start + 2 };
+    const int raw_n = has_rsh ? 3 : 2;
+    const int outputs[1] = { raw_end };
+    if (!ggml_can_fuse_subgraph_ext(gf, raw_idxs, raw_n, fusion->ops_all.data(), outputs, 1)) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        if (!rel_w->data || !rel_q->data || !fa->data ||
+            ggml_metal_fusion_overlap(fa, rel_w) || ggml_metal_fusion_overlap(fa, rel_q)) {
+            return false;
+        }
+    }
+
+    return true;
+}
 
 static bool ggml_metal_fusion_check_softcap(
         const ggml_metal_fusion       * fusion,
@@ -2179,6 +2281,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MUL_MAT_ADD,  ops_mul_mat_add,  {}, false, ggml_metal_fusion_check_mul_mat_add },
     { GGML_METAL_FUSION_MUL_SOFT_MAX, ops_mul_soft_max, {}, false, ggml_metal_fusion_check_mul_soft_max },
     { GGML_METAL_FUSION_SOFTCAP,      ops_softcap,      {}, false, ggml_metal_fusion_check_softcap },
+    { GGML_METAL_FUSION_FA_BANDED_REL, ops_fa_banded_rel_rsh, {}, true, ggml_metal_fusion_check_fa_banded_rel },
+    { GGML_METAL_FUSION_FA_BANDED_REL, ops_fa_banded_rel,     {}, true, ggml_metal_fusion_check_fa_banded_rel },
 };
 
 // ---- alloc deps -----------------------------------------------------------

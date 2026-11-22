@@ -2126,7 +2126,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_t
         bool has_scap,
         bool has_banded,
         bool has_kvpad,
-        bool has_rel_pos) {
+        bool has_rel_pos,
+        bool has_rel_mm) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
 
     char base[256];
@@ -2136,8 +2137,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_t
     const int32_t dv = (int32_t) op->src[2]->ne[0];
 
     snprintf(base, 256, "kernel_flash_attn_ext_tensor_f16_dk%d_dv%d_q%d_c%d_nsg%d", dk, dv, q_blk, c_blk, nsg);
-    snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_banded=%d_kvpad=%d_relpos=%d_nwg=%d",
-            base, has_mask, has_sinks, has_bias, has_scap, has_banded, has_kvpad, has_rel_pos, nwg);
+    snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_banded=%d_kvpad=%d_relpos=%d_relmm=%d_nwg=%d",
+            base, has_mask, has_sinks, has_bias, has_scap, has_banded, has_kvpad, has_rel_pos, has_rel_mm, nwg);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -2151,6 +2152,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_t
         ggml_metal_cv_set_bool(cv, has_kvpad,   FC_FLASH_ATTN_EXT_TENSOR + 5);
         ggml_metal_cv_set_bool(cv, has_rel_pos, FC_FLASH_ATTN_EXT_TENSOR + 6);
         ggml_metal_cv_set_int32(cv, nwg,        FC_FLASH_ATTN_EXT_TENSOR + 7);
+        ggml_metal_cv_set_bool(cv, has_rel_mm,  FC_FLASH_ATTN_EXT_TENSOR + 8);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 

@@ -401,7 +401,8 @@ template [[host_name("kernel_flash_attn_ext_tensor_bf16_dk256_dv256")]] kernel f
 template [[host_name("kernel_flash_attn_ext_tensor_bf16_dk512_dv512")]] kernel flash_attn_ext_tensor_t kernel_flash_attn_ext_tensor<bfloat, bfloat4, 512, 512, OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE>;
 template [[host_name("kernel_flash_attn_ext_tensor_bf16_dk576_dv512")]] kernel flash_attn_ext_tensor_t kernel_flash_attn_ext_tensor<bfloat, bfloat4, 576, 512, OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE>;
 
-constant int32_t FC_flash_attn_ext_tensor_nwg [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 7)]];
+constant int32_t FC_flash_attn_ext_tensor_nwg        [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 7)]];
+constant bool    FC_flash_attn_ext_tensor_has_rel_mm [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 8)]];
 
 // High-throughput F16 Metal 4 tensor FlashAttention with pre-packed device Q (zero Q shmem),
 // hardware exp2 softmax, tile-level k_pos skip, Split-KV (NWG), and wide Q=32xC=128 MMA tiles.
@@ -424,6 +425,7 @@ kernel void kernel_flash_attn_ext_tensor_f16_wide(
         device const char * pad,
         device const char * k_pos,
         device const char * q_pos,
+        device const char * rel_q,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
@@ -543,6 +545,21 @@ kernel void kernel_flash_attn_ext_tensor_f16_wide(
         sf[0] = 0;
     }
 
+    threadgroup float4 * s_rq4 = (threadgroup float4 *) (sf + 4);
+    if (FC_flash_attn_ext_tensor_has_banded && FC_flash_attn_ext_tensor_has_rel_mm) {
+        for (int i = tiitg; i < Q * 4; i += NSG * NW) {
+            const int j  = i >> 2;
+            const int k4 = i & 3;
+            if (iq1 + j < args.ne01) {
+                device const float4 * rq_ptr = (device const float4 *) (
+                    rel_q + (uint64_t) (iq1 + j) * args.nb62 + (uint64_t) iq2 * args.nb61 + (uint64_t) (iq3 % args.ne63) * args.nb63);
+                s_rq4[i] = rq_ptr[k4] * LOG2E;
+            } else {
+                s_rq4[i] = float4(0.0f);
+            }
+        }
+    }
+
     device const char * rel_head = rel + (uint64_t) iq2 * args.nb61 + (uint64_t) (iq3 % args.ne63) * args.nb63;
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -582,10 +599,10 @@ kernel void kernel_flash_attn_ext_tensor_f16_wide(
         static_assert(NC == 4, "kernel_flash_attn_ext_tensor_f16_wide requires C == 128 (NC == 4)");
         {
             int4 kp4 = int4(ic + 4 * tiisg + 0, ic + 4 * tiisg + 1, ic + 4 * tiisg + 2, ic + 4 * tiisg + 3);
+            int  kp_min = ic;
+            int  kp_max = min(ic + C - 1, args.ne11 - 1);
             bool tile_has_rel = false;
             if (FC_flash_attn_ext_tensor_has_banded) {
-                int kp_min = ic;
-                int kp_max = min(ic + C - 1, args.ne11 - 1);
                 if (FC_flash_attn_ext_tensor_has_rel_pos) {
                     device const int * kp = (device const int *) k_pos + (uint64_t) iq3 * args.ne11 + ic;
                     const int base_col = 4 * tiisg;
@@ -647,13 +664,29 @@ kernel void kernel_flash_attn_ext_tensor_f16_wide(
                 }
 
                 if (FC_flash_attn_ext_tensor_has_banded && tile_has_rel && iq1 + j < args.ne01) {
-                    device const float * pr_row = (device const float *) (rel_head + (uint64_t) (iq1 + j) * args.nb62);
                     const int base_col = ic + 4 * tiisg;
-                    FOR_UNROLL (short k = 0; k < 4; ++k) {
-                        if (base_col + k < args.ne11) {
-                            const int rel_dist = qp[jj] - kp4[k];
-                            if (rel_dist >= 0 && rel_dist < args.rel_extent) {
-                                s4[k] += pr_row[rel_dist] * LOG2E;
+                    if (FC_flash_attn_ext_tensor_has_rel_mm) {
+                        const float4 rq0 = s_rq4[j * 4 + 0];
+                        const float4 rq1 = s_rq4[j * 4 + 1];
+                        const float4 rq2 = s_rq4[j * 4 + 2];
+                        const float4 rq3 = s_rq4[j * 4 + 3];
+                        FOR_UNROLL (short k = 0; k < 4; ++k) {
+                            if (base_col + k < args.ne11) {
+                                const int rel_dist = qp[jj] - kp4[k];
+                                if (rel_dist >= 0 && rel_dist < args.rel_extent) {
+                                    device const float4 * rw = (device const float4 *) rel + (uint64_t) rel_dist * 4;
+                                    s4[k] += dot(rq0, rw[0]) + dot(rq1, rw[1]) + dot(rq2, rw[2]) + dot(rq3, rw[3]);
+                                }
+                            }
+                        }
+                    } else {
+                        device const float * pr_row = (device const float *) (rel_head + (uint64_t) (iq1 + j) * args.nb62);
+                        FOR_UNROLL (short k = 0; k < 4; ++k) {
+                            if (base_col + k < args.ne11) {
+                                const int rel_dist = qp[jj] - kp4[k];
+                                if (rel_dist >= 0 && rel_dist < args.rel_extent) {
+                                    s4[k] += pr_row[rel_dist] * LOG2E;
+                                }
                             }
                         }
                     }

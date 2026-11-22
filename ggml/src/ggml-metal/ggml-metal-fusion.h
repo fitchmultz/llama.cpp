@@ -57,6 +57,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_MUL_SOFT_MAX,  // MUL(x, per-row scalar) + SOFT_MAX (large-vocab parallel softmax)
     GGML_METAL_FUSION_SOFTCAP,       // SCALE(1/cap) + TANH + SCALE(cap) (logit softcapping)
     GGML_METAL_FUSION_MOE_REDUCE_CONV_ADD, // MOE_REDUCE + SSM_CONV_FULL + ADD (register-resident FFN epilogue)
+    GGML_METAL_FUSION_FA_BANDED_REL, // MUL_MAT(rel_w[16,E], rel_q) [+ RESHAPE] + FLASH_ATTN_EXT_BANDED
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp

@@ -3394,6 +3394,9 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+static bool ggml_metal_op_flash_attn_ext_use_tensor_wide(const ggml_tensor * op, bool has_tensor);
+static int  ggml_metal_op_flash_attn_ext_impl(ggml_metal_op_t ctx, int idx, const ggml_tensor * rel_mm);
+
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -3401,6 +3404,22 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_t enc = ctx->enc;
 
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+
+    if (ctx->use_fusion() && props_dev->has_tensor && op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] == 16) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_FA_BANDED_REL) {
+            const ggml_tensor * fa = ctx->node(idx + 1);
+            if (ggml_metal_op_flash_attn_ext_use_tensor_wide(fa, props_dev->has_tensor)) {
+                if (!ggml_metal_op_concurrency_check(ctx, fa)) {
+                    ggml_metal_op_concurrency_reset(ctx);
+                }
+                ctx->count_fusions(fusion);
+                ggml_metal_op_flash_attn_ext_impl(ctx, idx + 1, op);
+                return 2;
+            }
+        }
+    }
 
     if (ctx->use_fusion() && props_dev->has_bfloat && op->src[0]->type == GGML_TYPE_BF16 && op->src[0]->ne[0] == 64) {
         int n = 1;
@@ -4672,6 +4691,10 @@ size_t ggml_metal_op_flash_attn_ext_extra_rows(const ggml_tensor * op) {
 }
 
 int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+    return ggml_metal_op_flash_attn_ext_impl(ctx, idx, nullptr);
+}
+
+static int ggml_metal_op_flash_attn_ext_impl(ggml_metal_op_t ctx, int idx, const ggml_tensor * rel_mm) {
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -4735,13 +4758,16 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     const bool has_sinks   = op->src[4] != NULL;
     const bool has_banded  = op->op == GGML_OP_FLASH_ATTN_EXT_BANDED;
     const bool has_rel_pos = has_banded && op->src[7] != NULL && op->src[8] != NULL;
+    const bool has_rel_mm  = has_banded && rel_mm != nullptr;
 
-    const ggml_tensor * rel = has_banded ? op->src[6] : nullptr;
-    const int32_t  rel_extent = rel ? (int32_t) rel->ne[0] : 0;
-    const int32_t  ne63       = rel ? (int32_t) rel->ne[3] : 1;
-    const uint64_t nb61       = rel ? rel->nb[1] : 0;
-    const uint64_t nb62       = rel ? rel->nb[2] : 0;
-    const uint64_t nb63       = rel ? rel->nb[3] : 0;
+    const ggml_tensor * rel   = has_banded ? op->src[6] : nullptr;
+    const ggml_tensor * rel_w = has_rel_mm ? rel_mm->src[0] : nullptr;
+    const ggml_tensor * rel_q = has_rel_mm ? rel_mm->src[1] : nullptr;
+    const int32_t  rel_extent = has_rel_mm ? (int32_t) rel_w->ne[1] : (rel ? (int32_t) rel->ne[0] : 0);
+    const int32_t  ne63       = has_rel_mm ? ne03 : (rel ? (int32_t) rel->ne[3] : 1);
+    const uint64_t nb61       = has_rel_mm ? rel_q->nb[1] : (rel ? rel->nb[1] : 0);
+    const uint64_t nb62       = has_rel_mm ? rel_q->nb[2] : (rel ? rel->nb[2] : 0);
+    const uint64_t nb63       = has_rel_mm ? (uint64_t) ne01 * rel_q->nb[2] : (rel ? rel->nb[3] : 0);
     const int32_t  sinks_s1   = (has_sinks && op->src[4]->ne[1] > 1) ? (int32_t) (op->src[4]->nb[1]/sizeof(float)) : 0;
     const int32_t  sinks_s2   = (has_sinks && op->src[4]->ne[2] > 1) ? (int32_t) (op->src[4]->nb[2]/sizeof(float)) : 0;
 
@@ -4758,14 +4784,15 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
     GGML_ASSERT(ne01 < 65536);
 
-    ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
-    ggml_metal_buffer_id bid_src1 = ggml_metal_get_buffer_id(op->src[1]);
-    ggml_metal_buffer_id bid_src2 = ggml_metal_get_buffer_id(op->src[2]);
-    ggml_metal_buffer_id bid_src3 = has_mask    ? ggml_metal_get_buffer_id(op->src[3]) : bid_src0;
-    ggml_metal_buffer_id bid_src4 = has_sinks   ? ggml_metal_get_buffer_id(op->src[4]) : bid_src0;
-    ggml_metal_buffer_id bid_rel  = has_banded  ? ggml_metal_get_buffer_id(rel)        : bid_src0;
-    ggml_metal_buffer_id bid_kpos = has_rel_pos ? ggml_metal_get_buffer_id(op->src[7]) : bid_src0;
-    ggml_metal_buffer_id bid_qpos = has_rel_pos ? ggml_metal_get_buffer_id(op->src[8]) : bid_src0;
+    ggml_metal_buffer_id bid_src0  = ggml_metal_get_buffer_id(op->src[0]);
+    ggml_metal_buffer_id bid_src1  = ggml_metal_get_buffer_id(op->src[1]);
+    ggml_metal_buffer_id bid_src2  = ggml_metal_get_buffer_id(op->src[2]);
+    ggml_metal_buffer_id bid_src3  = has_mask    ? ggml_metal_get_buffer_id(op->src[3]) : bid_src0;
+    ggml_metal_buffer_id bid_src4  = has_sinks   ? ggml_metal_get_buffer_id(op->src[4]) : bid_src0;
+    ggml_metal_buffer_id bid_rel   = has_rel_mm  ? ggml_metal_get_buffer_id(rel_w)      : (has_banded ? ggml_metal_get_buffer_id(rel) : bid_src0);
+    ggml_metal_buffer_id bid_rel_q = has_rel_mm  ? ggml_metal_get_buffer_id(rel_q)      : bid_src0;
+    ggml_metal_buffer_id bid_kpos  = has_rel_pos ? ggml_metal_get_buffer_id(op->src[7]) : bid_src0;
+    ggml_metal_buffer_id bid_qpos  = has_rel_pos ? ggml_metal_get_buffer_id(op->src[8]) : bid_src0;
 
     ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
 
@@ -5143,13 +5170,13 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.sinks_s2      =*/ sinks_s2,
         };
 
-        // shared memory layout: queries (16-bit, omitted in wide), scores (float), probabilities (16-bit), row scale (float), rescale flag (int)
+        // shared memory layout: queries (16-bit, omitted in wide), scores (float), probabilities (16-bit), row scale (float), rescale flag (int), optional rel_q [Q, 16] (float)
         const size_t smem = use_wide
-            ? GGML_PAD((size_t) nqptg*ncpsg*(sizeof(float) + sizeof(ggml_fp16_t)) + nqptg*sizeof(float) + sizeof(int32_t), 16)
+            ? GGML_PAD((size_t) nqptg*ncpsg*(sizeof(float) + sizeof(ggml_fp16_t)) + nqptg*sizeof(float) + 4*sizeof(int32_t) + (has_rel_mm ? (size_t) nqptg*16*sizeof(float) : 0), 16)
             : GGML_PAD((size_t) nqptg*ne00*sizeof(ggml_fp16_t) + nqptg*ncpsg*(sizeof(float) + sizeof(ggml_fp16_t)) + nqptg*sizeof(float) + sizeof(int32_t), 16);
 
         auto pipeline = use_wide
-            ? ggml_metal_library_get_pipeline_flash_attn_ext_tensor_wide(lib, op, nqptg, ncpsg, nsg, nwg, has_mask, has_sinks, has_bias, has_scap, has_banded, has_kvpad, has_rel_pos)
+            ? ggml_metal_library_get_pipeline_flash_attn_ext_tensor_wide(lib, op, nqptg, ncpsg, nsg, nwg, has_mask, has_sinks, has_bias, has_scap, has_banded, has_kvpad, has_rel_pos, has_rel_mm)
             : ggml_metal_library_get_pipeline_flash_attn_ext_tensor(lib, op, has_mask, has_sinks, has_bias, has_scap, has_banded, has_kvpad, has_rel_pos);
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
@@ -5173,6 +5200,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_pad,  9);
         ggml_metal_encoder_set_buffer  (enc, bid_kpos, 10);
         ggml_metal_encoder_set_buffer  (enc, bid_qpos, 11);
+        if (use_wide) {
+            ggml_metal_encoder_set_buffer(enc, bid_rel_q, 12);
+        }
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 

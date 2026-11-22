@@ -245,7 +245,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         bool has_scap,
         bool has_banded,
         bool has_kvpad,
-        bool has_rel_pos);
+        bool has_rel_pos,
+        bool has_rel_mm);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
         ggml_metal_library_t lib,
