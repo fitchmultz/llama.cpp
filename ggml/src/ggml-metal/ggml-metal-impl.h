@@ -15,7 +15,7 @@
 #define N_MM_SIMD_GROUP_Y 2
 
 #define N_ARGMAX_NPART_MAX 256
-#define N_ARGMAX_CHUNK 4096
+#define N_ARGMAX_CHUNK 512
 
 #define N_SG_CONV_2D 4
 
@@ -1648,5 +1648,28 @@ typedef struct {
 typedef struct {
     int64_t ne;
 } ggml_metal_kargs_silu_back;
+
+typedef struct {
+    int32_t  rank;
+    uint64_t nb_w1_1;
+    uint64_t nb_wse1;
+    uint64_t nb_s1;
+    uint64_t nb_sp1;
+    uint64_t nb_so1;
+    uint64_t nb_lo1;
+} ggml_metal_kargs_dspark_markov_gru;
+
+typedef struct {
+    int32_t  ne01;
+    int32_t  npart;
+    int32_t  nb;
+    uint64_t nb_lm1;
+    uint64_t nb_y1;
+    uint64_t nb_b1;
+    uint64_t nb_v1;
+    uint64_t nb_c1;
+    float    inv_cap;
+    float    cap;
+} ggml_metal_kargs_dspark_markov_logits;
 
 #endif // GGML_METAL_IMPL

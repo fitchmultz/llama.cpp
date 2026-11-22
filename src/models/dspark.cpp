@@ -1091,9 +1091,15 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
         const int64_t hd = hparams.n_embd_head_k(il);
         auto * residual = cur;
         cur = build_norm(cur, l.attn_norm, nullptr, LLM_NORM_RMS, il);
-        auto * q = ggml_reshape_3d(ctx0, build_lora_mm(l.wq, cur), hd, hparams.n_head(il), n_tokens);
-        auto * k = ggml_reshape_3d(ctx0, build_lora_mm(l.wk, cur), hd, hparams.n_head_kv(il), n_tokens);
-        auto * v = ggml_reshape_3d(ctx0, build_lora_mm(l.wv, cur), hd, hparams.n_head_kv(il), n_tokens);
+        auto * q_proj = build_lora_mm(l.wq, cur);
+        auto * k_proj = build_lora_mm(l.wk, cur);
+        auto * v_proj = build_lora_mm(l.wv, cur);
+        ggml_build_forward_expand(gf, q_proj);
+        ggml_build_forward_expand(gf, k_proj);
+        ggml_build_forward_expand(gf, v_proj);
+        auto * q = ggml_reshape_3d(ctx0, q_proj, hd, hparams.n_head(il), n_tokens);
+        auto * k = ggml_reshape_3d(ctx0, k_proj, hd, hparams.n_head_kv(il), n_tokens);
+        auto * v = ggml_reshape_3d(ctx0, v_proj, hd, hparams.n_head_kv(il), n_tokens);
         q = build_rope(build_norm(q, l.attn_q_norm, nullptr, LLM_NORM_RMS, il), positions, il);
         k = build_rope(build_norm(k, l.attn_k_norm, nullptr, LLM_NORM_RMS, il), positions, il);
         cur = build_attn(attn, l.wo, nullptr, nullptr, q, k, v, nullptr, nullptr, nullptr, 1.0f/sqrtf(hd), il);
@@ -1122,13 +1128,28 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     const bool map_d2t = use_pruned && use_factored;
     const int64_t n_vocab_out = map_d2t ? dspark_d2t->ne[0] : hparams.n_vocab_unpadded;
     const int64_t n_draft = n_out - 1;
+    const auto column = [&](ggml_tensor * t, int64_t i) {
+        return ggml_cont(ctx0, ggml_view_2d(ctx0, t, t->ne[0], nb, block*t->nb[1], i*t->nb[1]));
+    };
+    auto * context = column(f_rnn, 0);
+    auto * sample_cfg = chained_prob ? column(f_rnn, 1) : nullptr;
+    const bool factor_joint = use_factored &&
+                              model.dspark_joint_proj != nullptr &&
+                              !ggml_is_quantized(model.dspark_joint_proj->type) &&
+                              model.dspark_markov_w1 != nullptr &&
+                              dspark_markov_lm->ne[1] == n_vocab_out &&
+                              model.dspark_joint_proj->ne[0] == 2*rank + 2*n_embd &&
+                              model.dspark_joint_proj->ne[1] == 3*rank;
     ggml_tensor * base_all = nullptr;
+    ggml_tensor * w_se = nullptr;
+    ggml_tensor * static_proj_all = nullptr;
     if (use_factored) {
         // Compute draft base logits ONCE for all draft steps (uses quantized draft-only dspark_base_lm when available)
-        auto * cur_draft = ggml_view_3d(ctx0, cur, n_embd, n_draft, nb,
-                cur->nb[1], block * cur->nb[1], cur->nb[1]);
-        cur_draft = ggml_reshape_2d(ctx0, ggml_cont(ctx0, cur_draft), n_embd, n_draft * nb);
-        cur_draft = ggml_add(ctx0, cur_draft, model.dspark_hidden_out_b);
+        auto * cur_draft_raw = ggml_reshape_2d(ctx0,
+                ggml_cont(ctx0, ggml_view_3d(ctx0, cur, n_embd, n_draft, nb,
+                        cur->nb[1], block * cur->nb[1], cur->nb[1])),
+                n_embd, n_draft * nb);
+        auto * cur_draft = ggml_add(ctx0, cur_draft_raw, model.dspark_hidden_out_b);
         ggml_tensor * output_w = dspark_base_lm != nullptr
             ? dspark_base_lm
             : ((hparams.n_vocab_unpadded > 0 && hparams.n_vocab_unpadded < target->output->ne[1])
@@ -1136,19 +1157,40 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
                 : target->output);
         base_all = build_lora_mm(output_w, cur_draft, target->output_s);
         ggml_prec_set_acc(base_all, GGML_PREC_F32);
+        ggml_build_forward_expand(gf, base_all);
+
+        if (factor_joint) {
+            // Exact linear factoring of dspark_joint_proj [2R+2D, 3R]: hoist W_ctx @ context + b and
+            // W_hid @ cur_draft_raw out of the chained loop so each step only multiplies W_se [2R, 3R]
+            auto * W = model.dspark_joint_proj;
+            w_se = ggml_view_2d(ctx0, W, 2*rank, 3*rank, W->nb[1], 0);
+            auto * w_hid = ggml_view_2d(ctx0, W, n_embd, 3*rank, W->nb[1], (size_t) (2*rank) * W->nb[0]);
+            auto * w_ctx = ggml_view_2d(ctx0, W, n_embd, 3*rank, W->nb[1], (size_t) (2*rank + n_embd) * W->nb[0]);
+            auto * ctx_proj = ggml_add(ctx0, ggml_mul_mat(ctx0, w_ctx, context), model.dspark_joint_proj_b);
+            auto * hid_proj = ggml_mul_mat(ctx0, w_hid, cur_draft_raw);
+            ggml_build_forward_expand(gf, w_se);
+            ggml_build_forward_expand(gf, ctx_proj);
+            ggml_build_forward_expand(gf, hid_proj);
+            static_proj_all = ggml_add(ctx0,
+                    ggml_reshape_3d(ctx0, hid_proj, 3*rank, n_draft, nb),
+                    ggml_reshape_3d(ctx0, ctx_proj, 3*rank, 1, nb));
+            ggml_build_forward_expand(gf, static_proj_all);
+        }
     }
     auto * state = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, rank, nb), 0.0f);
+    ggml_build_forward_expand(gf, state);
+    if (sample_cfg) {
+        ggml_build_forward_expand(gf, sample_cfg);
+    }
+    const int64_t st_width = chained_prob ? (rank + 1) : rank;
     std::vector<ggml_tensor *> state_cols;
     std::vector<ggml_tensor *> logit_cols;
     state_cols.reserve((size_t) block);
     logit_cols.reserve((size_t) n_out);
-    state_cols.push_back(ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0));
-    logit_cols.push_back(ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (chained_prob || use_factored) ? n_vocab_out : target->output->ne[1], nb), 0.0f));
-    const auto column = [&](ggml_tensor * t, int64_t i) {
-        return ggml_cont(ctx0, ggml_view_2d(ctx0, t, t->ne[0], nb, block*t->nb[1], i*t->nb[1]));
-    };
-    auto * context = column(f_rnn, 0);
-    auto * sample_cfg = chained_prob ? column(f_rnn, 1) : nullptr;
+    state_cols.push_back(ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, st_width, nb), 0.0f));
+    if (!chained_prob) {
+        logit_cols.push_back(ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, use_factored ? n_vocab_out : target->output->ne[1], nb), 0.0f));
+    }
     auto * d2t_2d = map_d2t ? ggml_reshape_2d(ctx0, dspark_d2t, 1, n_vocab_out) : nullptr;
     auto * prev = ids;
     ggml_tensor * tie_rank = nullptr;
@@ -1166,8 +1208,39 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
                         n_draft * base_all->nb[1], (i - 1) * base_all->nb[1]));
             }
         }
-        auto * col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i), base_i, context,
-                use_factored ? dspark_markov_lm : nullptr, nullptr);
+        ggml_tensor * col = nullptr;
+        if (factor_joint) {
+            ggml_tensor * static_proj_i = (nb == 1)
+                ? ggml_view_2d(ctx0, static_proj_all, 3*rank, 1, static_proj_all->nb[1], (i - 1) * static_proj_all->nb[1])
+                : ggml_cont(ctx0, ggml_view_2d(ctx0, static_proj_all, 3*rank, nb, static_proj_all->nb[2], (i - 1) * static_proj_all->nb[1]));
+            ggml_build_forward_expand(gf, static_proj_i);
+
+            auto * emb   = ggml_get_rows(ctx0, model.dspark_markov_w1, prev);
+            auto * se    = ggml_concat(ctx0, state, emb, 0);
+            auto * joint = ggml_add(ctx0, ggml_mul_mat(ctx0, w_se, se), static_proj_i);
+            const auto chunk = [&](int64_t j) {
+                return ggml_cont(ctx0, ggml_view_2d(ctx0, joint, rank, joint->ne[1], joint->nb[1], j*rank*joint->nb[0]));
+            };
+            auto * gate      = ggml_sigmoid(ctx0, chunk(0));
+            auto * candidate = ggml_tanh(ctx0, chunk(1));
+            state            = ggml_add(ctx0, candidate, ggml_mul(ctx0, gate, ggml_sub(ctx0, state, candidate)));
+            auto * latent    = ggml_tanh(ctx0, chunk(2));
+            // Deterministic DFS order enables Metal DSPARK_MARKOV_GRU fusion (13 ops -> 1 dispatch)
+            ggml_build_forward_expand(gf, gate);
+            ggml_build_forward_expand(gf, candidate);
+            ggml_build_forward_expand(gf, state);
+            ggml_build_forward_expand(gf, latent);
+
+            ggml_build_forward_expand(gf, base_i);
+            auto * bias = ggml_mul_mat(ctx0, dspark_markov_lm, latent);
+            ggml_prec_set_acc(bias, GGML_PREC_F32);
+            auto * logits = ggml_add(ctx0, base_i, bias);
+            const float cap = model.hparams.f_final_logit_softcapping;
+            col = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, logits, 1.0f/cap)), cap);
+        } else {
+            col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i), base_i, context,
+                    use_factored ? dspark_markov_lm : nullptr, nullptr);
+        }
         if (chained_prob) {
             auto * valid = (col->ne[0] == n_vocab_out)
                 ? col
@@ -1175,17 +1248,19 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
             auto * step_ctrl = ggml_view_2d(ctx0, sample_cfg, 2, nb, sample_cfg->nb[1], 2*(i - 1)*sizeof(float));
             auto * sampled = ggml_argmax(ctx0, valid);
             sampled->src[1] = step_ctrl;
+            // Expand step_ctrl before valid so MUL_MAT+ADD+SOFTCAP+ARGMAX are contiguous for Metal fusion
+            ggml_build_forward_expand(gf, step_ctrl);
+            ggml_build_forward_expand(gf, valid);
+            ggml_build_forward_expand(gf, sampled);
             prev = map_d2t
                 ? ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, d2t_2d, sampled), nb)
                 : sampled;
+            ggml_build_forward_expand(gf, prev);
             auto * tok_f32 = ggml_reshape_2d(ctx0, ggml_cast(ctx0, prev, GGML_TYPE_F32), 1, nb);
-            auto * st_tok  = ggml_concat(ctx0, state, tok_f32, 0);
-            state_cols.push_back(ggml_pad(ctx0, st_tok, n_embd - rank - 1, 0, 0, 0));
-            auto * inv_t = ggml_cont(ctx0, ggml_view_2d(ctx0, step_ctrl, 1, nb, step_ctrl->nb[1], 0));
-            auto * probs = ggml_soft_max(ctx0, ggml_mul(ctx0, valid, inv_t));
-            logit_cols.push_back(probs);
+            state_cols.push_back(ggml_concat(ctx0, state, tok_f32, 0));
+            logit_cols.push_back(valid);
         } else {
-            state_cols.push_back(ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0));
+            state_cols.push_back(state);
             logit_cols.push_back(col);
             if (i + 1 < n_out) {
                 // Select the first maximum, independent of backend argmax tie order.
@@ -1200,7 +1275,7 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     }
     if (n_out < block) {
         // h_nextn is read at every row
-        state_cols.push_back(ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, nb*(block - n_out)), 0.0f));
+        state_cols.push_back(ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, st_width, nb*(block - n_out)), 0.0f));
     }
     // Balanced binary-tree concat eliminates O(k^2) row copies across draft steps
     const auto concat_tree = [&](std::vector<ggml_tensor *> & parts) -> ggml_tensor * {
@@ -1218,8 +1293,6 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
         }
         return parts[0];
     };
-    auto * states = concat_tree(state_cols);
-    auto * logits = concat_tree(logit_cols);
     const auto block_order = [&](ggml_tensor * t, int64_t n) {
         if (nb == 1) {
             return t;
@@ -1227,9 +1300,20 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
         t = ggml_reshape_3d(ctx0, t, t->ne[0], nb, n);
         return ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, t, 0, 2, 1, 3)), t->ne[0], nb*n);
     };
-    res->t_h_nextn = block_order(states, block);
+    auto * states = block_order(concat_tree(state_cols), block);
+    res->t_h_nextn = ggml_pad(ctx0, states, n_embd - st_width, 0, 0, 0);
     cb(res->t_h_nextn, "dspark_chain_state", -1);
     ggml_build_forward_expand(gf, res->t_h_nextn);
-    logits = block_order(logits, n_out);
-    res->t_logits = (chained_prob || use_factored) ? logits : ggml_cont(ctx0, ggml_view_2d(ctx0, logits, n_vocab_out, nb*n_out, logits->nb[1], 0));
+    if (chained_prob) {
+        // Batch all draft-step softmaxes into ONE parallel MUL_SOFT_MAX pass after the chained loop
+        auto * all_valid = concat_tree(logit_cols);
+        auto * inv_3d    = ggml_view_3d(ctx0, sample_cfg, 1, n_draft, nb, 2*sizeof(float), sample_cfg->nb[1], 0);
+        auto * all_inv_t = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, inv_3d, 0, 2, 1, 3)), 1, n_draft * nb);
+        auto * all_probs = ggml_soft_max(ctx0, ggml_mul(ctx0, all_valid, all_inv_t));
+        auto * anchor_logits = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_vocab_out, nb), 0.0f);
+        res->t_logits = block_order(ggml_concat(ctx0, anchor_logits, all_probs, 1), n_out);
+    } else {
+        auto * logits = block_order(concat_tree(logit_cols), n_out);
+        res->t_logits = use_factored ? logits : ggml_cont(ctx0, ggml_view_2d(ctx0, logits, n_vocab_out, nb*n_out, logits->nb[1], 0));
+    }
 }

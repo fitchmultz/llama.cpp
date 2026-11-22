@@ -62,6 +62,8 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_L2_CLIP_FWHT_SET_ROWS, // L2_CLIP + RESHAPE + FWHT + RESHAPE + VIEW + [RESHAPE] + SET_ROWS(q8_0) (K head)
     GGML_METAL_FUSION_RMS_NORM_FWHT_SET_ROWS,// RMS_NORM + RESHAPE + FWHT + RESHAPE + VIEW + [RESHAPE] + SET_ROWS(q8_0) (V head)
     GGML_METAL_FUSION_FWHT_MUL_SIGMOID,      // FWHT + RESHAPE + SIGMOID + MUL (kqv_out gate)
+    GGML_METAL_FUSION_DSPARK_MARKOV_GRU,     // GET_ROWS(w1) + CONCAT + MUL_MAT(W_se) + ADD(static_proj) + GRU update & latent
+    GGML_METAL_FUSION_DSPARK_MARKOV_LOGITS,  // MUL_MAT(markov_lm Q4_0) + ADD(base) + SOFTCAP + ARGMAX(gumbel)
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp

@@ -2842,6 +2842,28 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_loop_control_mm(
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dspark_markov_gru(ggml_metal_library_t lib) {
+    const char * name = "kernel_dspark_markov_gru_bf16_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dspark_markov_logits(ggml_metal_library_t lib) {
+    const char * name = "kernel_dspark_markov_logits_q4_0_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_full(ggml_metal_library_t lib, bool is_set_rows, bool has_dyn, bool has_add, bool has_moe_reduce) {
     const char * name;
     if (has_moe_reduce) {

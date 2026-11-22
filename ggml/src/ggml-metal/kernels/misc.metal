@@ -1,4 +1,5 @@
 #include "common.h"
+#include "dequantize.h"
 
 kernel void kernel_argmax_f32(
         constant ggml_metal_kargs_argmax & args,
@@ -412,6 +413,215 @@ kernel void kernel_argmax_final_first_f32(
 
     if (tpitg.x == 0) {
         ((device int32_t *) dst)[row] = arg_val;
+    }
+}
+
+#if defined(GGML_METAL_HAS_BF16)
+// Fused DSpark Markov GRU step:
+//   emb = w1[prev], se = [state_in, emb], joint = W_se @ se + static_proj,
+//   gate = sigmoid(joint[0..R)), cand = tanh(joint[R..2R)),
+//   state_out = cand + gate * (state_in - cand), latent_out = tanh(joint[2R..3R))
+kernel void kernel_dspark_markov_gru_bf16_f32(
+        constant ggml_metal_kargs_dspark_markov_gru & args,
+        device   const char * w1,
+        device   const char * prev,
+        device   const char * state_in,
+        device   const char * w_se,
+        device   const char * static_proj,
+        device         char * state_out,
+        device         char * latent_out,
+        threadgroup    char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const int R     = args.rank;
+    const int R4    = R >> 2;
+    const int K4    = R >> 1; // (2 * R) / 4
+    const int b     = (int) tgpig.y;
+    const int tiitg = sgitg * 32 + tiisg;
+
+    const int32_t tok = ((device const int32_t *) prev)[b];
+
+    device const float4  * s_in4 = (device const float4  *) (state_in + (uint64_t) b * args.nb_s1);
+    device const bfloat4 * w1_4  = (device const bfloat4 *) (w1       + (uint64_t) tok * args.nb_w1_1);
+
+    threadgroup float  * s_se  = (threadgroup float  *) shmem;
+    threadgroup float4 * s_se4 = (threadgroup float4 *) shmem;
+
+    for (int i4 = tiitg; i4 < R4; i4 += 128) {
+        s_se4[i4]      = s_in4[i4];
+        s_se4[R4 + i4] = float4(w1_4[i4]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int r = (int) tgpig.x * 4 + sgitg;
+    if (r >= R) {
+        return;
+    }
+
+    device const bfloat4 * wg = (device const bfloat4 *) (w_se + (uint64_t) (r        ) * args.nb_wse1);
+    device const bfloat4 * wc = (device const bfloat4 *) (w_se + (uint64_t) (r +     R) * args.nb_wse1);
+    device const bfloat4 * wl = (device const bfloat4 *) (w_se + (uint64_t) (r + 2 * R) * args.nb_wse1);
+
+    float acc_g = 0.0f;
+    float acc_c = 0.0f;
+    float acc_l = 0.0f;
+
+    for (int k4 = tiisg; k4 < K4; k4 += 32) {
+        const float4 x = s_se4[k4];
+        acc_g += dot(float4(wg[k4]), x);
+        acc_c += dot(float4(wc[k4]), x);
+        acc_l += dot(float4(wl[k4]), x);
+    }
+
+    acc_g = simd_sum(acc_g);
+    acc_c = simd_sum(acc_c);
+    acc_l = simd_sum(acc_l);
+
+    if (tiisg == 0) {
+        device const float * sp = (device const float *) (static_proj + (uint64_t) b * args.nb_sp1);
+        device       float * so = (device       float *) (state_out   + (uint64_t) b * args.nb_so1);
+        device       float * lo = (device       float *) (latent_out  + (uint64_t) b * args.nb_lo1);
+
+        const float g_val = 1.0f / (1.0f + exp(-(acc_g + sp[r])));
+        const float c_val = precise::tanh(acc_c + sp[r + R]);
+        so[r] = c_val + g_val * (s_se[r] - c_val);
+        lo[r] = precise::tanh(acc_l + sp[r + 2 * R]);
+    }
+}
+#endif
+
+static inline float dspark_q4_0_block_dot(
+        device const block_q4_0 * qb,
+        threadgroup const float * sy,
+        float sumy_neg8) {
+    device const uint16_t * qs = ((device const uint16_t *) qb) + 1;
+    float acc0 = sumy_neg8;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    FOR_UNROLL (int j = 0; j < 8; ++j) {
+        const uint16_t q = qs[j];
+        acc0 += sy[2 * j + 0]      * (q & 0x000Fu);
+        acc1 += sy[2 * j + 1]      * (q & 0x0F00u);
+        acc2 += sy[16 + 2 * j + 0] * (q & 0x00F0u);
+        acc3 += sy[16 + 2 * j + 1] * (q & 0xF000u);
+    }
+    return float(qb->d) * ((acc0 + acc1) + (acc2 + acc3));
+}
+
+// Fused DSpark rank-256 Q4_0 Markov logits + base add + softcap + Gumbel argmax-part.
+// 100% simdgroup utilization (8 blocks split across 4 lanes x 8 rows/simdgroup) with latent cached in 1 KB shmem.
+kernel void kernel_dspark_markov_logits_q4_0_f32(
+        constant ggml_metal_kargs_dspark_markov_logits & args,
+        device   const char * markov_lm,
+        device   const char * latent,
+        device   const char * base_i,
+        device   const char * step_ctrl,
+        device         char * valid_out,
+        device         char * tmp,
+        threadgroup    char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        uint3  tpitg [[thread_position_in_threadgroup]],
+        uint   sgitg [[simdgroup_index_in_threadgroup]],
+        uint   tiisg [[thread_index_in_simdgroup]]) {
+    const int row   = (int) tgpig.y;
+    const int part  = (int) tgpig.x;
+    const int ne01  = args.ne01;
+    const int npart = args.npart;
+    const int chunk = (ne01 + npart - 1) / npart;
+    const int start = part * chunk;
+    const int end   = min(start + chunk, ne01);
+
+    threadgroup float   * s_y           = (threadgroup float   *) shmem;
+    threadgroup float   * s_sumy        = s_y + 256;
+    threadgroup float   * shared_maxval = s_sumy + 8;
+    threadgroup int32_t * shared_argmax = (threadgroup int32_t *) (shared_maxval + N_SIMDWIDTH);
+
+    // 8 simdgroups x 32 lanes = 256 elements = 8 Q4_0 blocks of latent
+    device const float * y_row = (device const float *) (latent + (uint64_t) row * args.nb_y1);
+    const float yv   = y_row[sgitg * 32 + tiisg];
+    const float bsum = simd_sum(yv);
+    if (tiisg == 0) {
+        s_sumy[sgitg] = -8.0f * bsum;
+    }
+    const float sc = (tiisg < 16)
+        ? ((tiisg & 1) == 0 ? 1.0f : (1.0f / 256.0f))
+        : ((tiisg & 1) == 0 ? (1.0f / 16.0f) : (1.0f / 4096.0f));
+    s_y[sgitg * 32 + tiisg] = yv * sc;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device const float * base_row  = (device const float *) (base_i    + (uint64_t) row * args.nb_b1);
+    device       float * valid_row = (device       float *) (valid_out + (uint64_t) row * args.nb_v1);
+    device const float * ctrl      = (device const float *) (step_ctrl + (uint64_t) row * args.nb_c1);
+    const float    inv_temp = ctrl[0];
+    const uint32_t seed     = as_type<uint32_t>(ctrl[1]);
+
+    const int lane_grp = (int) (tiisg >> 2); // 0..7 rows per simdgroup
+    const int lane_k   = (int) (tiisg & 3);  // 0..3 (2 Q4_0 blocks per lane)
+    const int ib0      = lane_k * 2;
+    const int ib1      = ib0 + 1;
+    const int row_off  = (int) sgitg * 8 + lane_grp;
+
+    const float sumy0 = s_sumy[ib0];
+    const float sumy1 = s_sumy[ib1];
+    threadgroup const float * sy0 = s_y + ib0 * 32;
+    threadgroup const float * sy1 = s_y + ib1 * 32;
+
+    float   lmax = -INFINITY;
+    int32_t larg = INT_MAX;
+
+    for (int r = start + row_off; r < end; r += 64) {
+        device const block_q4_0 * qb = (device const block_q4_0 *) (markov_lm + (uint64_t) r * args.nb_lm1);
+        float partial = dspark_q4_0_block_dot(qb + ib0, sy0, sumy0) +
+                        dspark_q4_0_block_dot(qb + ib1, sy1, sumy1);
+        partial += simd_shuffle_xor(partial, 1);
+        partial += simd_shuffle_xor(partial, 2);
+
+        if (lane_k == 0) {
+            const float v = args.cap * precise::tanh((base_row[r] + partial) * args.inv_cap);
+            valid_row[r] = v;
+            const float val = inv_temp > 0.0f ? (v * inv_temp + gumbel_noise_f32(seed, (uint32_t) r)) : v;
+            if (val > lmax || (val == lmax && r < larg)) {
+                lmax = val;
+                larg = r;
+            }
+        }
+    }
+
+    float   max_val = simd_max(lmax);
+    int32_t arg_val = simd_min(select(INT_MAX, larg, lmax == max_val));
+
+    if (sgitg == 0) {
+        shared_maxval[tiisg] = -INFINITY;
+        shared_argmax[tiisg] = INT_MAX;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shared_maxval[sgitg] = max_val;
+        shared_argmax[sgitg] = arg_val;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0) {
+        max_val = shared_maxval[tiisg];
+        arg_val = shared_argmax[tiisg];
+
+        float   max_val_reduced = simd_max(max_val);
+        int32_t arg_val_reduced = simd_min(select(INT_MAX, arg_val, max_val == max_val_reduced));
+
+        if (tpitg.x == 0) {
+            device float   * tmp_max = (device float   *) tmp;
+            device int32_t * tmp_arg = (device int32_t *) tmp + npart * args.nb;
+
+            tmp_max[row * npart + part] = max_val_reduced;
+            tmp_arg[row * npart + part] = arg_val_reduced;
+        }
     }
 }
 
