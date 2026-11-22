@@ -195,6 +195,9 @@ private: // disallow accessing these members directly, risking out-of-sync
     // set_token() drops the entries after the change, the next append brings them back
     std::vector<prefix_hash> hashes;
 
+    // minimum untouched prefix length since last sync_text_tokens() call
+    mutable size_t synced_min_valid = 0;
+
     void update_hashes();
 
 public:
@@ -252,6 +255,8 @@ public:
 
     llama_tokens get_text_tokens() const;
 
+    void sync_text_tokens(llama_tokens & dst, size_t & synced_raw_len) const;
+
     std::vector<char> serialize() const;
     static server_tokens deserialize(const llama_tokens & packed, bool has_mtmd);
 
@@ -266,6 +271,7 @@ public:
         map_idx_to_media.clear();
         tokens.clear();
         hashes.clear();
+        synced_min_valid = 0;
     }
 
     void keep_first(size_t n);

@@ -426,7 +426,33 @@ struct common_params_speculative {
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        if (!needs_rs_seq) {
+            return 0u;
+        }
+
+        uint32_t res = (uint32_t) std::max(0, draft.n_max);
+        for (const auto t : types) {
+            switch (t) {
+                case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+                    res = std::max<uint32_t>(res, ngram_simple.size_m);
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+                    res = std::max<uint32_t>(res, ngram_map_k.size_m);
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+                    res = std::max<uint32_t>(res, ngram_map_k4v.size_m);
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+                    res = std::max<uint32_t>(res, (uint32_t) std::max(0, ngram_mod.n_max));
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+                    res = std::max<uint32_t>(res, 8u);
+                    break;
+                default:
+                    break;
+            }
+        }
+        return res;
     }
 };
 

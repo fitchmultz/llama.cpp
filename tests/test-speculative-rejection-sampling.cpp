@@ -270,6 +270,113 @@ static int check_rejection_distribution(
     return ok ? 0 : 1;
 }
 
+static int check_deterministic_sample_and_accept_distribution(
+        const llama_model * model_tgt,
+        llama_context     * ctx_tgt,
+        common_params_sampling sampling,
+        bool                grammar_first_ref,
+        bool                grammar_first_test,
+        int                 n_trials,
+        const char        * label) {
+    common_sampler_ptr smpl_ref(common_sampler_init(model_tgt, sampling));
+    if (!smpl_ref) {
+        LOG_ERR("%s: failed to initialize reference sampler\n", label);
+        return 1;
+    }
+
+    common_sampler_sample(smpl_ref.get(), ctx_tgt, -1, grammar_first_ref);
+    const llama_token_data_array * dist_tgt = common_sampler_get_candidates(smpl_ref.get(), true);
+
+    common_sampler_ptr smpl_verify(common_sampler_init(model_tgt, sampling));
+    if (!smpl_verify) {
+        LOG_ERR("%s: failed to initialize verification sampler\n", label);
+        return 1;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model_tgt);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+
+    std::vector<llama_token> hot_tokens;
+    for (size_t i = 0; i < std::min<size_t>(dist_tgt->size, 16); ++i) {
+        if (dist_tgt->data[i].p > 0.0f) {
+            hot_tokens.push_back(dist_tgt->data[i].id);
+        }
+    }
+
+    std::mt19937 rng(42);
+    std::unordered_map<llama_token, int> token_counts;
+
+    for (int trial = 0; trial < n_trials; ++trial) {
+        llama_token tok_draft = ((trial & 1) == 0 && !hot_tokens.empty())
+            ? hot_tokens[(size_t) (rng() % hot_tokens.size())]
+            : (llama_token) (rng() % (uint32_t) n_vocab);
+
+        const std::vector<int> idxs = { -1, -1 };
+        const llama_tokens draft    = { tok_draft };
+
+        const auto accepted = common_sampler_sample_and_accept_n(
+                smpl_verify.get(), ctx_tgt, idxs, draft, grammar_first_test);
+        if (accepted.empty()) {
+            LOG_ERR("%s: trial %d returned empty result\n", label, trial);
+            return 1;
+        }
+        token_counts[accepted[0]]++;
+        common_sampler_reset(smpl_verify.get());
+    }
+
+    bool ok = true;
+    size_t covered = 0;
+    float tail_p_tgt = 0.0f;
+    int   tail_count = 0;
+
+    LOG("\n[%s] target vs empirical (%d trials):\n", label, n_trials);
+    for (size_t i = 0; i < dist_tgt->size; ++i) {
+        const llama_token id = dist_tgt->data[i].id;
+        const float p_t = dist_tgt->data[i].p;
+        const auto it = token_counts.find(id);
+        const int cnt = it == token_counts.end() ? 0 : it->second;
+        covered += cnt;
+
+        if (p_t <= 0.01f) {
+            tail_p_tgt += p_t;
+            tail_count += cnt;
+            continue;
+        }
+
+        const float p_e  = (float) cnt / n_trials;
+        const float diff = std::fabs(p_t - p_e);
+        const float tolerance = 6.0f * std::sqrt(p_t * (1.0f - p_t) / n_trials);
+
+        LOG("token %6d: target = %f, empirical = %f, diff = %f, tol = %f\n", id, p_t, p_e, diff, tolerance);
+
+        if (diff > tolerance) {
+            LOG_ERR("[%s] token %d: empirical probability %f too far from target %f (diff %f > tol %f)\n",
+                    label, id, p_e, p_t, diff, tolerance);
+            ok = false;
+        }
+    }
+
+    if (tail_p_tgt > 0.0f) {
+        const float tail_p_e  = (float) tail_count / n_trials;
+        const float tail_diff = std::fabs(tail_p_tgt - tail_p_e);
+        const float tail_tol  = 6.0f * std::sqrt(tail_p_tgt * (1.0f - tail_p_tgt) / n_trials);
+        LOG("tail  bucket: target = %f, empirical = %f, diff = %f, tol = %f\n", tail_p_tgt, tail_p_e, tail_diff, tail_tol);
+        if (tail_diff > tail_tol) {
+            LOG_ERR("[%s] tail bucket: empirical probability %f too far from target %f (diff %f > tol %f)\n",
+                    label, tail_p_e, tail_p_tgt, tail_diff, tail_tol);
+            ok = false;
+        }
+    }
+
+    if (covered != (size_t) n_trials) {
+        LOG_ERR("[%s] %zu of %d trials produced a token outside dist_tgt's candidates\n",
+                label, (size_t) n_trials - covered, n_trials);
+        ok = false;
+    }
+
+    return ok ? 0 : 1;
+}
+
 static int test_speculative_rejection_sampling(common_params & params, int n_trials) {
     params.sampling.backend_sampling = false;
     auto llama_init = common_init_from_params(params);
@@ -322,6 +429,16 @@ static int test_speculative_rejection_sampling(common_params & params, int n_tri
     }
 
     if (check_rejection_distribution(model_tgt, ctx_tgt, sampling_grmr, true, false, true, true, n_trials, "grammar-masked-pruned-f32") != 0) {
+        return 1;
+    }
+
+    // Fast-softmax deterministic sample-and-accept (used by ngram-simple + DSpark hybrid):
+    // verifies both unconstrained and grammar-masked paths preserve exact target probabilities.
+    if (check_deterministic_sample_and_accept_distribution(model_tgt, ctx_tgt, sampling, false, false, n_trials, "sample-and-accept-fast-softmax") != 0) {
+        return 1;
+    }
+
+    if (check_deterministic_sample_and_accept_distribution(model_tgt, ctx_tgt, sampling_grmr, true, false, n_trials, "sample-and-accept-fast-softmax-grammar") != 0) {
         return 1;
     }
 

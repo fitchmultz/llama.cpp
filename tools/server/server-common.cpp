@@ -795,9 +795,34 @@ llama_tokens server_tokens::get_text_tokens() const {
     return res;
 }
 
+void server_tokens::sync_text_tokens(llama_tokens & dst, size_t & synced_raw_len) const {
+    if (synced_raw_len == 0 || synced_raw_len > synced_min_valid || synced_raw_len > tokens.size()) {
+        dst.clear();
+        dst.reserve(tokens.size());
+        for (llama_token t : tokens) {
+            if (t != LLAMA_TOKEN_NULL) {
+                dst.push_back(t);
+            }
+        }
+        synced_raw_len   = tokens.size();
+        synced_min_valid = tokens.size();
+        return;
+    }
+    for (size_t i = synced_raw_len; i < tokens.size(); ++i) {
+        if (tokens[i] != LLAMA_TOKEN_NULL) {
+            dst.push_back(tokens[i]);
+        }
+    }
+    synced_raw_len   = tokens.size();
+    synced_min_valid = tokens.size();
+}
+
 void server_tokens::set_token(llama_pos pos, llama_token id) {
     GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
     tokens[pos] = id;
+    if ((size_t) pos < synced_min_valid) {
+        synced_min_valid = (size_t) pos;
+    }
     hashes.resize(std::min(hashes.size(), (size_t) pos / hash_block_size));
 }
 
@@ -832,6 +857,9 @@ void server_tokens::keep_first(size_t n) {
         }
     }
     tokens.resize(n);
+    if (n < synced_min_valid) {
+        synced_min_valid = n;
+    }
     hashes.resize(std::min(hashes.size(), n / hash_block_size));
 }
 

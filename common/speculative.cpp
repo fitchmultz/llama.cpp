@@ -1478,7 +1478,8 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             if (sample_from_anchor || causal_attn) {
                 throw std::runtime_error("Inkling2 DSpark requires a noncausal block with an anchor");
             }
-            context_rows = (size_t) block_size + 1;
+            const int32_t max_draft = std::max<int32_t>(block_size, common_speculative_n_max(&params));
+            context_rows = (size_t) max_draft + 2;
             const size_t slots = (size_t) n_seq * context_rows;
             context_embd.resize(slots * (size_t) n_embd_dec);
             context_pos.assign(slots, -1);
@@ -1520,7 +1521,7 @@ protected:
         const float * projected = llama_get_embeddings_nextn(params.ctx_dft);
         if (projected) {
             const size_t seq_offset = (size_t) seq_id * context_rows;
-            const llama_pos pos_min = std::max(0, batch_inject.tokens[row_beg + n_chunk - 1].pos[0] - block_size);
+            const llama_pos pos_min = std::max<llama_pos>(0, batch_inject.tokens[row_beg + n_chunk - 1].pos[0] - (llama_pos) (context_rows - 1));
             for (int32_t i = 0; i < n_chunk; ++i) {
                 const llama_pos pos = batch_inject.tokens[row_beg + i].pos[0];
                 if (pos < pos_min) {
@@ -2678,25 +2679,110 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
 // state of self-speculation (simple implementation, not ngram-map)
 struct common_speculative_impl_ngram_simple : public common_speculative_impl {
+    static constexpr size_t HT_BITS    = 16;
+    static constexpr size_t HT_BUCKETS = 1u << HT_BITS;
+    static constexpr size_t HT_MASK    = HT_BUCKETS - 1u;
+    static constexpr size_t HT_WAYS    = 4;
+
+    struct ht_bucket {
+        uint32_t pos[HT_WAYS] = {}; // 1-based start index (0 = empty), newest in pos[0]
+    };
+
+    struct seq_state {
+        std::vector<ht_bucket> table;
+        size_t      indexed_len = 0;
+        llama_token tail_tok    = LLAMA_TOKEN_NULL;
+        int32_t     cooldown    = 0;
+        bool        escalated   = false; // probe at 15 (N=16) first, escalate to full m on verified match
+    };
+
     common_params_speculative_ngram_map params;
 
     // shared across all sequences
     common_ngram_simple_config config;
 
+    // when paired with a neural draft model, defer concurrent multi-slot steps to the neural
+    // drafter so non-unified KV caches keep all active slots synchronized in one verify pass
+    bool has_fallback_draft = false;
+
+    std::vector<seq_state> states;
+
     common_speculative_impl_ngram_simple(
             const common_params_speculative & params, uint32_t n_seq,
-            common_ngram_simple_config config)
+            common_ngram_simple_config config,
+            bool has_fallback_draft = false)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE, n_seq, params.ngram_simple.size_m)
         , params(params.ngram_simple)
         , config(config)
+        , has_fallback_draft(has_fallback_draft)
+        , states(n_seq)
     {
         SPC_TRC("%s", "adding speculative implementation 'ngram-simple'\n");
-        SPC_TRC("- size_n=%d, size_m=%d, min_hits=%d\n",
-                this->params.size_n, this->params.size_m, this->params.min_hits);
+        SPC_TRC("- size_n=%d, size_m=%d, min_hits=%d, has_fallback_draft=%d\n",
+                this->params.size_n, this->params.size_m, this->params.min_hits, (int) this->has_fallback_draft);
     }
 
-    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
-        // noop
+    static uint32_t hash_ngram(const llama_token * ptr, size_t n) {
+        uint64_t h = 0xcbf29ce484222325ULL;
+        for (size_t i = 0; i < n; ++i) {
+            h = (h ^ (uint64_t) (uint32_t) ptr[i]) * 0x100000001b3ULL;
+        }
+        h ^= h >> 33;
+        h *= 0xff51afd7ed558ccdULL;
+        h ^= h >> 33;
+        return (uint32_t) (h & HT_MASK);
+    }
+
+    static void insert_pos(seq_state & st, const llama_token * data, size_t j, size_t n) {
+        const uint32_t h = hash_ngram(data + j, n);
+        auto & b = st.table[h];
+        const uint32_t enc = (uint32_t) (j + 1);
+        b.pos[3] = b.pos[2];
+        b.pos[2] = b.pos[1];
+        b.pos[1] = b.pos[0];
+        b.pos[0] = enc;
+    }
+
+    static void sync_index(seq_state & st, const llama_tokens & prompt, size_t n) {
+        if (n == 0 || prompt.size() >= (size_t) UINT32_MAX) {
+            return;
+        }
+        if (st.table.empty()) {
+            st.table.resize(HT_BUCKETS);
+        }
+        if (st.indexed_len > prompt.size() || (st.indexed_len > 0 && prompt[st.indexed_len - 1] != st.tail_tok)) {
+            std::fill(st.table.begin(), st.table.end(), ht_bucket{});
+            st.indexed_len = 0;
+            st.tail_tok    = LLAMA_TOKEN_NULL;
+        }
+        if (prompt.size() < n) {
+            st.indexed_len = prompt.size();
+            st.tail_tok    = prompt.empty() ? LLAMA_TOKEN_NULL : prompt.back();
+            return;
+        }
+        const size_t j_beg = (st.indexed_len >= n) ? (st.indexed_len - n + 1) : 0;
+        const size_t j_end = prompt.size() - n;
+        const llama_token * data = prompt.data();
+        for (size_t j = j_beg; j <= j_end; ++j) {
+            insert_pos(st, data, j, n);
+        }
+        st.indexed_len = prompt.size();
+        st.tail_tok    = prompt.back();
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        auto & st = states[seq_id];
+        if (!st.table.empty()) {
+            std::fill(st.table.begin(), st.table.end(), ht_bucket{});
+        }
+        st.indexed_len = 0;
+        st.tail_tok    = LLAMA_TOKEN_NULL;
+        st.cooldown    = 0;
+        st.escalated   = false;
+        sync_index(st, prompt, config.size_ngram);
     }
 
     bool process(const common_batch & /*batch*/) override {
@@ -2707,18 +2793,115 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         assert(dparams.size() == n_seq);
 
+        if (has_fallback_draft) {
+            int32_t n_active = 0;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (dparams[seq_id].drafting) {
+                    ++n_active;
+                }
+            }
+            if (n_active >= 2) {
+                return;
+            }
+        }
+
+        const size_t n = config.size_ngram;
+        const size_t m = config.size_mgram;
+        if (n == 0 || m == 0) {
+            return;
+        }
+
+        llama_token pat_stack[64];
+        std::vector<llama_token> pat_heap;
+        llama_token * pat = (n <= 64) ? pat_stack : nullptr;
+        if (!pat) {
+            pat_heap.resize(n);
+            pat = pat_heap.data();
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
                 continue;
             }
 
-            *dp.result = common_ngram_simple_draft(config, *dp.prompt, dp.id_last);
+            const auto & prompt = *dp.prompt;
+            const size_t cur_len = prompt.size();
+            if (cur_len < n + 1 || cur_len >= (size_t) UINT32_MAX) {
+                continue;
+            }
+
+            auto & st = states[seq_id];
+            sync_index(st, prompt, n);
+
+            if (has_fallback_draft && st.cooldown > 0) {
+                --st.cooldown;
+                continue;
+            }
+
+            const llama_token * data = prompt.data();
+            if (n > 1) {
+                std::memcpy(pat, data + (cur_len - n + 1), (n - 1) * sizeof(llama_token));
+            }
+            pat[n - 1] = dp.id_last;
+
+            const uint32_t h = hash_ngram(pat, n);
+            const auto & b = st.table[h];
+
+            const size_t min_copy = has_fallback_draft ? std::max<size_t>(n, 8) : n;
+
+            for (size_t w = 0; w < HT_WAYS; ++w) {
+                if (b.pos[w] == 0) {
+                    break;
+                }
+                const size_t j = (size_t) (b.pos[w] - 1);
+                if (j + n >= cur_len) {
+                    continue;
+                }
+                if (std::memcmp(data + j, pat, n * sizeof(llama_token)) != 0) {
+                    continue;
+                }
+                // In hybrid mode, probe at 15 tokens (N=16, exact rt=2 MMA tile) first and escalate
+                // to full m (e.g. 23/31/47) only once a suffix match proves high acceptance.
+                // Quantize draft length to {15, m} so the target compute graph is reused without churn.
+                const size_t target_m = (has_fallback_draft && m > 15 && !st.escalated) ? 15 : m;
+                size_t copy_max = std::min(target_m, cur_len - (j + n));
+                if (dp.n_max > 0) {
+                    copy_max = std::min<size_t>(copy_max, (size_t) dp.n_max);
+                }
+                if (copy_max < min_copy) {
+                    continue;
+                }
+                if (has_fallback_draft && copy_max < target_m && (dp.n_max <= 0 || copy_max < (size_t) dp.n_max)) {
+                    if (target_m > 15 && copy_max >= 15) {
+                        copy_max = 15;
+                    } else {
+                        continue;
+                    }
+                }
+                dp.result->assign(data + j + n, data + j + n + copy_max);
+                break;
+            }
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
-        // noop
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        if (!has_fallback_draft || seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        auto & st = states[seq_id];
+        if (is_other) {
+            st.escalated = false;
+            return;
+        }
+        if (n_accepted >= 12) {
+            st.escalated = true;
+        } else {
+            st.escalated = false;
+            if (n_accepted <= 2) {
+                st.cooldown = 4;
+            }
+        }
     }
 
     bool need_prompt() const override { return true; }
@@ -3666,9 +3849,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                     /* .size_mgram = */ mgram_size_value
                 };
                 auto state = std::make_unique<common_speculative_impl_ngram_simple>(
-                    /* .params = */ config.params,
-                    /* .n_seq  = */ n_seq,
-                    /* .state  = */ config_simple
+                    /* .params             = */ config.params,
+                    /* .n_seq              = */ n_seq,
+                    /* .state              = */ config_simple,
+                    /* .has_fallback_draft = */ config.params.draft.ctx_dft != nullptr
                 );
                 impls.push_back(std::move(state));
                 break;

@@ -796,6 +796,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 }
 
 static bool grammar_allows_token(struct llama_sampler * grmr, llama_token id);
+static bool compute_exp_sum_contig(const float * logits, int n_vocab, float temp, std::vector<float> & p_out, float & sum_out);
+static llama_token sample_from_probs_contig(const float * p, int n_vocab, std::mt19937 & rng, double total_mass = 1.0);
+static bool can_use_fast_softmax(const common_sampler * gsmpl, llama_context * ctx, int idx, bool grammar_first);
 
 #if defined(__APPLE__)
 static size_t apple_pcore_count() {
@@ -854,6 +857,92 @@ static llama_token try_fast_greedy_argmax(struct common_sampler * gsmpl, struct 
     return best_id;
 }
 
+static void apply_grammar_mask_contig(struct common_sampler * gsmpl, const float * logits_raw, int n_vocab) {
+    auto & cand = gsmpl->cand_grmr;
+    cand.resize((size_t) n_vocab);
+#if defined(__APPLE__)
+    if (n_vocab >= 32768) {
+        const size_t n_chunks = apple_pcore_count();
+        const size_t chunk_sz = ((size_t) n_vocab + n_chunks - 1) / n_chunks;
+        struct init_ctx {
+            llama_token_data * cand;
+            const float      * logits;
+            size_t             n_total;
+            size_t             chunk_sz;
+        } ictx = { cand.data(), logits_raw, (size_t) n_vocab, chunk_sz };
+        dispatch_apply_f(n_chunks, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &ictx, [](void * ptr, size_t c) {
+            const auto * ctx = (const init_ctx *) ptr;
+            const size_t beg = c * ctx->chunk_sz;
+            const size_t end = std::min(beg + ctx->chunk_sz, ctx->n_total);
+            for (size_t k = beg; k < end; ++k) {
+                ctx->cand[k] = { (llama_token) k, ctx->logits[k], 0.0f };
+            }
+        });
+    } else
+#endif
+    {
+        for (int k = 0; k < n_vocab; ++k) {
+            cand[k] = { (llama_token) k, logits_raw[k], 0.0f };
+        }
+    }
+    llama_token_data_array arr = { cand.data(), cand.size(), -1, false };
+    llama_sampler_apply(gsmpl->grmr, &arr);
+}
+
+static llama_token try_fast_softmax_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first, int n_vocab, bool & grammar_rejected) {
+    grammar_rejected = false;
+    if (!can_use_fast_softmax(gsmpl, ctx, idx, grammar_first) || n_vocab <= 0) {
+        return LLAMA_TOKEN_NULL;
+    }
+    const auto tm = gsmpl->tm();
+    const float * logits_raw = llama_get_logits_ith(ctx, idx);
+    float exp_sum = 0.0f;
+    if (!compute_exp_sum_contig(logits_raw, n_vocab, gsmpl->params.temp, gsmpl->p_buf, exp_sum)) {
+        return LLAMA_TOKEN_NULL;
+    }
+    const float * p_exp = gsmpl->p_buf.data();
+    const llama_token cand_id = sample_from_probs_contig(p_exp, n_vocab, gsmpl->rng, (double) exp_sum);
+    if (!grammar_should_apply(gsmpl) || grammar_allows_token(gsmpl->grmr, cand_id)) {
+        return cand_id;
+    }
+
+    // Grammar rejected the unmasked draw: reuse p_exp over grammar-valid tokens directly
+    // with gsmpl->rng to preserve exact p_V without rebuilding the full sampler chain.
+    apply_grammar_mask_contig(gsmpl, logits_raw, n_vocab);
+    const auto & cand = gsmpl->cand_grmr;
+    double p_sum = 0.0;
+    llama_token last_valid = LLAMA_TOKEN_NULL;
+    for (int k = 0; k < n_vocab; ++k) {
+        if (cand[k].logit != -INFINITY) {
+            const float ek = p_exp[k];
+            if (ek > 0.0f) {
+                p_sum += (double) ek;
+                last_valid = (llama_token) k;
+            }
+        }
+    }
+    if (p_sum > 0.0 && last_valid != LLAMA_TOKEN_NULL) {
+        std::uniform_real_distribution<double> uni(0.0, 1.0);
+        double u = uni(gsmpl->rng) * p_sum;
+        for (int k = 0; k < n_vocab; ++k) {
+            if (cand[k].logit == -INFINITY) {
+                continue;
+            }
+            const float ek = p_exp[k];
+            if (ek > 0.0f) {
+                u -= (double) ek;
+                if (u <= 0.0) {
+                    return (llama_token) k;
+                }
+            }
+        }
+        return last_valid;
+    }
+
+    grammar_rejected = true;
+    return LLAMA_TOKEN_NULL;
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
@@ -868,8 +957,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     size_t i = 0;
     for (; i < draft.size(); i++) {
         llama_token id = try_fast_greedy_argmax(gsmpl, ctx, idxs[i], grammar_first, n_vocab);
+        bool grammar_rejected = false;
         if (id == LLAMA_TOKEN_NULL) {
-            id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+            id = try_fast_softmax_sample(gsmpl, ctx, idxs[i], grammar_first, n_vocab, grammar_rejected);
+        }
+        if (id == LLAMA_TOKEN_NULL) {
+            id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first || grammar_rejected);
         }
 
         common_sampler_accept(gsmpl, id, true);
@@ -885,8 +978,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
     if (i == draft.size()) {
         llama_token id = try_fast_greedy_argmax(gsmpl, ctx, idxs[i], grammar_first, n_vocab);
+        bool grammar_rejected = false;
         if (id == LLAMA_TOKEN_NULL) {
-            id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+            id = try_fast_softmax_sample(gsmpl, ctx, idxs[i], grammar_first, n_vocab, grammar_rejected);
+        }
+        if (id == LLAMA_TOKEN_NULL) {
+            id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first || grammar_rejected);
         }
 
         common_sampler_accept(gsmpl, id, true);
@@ -1273,7 +1370,7 @@ static bool compute_exp_sum_contig(const float * logits, int n_vocab, float temp
     return true;
 }
 
-static llama_token sample_from_probs_contig(const float * p, int n_vocab, std::mt19937 & rng, double total_mass = 1.0) {
+static llama_token sample_from_probs_contig(const float * p, int n_vocab, std::mt19937 & rng, double total_mass) {
     std::uniform_real_distribution<double> uni(0.0, 1.0);
     double u = uni(rng) * total_mass;
     llama_token last_pos = n_vocab - 1;
@@ -1516,34 +1613,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(
             // Slow path: mask full vocabulary once and compute exact renormalized p_V directly from p_exp
             {
                 const auto tm = gsmpl->tm();
-                cand.resize((size_t) n_vocab);
-#if defined(__APPLE__)
-                if (n_vocab >= 32768) {
-                    const size_t n_chunks = apple_pcore_count();
-                    const size_t chunk_sz = ((size_t) n_vocab + n_chunks - 1) / n_chunks;
-                    struct init_ctx {
-                        llama_token_data * cand;
-                        const float      * logits;
-                        size_t             n_total;
-                        size_t             chunk_sz;
-                    } ictx = { cand.data(), logits_raw, (size_t) n_vocab, chunk_sz };
-                    dispatch_apply_f(n_chunks, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &ictx, [](void * ptr, size_t c) {
-                        const auto * ctx = (const init_ctx *) ptr;
-                        const size_t beg = c * ctx->chunk_sz;
-                        const size_t end = std::min(beg + ctx->chunk_sz, ctx->n_total);
-                        for (size_t k = beg; k < end; ++k) {
-                            ctx->cand[k] = { (llama_token) k, ctx->logits[k], 0.0f };
-                        }
-                    });
-                } else
-#endif
-                {
-                    for (int k = 0; k < n_vocab; ++k) {
-                        cand[k] = { (llama_token) k, logits_raw[k], 0.0f };
-                    }
-                }
-                llama_token_data_array arr = { cand.data(), cand.size(), -1, false };
-                llama_sampler_apply(gsmpl->grmr, &arr);
+                apply_grammar_mask_contig(gsmpl, logits_raw, n_vocab);
             }
 
             float p_sum = 0.0f;
@@ -1763,20 +1833,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(
     }
 
     if (i == draft.size()) {
-        llama_token id = LLAMA_TOKEN_NULL;
-        if (can_use_fast_softmax(gsmpl, ctx, idxs[i], grammar_first)) {
-            const auto tm = gsmpl->tm();
-            const float * logits_raw = llama_get_logits_ith(ctx, idxs[i]);
-            float bonus_sum = 0.0f;
-            if (compute_exp_sum_contig(logits_raw, n_vocab, gsmpl->params.temp, gsmpl->p_buf, bonus_sum)) {
-                const llama_token cand_id = sample_from_probs_contig(gsmpl->p_buf.data(), n_vocab, gsmpl->rng, (double) bonus_sum);
-                if (!grammar_should_apply(gsmpl) || grammar_allows_token(gsmpl->grmr, cand_id)) {
-                    id = cand_id;
-                }
-            }
-        }
+        bool grammar_rejected = false;
+        llama_token id = try_fast_softmax_sample(gsmpl, ctx, idxs[i], grammar_first, n_vocab, grammar_rejected);
         if (id == LLAMA_TOKEN_NULL) {
-            id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first || grammar_should_apply(gsmpl));
+            id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first || grammar_rejected);
         }
 
         common_sampler_accept(gsmpl, id, true);

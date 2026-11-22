@@ -309,6 +309,7 @@ struct server_slot {
     std::vector<std::vector<float>> spec_draft_q_f32;
     std::vector<std::vector<float>> spec_draft_q_f32_pool;
     llama_tokens spec_prompt;
+    size_t       spec_prompt_raw_len = 0;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
@@ -459,6 +460,8 @@ struct server_slot {
             spec_draft_q_f32_pool.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
+            spec_prompt.clear();
+            spec_prompt_raw_len = 0;
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -3892,7 +3895,7 @@ private:
                         }
 
                         if (common_speculative_need_prompt(spec.get())) {
-                            slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                            slot.prompt.tokens.sync_text_tokens(slot.spec_prompt, slot.spec_prompt_raw_len);
                         }
 
                         const bool spec_reject = slot.use_spec_rejection();
@@ -4866,7 +4869,14 @@ private:
                 slot.state = SLOT_STATE_GENERATING;
 
                 if (slot.can_speculate()) {
-                    common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                    if (common_speculative_need_prompt(spec.get())) {
+                        slot.spec_prompt.clear();
+                        slot.spec_prompt_raw_len = 0;
+                        slot.prompt.tokens.sync_text_tokens(slot.spec_prompt, slot.spec_prompt_raw_len);
+                        common_speculative_begin(spec.get(), slot.id, slot.spec_prompt);
+                    } else {
+                        common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                    }
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;
