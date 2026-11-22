@@ -111,6 +111,7 @@ kernel void kernel_flash_attn_ext_vec_q8_0_gqa(
         device const char * rel,
         device const char * k_pos,
         device const char * q_pos,
+        device const char * rel_q,
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
@@ -204,8 +205,9 @@ kernel void kernel_flash_attn_ext_vec_q8_0_gqa(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Mask base (when H > 1, host guarantees ne32 == 1; when H == 1, handle arbitrary ne32)
-    device const char * pm_stream = mask + (uint64_t) (iq2_base % args.ne32) * args.nb32 + (uint64_t) (iq3 % args.ne33) * args.nb33;
-    device const char * rel_base  = rel  + (uint64_t) (iq3 % args.ne63) * args.nb63 + (uint64_t) iq2_base * args.nb61;
+    device const char * pm_stream  = mask  + (uint64_t) (iq2_base % args.ne32) * args.nb32 + (uint64_t) (iq3 % args.ne33) * args.nb33;
+    device const char * rel_base   = rel   + (uint64_t) (iq3 % args.ne63) * args.nb63 + (uint64_t) iq2_base * args.nb61;
+    device const char * rel_q_base = rel_q + (uint64_t) (iq3 % args.ne63) * args.nb63 + (uint64_t) iq2_base * args.nb61;
 
     const float scale_log2 = args.scale * LOG2E;
     const float scap_log2  = args.logit_softcap * LOG2E;
@@ -350,9 +352,16 @@ kernel void kernel_flash_attn_ext_vec_q8_0_gqa(
                 }
 
                 if (FC_flash_attn_ext_vec_has_banded && in_band) {
-                    device const float * pr_h = (device const float *) (
-                        rel_base + (uint64_t) iq1_q * args.nb62 + (uint64_t) hh * args.nb61);
-                    s += pr_h[rel_dist] * LOG2E;
+                    if (FC_flash_attn_ext_vec_has_rel_mm) {
+                        device const float4 * rq = (device const float4 *) (
+                            rel_q_base + (uint64_t) iq1_q * args.nb62 + (uint64_t) hh * args.nb61);
+                        device const float4 * rw = (device const float4 *) rel + (uint64_t) rel_dist * 4;
+                        s += (dot(rq[0], rw[0]) + dot(rq[1], rw[1]) + dot(rq[2], rw[2]) + dot(rq[3], rw[3])) * LOG2E;
+                    } else {
+                        device const float * pr_h = (device const float *) (
+                            rel_base + (uint64_t) iq1_q * args.nb62 + (uint64_t) hh * args.nb61);
+                        s += pr_h[rel_dist] * LOG2E;
+                    }
                 }
 
                 const float m_old = M[m_idx];

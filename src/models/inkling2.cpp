@@ -508,10 +508,34 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
             }
         }
 
+        const bool small_wave = (n_tokens <= 32);
+
         if (messages[0]) {
-            // the messages enter before the input norms, so SWA layers normalize three inputs
-            for (int j = 0; j < 3; ++j) {
-                inputs[j] = control(inputs[j], messages[j], layer, j);
+            if (small_wave) {
+                // Build all 3 independent loop controllers (Q, K, V) in lockstep waves on small
+                // decode/verify batches so down[0..2], ctrl[0..2], and norm[0..2] run concurrently.
+                ggml_tensor * lh[3];
+                for (int j = 0; j < 3; ++j) {
+                    ggml_tensor * h = ggml_concat(ctx0, ggml_reshape_3d(ctx0, inputs[j], n_embd, 1, n_tokens), ggml_reshape_3d(ctx0, messages[j], n_embd, 1, n_tokens), 1);
+                    h = ggml_reshape_2d(ctx0, ggml_rms_norm(ctx0, h, 1e-6f), 2*n_embd, n_tokens);
+                    lh[j] = build_lora_mm(layer.loop_down[j], h);
+                    ggml_build_forward_expand(gf, lh[j]);
+                }
+                for (int j = 0; j < 3; ++j) {
+                    ggml_tensor * g_lin = build_lora_mm(layer.loop_gain[j],   lh[j]);
+                    ggml_tensor * f_lin = build_lora_mm(layer.loop_forget[j], lh[j]);
+                    ggml_build_forward_expand(gf, g_lin);
+                    ggml_build_forward_expand(gf, f_lin);
+                    ggml_tensor * forget = ggml_tanh(ctx0, f_lin);
+                    ggml_tensor * gain   = ggml_tanh(ctx0, g_lin);
+                    inputs[j] = ggml_add(ctx0, ggml_mul(ctx0, ggml_scale_bias(ctx0, forget, -1.0f, 1.0f), inputs[j]), ggml_mul(ctx0, gain, messages[j]));
+                    ggml_build_forward_expand(gf, inputs[j]);
+                }
+            } else {
+                // the messages enter before the input norms, so SWA layers normalize three inputs
+                for (int j = 0; j < 3; ++j) {
+                    inputs[j] = control(inputs[j], messages[j], layer, j);
+                }
             }
             cb(inputs[0], "loop_q_inp", il);
         }
@@ -519,6 +543,9 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         if (is_swa && messages[0]) {
             for (int j = 0; j < 3; ++j) {
                 inputs[j] = build_norm(inputs[j], layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+                if (small_wave) {
+                    ggml_build_forward_expand(gf, inputs[j]);
+                }
             }
         } else if (is_swa) {
             inputs[0] = build_norm(inputs[0], layer.attn_norm, nullptr, LLM_NORM_RMS, il);
@@ -527,21 +554,47 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
             inputs[0] = build_norm(inputs[0], layer.attn_q_inp_norm, nullptr, LLM_NORM_RMS, il);
             inputs[1] = build_norm(inputs[1], layer.attn_k_inp_norm, nullptr, LLM_NORM_RMS, il);
             inputs[2] = build_norm(inputs[2], layer.attn_v_inp_norm, nullptr, LLM_NORM_RMS, il);
+            if (small_wave) {
+                ggml_build_forward_expand(gf, inputs[0]);
+                ggml_build_forward_expand(gf, inputs[1]);
+                ggml_build_forward_expand(gf, inputs[2]);
+            }
         }
 
         // self-attention
         {
-            ggml_tensor * Qcur = build_lora_mm(layer.wq, inputs[0]);
-            ggml_tensor * Kcur = convolve(build_lora_mm(layer.wk, inputs[1]), layer.attn_k_conv,
-                    is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0);
-            ggml_tensor * Vcur = convolve(build_lora_mm(layer.wv, inputs[2]), layer.attn_v_conv,
-                    is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa);
-            ggml_tensor * Rcur = build_lora_mm(layer.attn_rel, inputs[0]);
+            ggml_tensor * Qproj     = build_lora_mm(layer.wq, inputs[0]);
+            ggml_tensor * Kproj     = build_lora_mm(layer.wk, inputs[1]);
+            ggml_tensor * Vproj     = build_lora_mm(layer.wv, inputs[2]);
+            ggml_tensor * Rproj     = build_lora_mm(layer.attn_rel, inputs[0]);
+            ggml_tensor * Kconv_dyn = is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]);
+            ggml_tensor * Vconv_dyn = is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]);
+            ggml_tensor * sinks     = nullptr;
+            ggml_tensor * Gproj     = nullptr;
 
-            Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip);
+            if (small_wave) {
+                // Expand all independent attention linear projections together before convolve/clip
+                // on small decode/verify batches so the GPU schedules them concurrently in one wave.
+                sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
+                Gproj = build_lora_mm(layer.wqkv_gate, inputs[0]);
+
+                ggml_build_forward_expand(gf, Qproj);
+                ggml_build_forward_expand(gf, Kproj);
+                ggml_build_forward_expand(gf, Vproj);
+                ggml_build_forward_expand(gf, Rproj);
+                ggml_build_forward_expand(gf, sinks);
+                if (Kconv_dyn) { ggml_build_forward_expand(gf, Kconv_dyn); }
+                if (Vconv_dyn) { ggml_build_forward_expand(gf, Vconv_dyn); }
+                ggml_build_forward_expand(gf, Gproj);
+            }
+
+            ggml_tensor * Kcur = convolve(Kproj, layer.attn_k_conv, Kconv_dyn, state, history, recr, 0);
+            ggml_tensor * Vcur = convolve(Vproj, layer.attn_v_conv, Vconv_dyn, state, history, recr, n_embd_k_gqa);
+
+            ggml_tensor * Qcur = clip(ggml_reshape_3d(ctx0, Qproj, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip);
             Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           hparams.f_qk_clip);
             Vcur = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens), hparams.f_norm_rms_eps);
-            Rcur = clip(ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens), layer.attn_rel_clip, hparams.f_relative_clip);
+            ggml_tensor * Rcur = clip(ggml_reshape_3d(ctx0, Rproj, hparams.n_relative, n_head, n_tokens), layer.attn_rel_clip, hparams.f_relative_clip);
 
             if (!is_swa) {
                 Qcur = ggml_mul(ctx0, Qcur, tau);
@@ -558,7 +611,9 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
             const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
             const int64_t n_kv     = rel_pos->ne[0];
 
-            ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
+            if (!sinks) {
+                sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
+            }
 
             const auto * cache_cur = is_swa ? attn->mctx->get_swa() : attn->mctx->get_base();
             ggml_tensor * k_all_cur = use_banded_pos(il, is_swa) ? cache_cur->get_k(ctx0, il) : nullptr;
@@ -577,6 +632,9 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                     Vcur = llama_mul_mat_hadamard(ctx0, Vcur, v_rot);
                 }
                 ggml_build_forward_expand(gf, Qcur);
+                if (small_wave) {
+                    ggml_build_forward_expand(gf, Rcur);
+                }
                 ggml_build_forward_expand(gf, Kcur);
                 ggml_build_forward_expand(gf, cache_cur->cpy_k(ctx0, Kcur, is_swa ? attn->get_k_idxs_swa() : attn->get_k_idxs(), il));
                 ggml_build_forward_expand(gf, Vcur);
@@ -724,7 +782,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 cur = n_rows_max >= n_seq_tokens ? outs[0] : ggml_reshape_2d(ctx0, outs[0], outs[0]->ne[0], n_tokens);
             }
 
-            cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
+            cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, Gproj ? Gproj : build_lora_mm(layer.wqkv_gate, inputs[0])));
             cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
             cb(cur, "attn_out", il);
         }

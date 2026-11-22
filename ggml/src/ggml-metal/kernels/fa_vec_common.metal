@@ -16,6 +16,7 @@ constant bool    FC_flash_attn_ext_vec_has_sparse [[function_constant(FC_FLASH_A
 constant bool    FC_flash_attn_ext_vec_has_rows   [[function_constant(FC_FLASH_ATTN_EXT_VEC + 6)]];
 constant bool    FC_flash_attn_ext_vec_has_banded  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 7)]];
 constant bool    FC_flash_attn_ext_vec_has_rel_pos [[function_constant(FC_FLASH_ATTN_EXT_VEC + 8)]];
+constant bool    FC_flash_attn_ext_vec_has_rel_mm  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 9)]];
 template<
     typename q4_t,  // query types in shared memory
     typename k4_t,  // key types in shared memory
@@ -49,6 +50,7 @@ kernel void kernel_flash_attn_ext_vec(
         device const char * rel,
         device const char * k_pos,
         device const char * q_pos,
+        device const char * rel_q,
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
@@ -472,8 +474,14 @@ kernel void kernel_flash_attn_ext_vec(
                         const int iq1_q = iq1*Q + qq;
                         const int rel_dist = qp_val[qq] - kp_val;
                         if (rel_dist >= 0 && rel_dist < args.rel_extent) {
-                            device const float * pr = (device const float *) (rel + (uint64_t) iq1_q*args.nb62 + (uint64_t) iq2*args.nb61 + (uint64_t) (iq3%args.ne63)*args.nb63);
-                            s += pr[rel_dist] * LOG2E;
+                            if (FC_flash_attn_ext_vec_has_rel_mm) {
+                                device const float4 * rq = (device const float4 *) (rel_q + (uint64_t) iq1_q*args.nb62 + (uint64_t) iq2*args.nb61 + (uint64_t) (iq3%args.ne63)*args.nb63);
+                                device const float4 * rw = (device const float4 *) rel + (uint64_t) rel_dist * 4;
+                                s += (dot(rq[0], rw[0]) + dot(rq[1], rw[1]) + dot(rq[2], rw[2]) + dot(rq[3], rw[3])) * LOG2E;
+                            } else {
+                                device const float * pr = (device const float *) (rel + (uint64_t) iq1_q*args.nb62 + (uint64_t) iq2*args.nb61 + (uint64_t) (iq3%args.ne63)*args.nb63);
+                                s += pr[rel_dist] * LOG2E;
+                            }
                         }
                     }
 

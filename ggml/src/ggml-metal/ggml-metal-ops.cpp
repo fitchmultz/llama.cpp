@@ -3585,12 +3585,13 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
 
-    if (ctx->use_fusion() && props_dev->has_tensor && op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] == 16) {
+    if (ctx->use_fusion() && op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] == 16) {
         int n = 1;
         const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_FA_BANDED_REL) {
             const ggml_tensor * fa = ctx->node(idx + 1);
-            if (ggml_metal_op_flash_attn_ext_use_tensor_wide(fa, props_dev->has_tensor)) {
+            if (ggml_metal_op_flash_attn_ext_use_tensor_wide(fa, props_dev->has_tensor) ||
+                ggml_metal_op_flash_attn_ext_use_vec(fa)) {
                 if (!ggml_metal_op_concurrency_check(ctx, fa)) {
                     ggml_metal_op_concurrency_reset(ctx);
                 }
@@ -6331,26 +6332,27 @@ static int ggml_metal_op_flash_attn_ext_impl(ggml_metal_op_t ctx, int idx, const
 
         auto pipeline = use_vec_tensor_q8_0_gqa
             ? ggml_metal_library_get_pipeline_flash_attn_ext_vec_tensor_q8_0_gqa(
-                  lib, op, has_mask, has_sinks, has_scap, has_kvpad, has_banded, has_rel_pos, nhptg, is_q4_0_kv, nwg)
+                  lib, op, has_mask, has_sinks, has_scap, has_kvpad, has_banded, has_rel_pos, has_rel_mm, nhptg, is_q4_0_kv, nwg)
             : (use_vec_q8_0_gqa
                 ? ggml_metal_library_get_pipeline_flash_attn_ext_vec_q8_0_gqa(
-                      lib, op, has_mask, has_sinks, has_scap, has_kvpad, has_banded, has_rel_pos, nqptg, nhptg, nsg, nwg)
+                      lib, op, has_mask, has_sinks, has_scap, has_kvpad, has_banded, has_rel_pos, has_rel_mm, nqptg, nhptg, nsg, nwg)
                 : ggml_metal_library_get_pipeline_flash_attn_ext_vec(
-                      lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, has_rows, has_banded, has_rel_pos, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20));
+                      lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, has_rows, has_banded, has_rel_pos, has_rel_mm, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20));
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-        ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
-        ggml_metal_encoder_set_buffer  (enc, bid_k,    2);
-        ggml_metal_encoder_set_buffer  (enc, bid_v,    3);
-        ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
-        ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
+        ggml_metal_encoder_set_buffer  (enc, bid_src0,  1);
+        ggml_metal_encoder_set_buffer  (enc, bid_k,     2);
+        ggml_metal_encoder_set_buffer  (enc, bid_v,     3);
+        ggml_metal_encoder_set_buffer  (enc, bid_src3,  4);
+        ggml_metal_encoder_set_buffer  (enc, bid_src4,  5);
         ggml_metal_encoder_set_buffer  (enc, use_sparse ? bid_idx : (has_rows ? ggml_metal_get_buffer_id(kv_rows) : bid_src0), 8);
-        ggml_metal_encoder_set_buffer  (enc, bid_rel,  9);
-        ggml_metal_encoder_set_buffer  (enc, bid_kpos, 10);
-        ggml_metal_encoder_set_buffer  (enc, bid_qpos, 11);
+        ggml_metal_encoder_set_buffer  (enc, bid_rel,   9);
+        ggml_metal_encoder_set_buffer  (enc, bid_kpos,  10);
+        ggml_metal_encoder_set_buffer  (enc, bid_qpos,  11);
+        ggml_metal_encoder_set_buffer  (enc, bid_rel_q, 12);
 
         const size_t smem = use_vec_tensor_q8_0_gqa
             ? GGML_PAD((size_t) 16*128*sizeof(ggml_fp16_t) + (size_t) 64*128*sizeof(ggml_fp16_t) + (size_t) 16*64*(sizeof(float) + sizeof(ggml_fp16_t)) + (size_t) 16*sizeof(float) + 8*sizeof(int32_t), 16)

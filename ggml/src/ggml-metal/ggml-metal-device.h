@@ -293,6 +293,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         bool    has_rows,
         bool    has_banded,
         bool    has_rel_pos,
+        bool    has_rel_mm,
         int32_t nqpsg,
         int32_t ne,
         int32_t nsg,
@@ -310,6 +311,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         bool    has_kvpad,
         bool    has_banded,
         bool    has_rel_pos,
+        bool    has_rel_mm,
         int32_t nqpsg,
         int32_t nhptg,
         int32_t nsg,
@@ -324,6 +326,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         bool    has_kvpad,
         bool    has_banded,
         bool    has_rel_pos,
+        bool    has_rel_mm,
         int32_t nhptg,
         bool    is_q4_0,
         int32_t nwg);

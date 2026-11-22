@@ -820,6 +820,7 @@ kernel void kernel_flash_attn_ext_vec_tensor_q8_0_gqa(
         device const char * rel,
         device const char * k_pos,
         device const char * q_pos,
+        device const char * rel_q,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
@@ -930,8 +931,9 @@ kernel void kernel_flash_attn_ext_vec_tensor_q8_0_gqa(
         S[hh] = 0.0f;
     }
 
-    device const char * pm_stream = mask + (uint64_t) (iq3 % args.ne33) * args.nb33;
-    device const char * rel_base  = rel  + (uint64_t) (iq3 % args.ne63) * args.nb63 + (uint64_t) iq2_base * args.nb61;
+    device const char * pm_stream  = mask  + (uint64_t) (iq3 % args.ne33) * args.nb33;
+    device const char * rel_base   = rel   + (uint64_t) (iq3 % args.ne63) * args.nb63 + (uint64_t) iq2_base * args.nb61;
+    device const char * rel_q_base = rel_q + (uint64_t) (iq3 % args.ne63) * args.nb63 + (uint64_t) iq2_base * args.nb61;
 
     auto tq = tensor(sq,  dextents<int32_t, 2>(DK, M_PAD));
     auto tk = tensor(skv, dextents<int32_t, 2>(DK, C));
@@ -1086,13 +1088,30 @@ kernel void kernel_flash_attn_ext_vec_tensor_q8_0_gqa(
             s1 = force_ninf1 ? (-FLT_MAX / 2) : (s1 + m1_log2);
 
             if (FC_flash_attn_ext_tensor_has_banded && (ib0 || ib1)) {
-                device const float * pr_h = (device const float *) (
-                    rel_base + (uint64_t) iq1_sg * args.nb62 + (uint64_t) hh * args.nb61);
-                if (ib0) {
-                    s0 += pr_h[rd0] * LOG2E;
-                }
-                if (ib1) {
-                    s1 += pr_h[rd1] * LOG2E;
+                if (FC_flash_attn_ext_tensor_has_rel_mm) {
+                    device const float4 * rq = (device const float4 *) (
+                        rel_q_base + (uint64_t) iq1_sg * args.nb62 + (uint64_t) hh * args.nb61);
+                    const float4 rq0 = rq[0];
+                    const float4 rq1 = rq[1];
+                    const float4 rq2 = rq[2];
+                    const float4 rq3 = rq[3];
+                    if (ib0) {
+                        device const float4 * rw = (device const float4 *) rel + (uint64_t) rd0 * 4;
+                        s0 += (dot(rq0, rw[0]) + dot(rq1, rw[1]) + dot(rq2, rw[2]) + dot(rq3, rw[3])) * LOG2E;
+                    }
+                    if (ib1) {
+                        device const float4 * rw = (device const float4 *) rel + (uint64_t) rd1 * 4;
+                        s1 += (dot(rq0, rw[0]) + dot(rq1, rw[1]) + dot(rq2, rw[2]) + dot(rq3, rw[3])) * LOG2E;
+                    }
+                } else {
+                    device const float * pr_h = (device const float *) (
+                        rel_base + (uint64_t) iq1_sg * args.nb62 + (uint64_t) hh * args.nb61);
+                    if (ib0) {
+                        s0 += pr_h[rd0] * LOG2E;
+                    }
+                    if (ib1) {
+                        s1 += pr_h[rd1] * LOG2E;
+                    }
                 }
             }
 

@@ -2062,8 +2062,8 @@ static bool ggml_metal_fusion_check_fa_banded_rel(
     if (n_kv_max > 0) {
         return false;
     }
-    // Wide Metal 4 tensor path requires ne01 >= 32 (guarantees !use_vec and use_kv_f16 for quantized KV)
-    if (q->ne[1] < 32) {
+    // Supported on wide Metal 4 tensor path (ne01 >= 32) and all vec paths (ne01 < 20)
+    if (q->ne[1] >= 20 && q->ne[1] < 32) {
         return false;
     }
     switch (k->type) {
@@ -2073,6 +2073,12 @@ static bool ggml_metal_fusion_check_fa_banded_rel(
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
+            break;
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_F32:
+            if (q->ne[1] >= 20) {
+                return false;
+            }
             break;
         default:
             return false;
