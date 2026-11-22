@@ -592,12 +592,18 @@ template [[host_name("kernel_mul_mv_mma_" tname "_f32_nt1_rt2")]] kernel mul_mv_
 template [[host_name("kernel_mul_mv_mma_" tname "_f32_nt2_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<2, 2, bq, nl, deq>; \
 template [[host_name("kernel_mul_mv_mma_" tname "_f32_nt4_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<4, 2, bq, nl, deq>;
 
-// q8_0 with 9..16 src1 rows: the per-block scaling above is slower than dequantizing to f32
+// q8_0 with 9..24 src1 rows: the per-block scaling above is slower than dequantizing to f32
 template [[host_name("kernel_mul_mv_mma_q8_0_f32_nt1_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<1, 2, block_q8_0, 2, dequantize_q8_0>;
 template [[host_name("kernel_mul_mv_mma_q8_0_f32_nt2_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<2, 2, block_q8_0, 2, dequantize_q8_0>;
 template [[host_name("kernel_mul_mv_mma_q8_0_f32_nt4_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<4, 2, block_q8_0, 2, dequantize_q8_0>;
+template [[host_name("kernel_mul_mv_mma_q8_0_f32_nt1_rt3")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<1, 3, block_q8_0, 2, dequantize_q8_0>;
+template [[host_name("kernel_mul_mv_mma_q8_0_f32_nt2_rt3")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<2, 3, block_q8_0, 2, dequantize_q8_0>;
+template [[host_name("kernel_mul_mv_mma_q8_0_f32_nt4_rt3")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<4, 3, block_q8_0, 2, dequantize_q8_0>;
 
 MUL_MV_MMA_GEN("f32",  float4x4,   1,     dequantize_f32)
+template [[host_name("kernel_mul_mv_mma_f32_f32_nt1_rt3")]]  kernel mul_mv_mma_t kernel_mul_mv_mma_gen<1, 3, float4x4,   1, dequantize_f32>;
+template [[host_name("kernel_mul_mv_mma_f32_f32_nt2_rt3")]]  kernel mul_mv_mma_t kernel_mul_mv_mma_gen<2, 3, float4x4,   1, dequantize_f32>;
+template [[host_name("kernel_mul_mv_mma_f32_f32_nt4_rt3")]]  kernel mul_mv_mma_t kernel_mul_mv_mma_gen<4, 3, float4x4,   1, dequantize_f32>;
 MUL_MV_MMA_GEN("f16",  half4x4,    1,     dequantize_f16)
 MUL_MV_MMA_GEN("q4_1", block_q4_1, 2,     dequantize_q4_1)
 MUL_MV_MMA_GEN("q5_0", block_q5_0, 2,     dequantize_q5_0)
@@ -607,6 +613,9 @@ MUL_MV_MMA_GEN("q6_K", block_q6_K, QK_NL, dequantize_q6_K)
 
 #if defined(GGML_METAL_HAS_BF16)
 MUL_MV_MMA_GEN("bf16",    bfloat4x4,     1,     dequantize_bf16)
+template [[host_name("kernel_mul_mv_mma_bf16_f32_nt1_rt3")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<1, 3, bfloat4x4,  1, dequantize_bf16>;
+template [[host_name("kernel_mul_mv_mma_bf16_f32_nt2_rt3")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<2, 3, bfloat4x4,  1, dequantize_bf16>;
+template [[host_name("kernel_mul_mv_mma_bf16_f32_nt4_rt3")]] kernel mul_mv_mma_t kernel_mul_mv_mma_gen<4, 3, bfloat4x4,  1, dequantize_bf16>;
 #endif
 MUL_MV_MMA_GEN("q1_0",    block_q1_0,    8,     dequantize_q1_0)
 MUL_MV_MMA_GEN("q2_0",    block_q2_0,    4,     dequantize_q2_0)

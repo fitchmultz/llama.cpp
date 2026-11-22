@@ -46,7 +46,7 @@ bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_sim
     const int64_t ne02 = op->src[0]->ne[2];
     const int64_t ne21 = op->src[2]->ne[1];
 
-    return has_simdgroup_mm && ne00 >= 64 && ne02 <= 1024 && ne21 >= 32;
+    return has_simdgroup_mm && ne00 >= 64 && ne02 <= 1024 && ne21 >= 24;
 }
 
 // the most src1 rows of the few-row MMA kernels
@@ -66,7 +66,19 @@ enum ggml_metal_mma_kind ggml_metal_mul_mv_mma_kind(enum ggml_type type, int rt)
 }
 
 int ggml_metal_mul_mv_mma_rt(const struct ggml_tensor * op) {
-    return op->src[1]->ne[1] > GGML_METAL_MMA_TILE_ROWS ? 2 : 1;
+    const int64_t n = op->src[1]->ne[1];
+    return (int) ((n + GGML_METAL_MMA_TILE_ROWS - 1) / GGML_METAL_MMA_TILE_ROWS);
+}
+
+static int64_t ggml_metal_mul_mv_mma_rows_max(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q8_0:
+            return 24;
+        default:
+            return GGML_METAL_MMA_ROWS_MAX;
+    }
 }
 
 static bool ggml_metal_mul_mv_mma_type_supported(enum ggml_type type) {
@@ -149,7 +161,7 @@ bool ggml_metal_op_mul_mat_use_mma(const struct ggml_tensor * op) {
     const bool batch_ok = src1->ne[2] <= INT16_MAX && src1->ne[2]/src0->ne[2] <= INT16_MAX && src1->ne[3]/src0->ne[3] <= INT16_MAX;
 
     return ggml_metal_mul_mat_mma_type_ok(op) && batch_ok &&
-        src1->type == GGML_TYPE_F32 && src1->ne[1] >= ggml_metal_mul_mv_mma_rows_min(src0->type) && src1->ne[1] <= GGML_METAL_MMA_ROWS_MAX &&
+        src1->type == GGML_TYPE_F32 && src1->ne[1] >= ggml_metal_mul_mv_mma_rows_min(src0->type) && src1->ne[1] <= ggml_metal_mul_mv_mma_rows_max(src0->type) &&
         !ggml_is_transposed(src0) && !ggml_is_transposed(src1) &&
         src1->nb[0] == sizeof(float) && src1->nb[1] % 16 == 0 && src1->nb[2] % 16 == 0 && src1->nb[3] % 16 == 0;
 }
