@@ -300,9 +300,13 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                    ggml_backend_sched_t   sched_override = nullptr) const;
 
-    llm_graph_cb graph_get_cb() const;
+    llm_graph_cb graph_get_cb(ggml_backend_sched_t sched_override = nullptr) const;
+
+    ggml_backend_sched_t get_active_sched() const;
+    void small_gf_cache_reset();
 
     // parameters defining the backend scheduler instance
     struct sched_params {
@@ -474,6 +478,20 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    // Small-batch LRU graph cache (n_tokens <= 16) to eliminate ~5 ms graph build + gallocr churn
+    // when adaptive speculative decoding or concurrent batch sizes switch n_tokens between steps.
+    struct small_gf_entry {
+        llm_graph_result_ptr   res;
+        ggml_backend_sched_ptr sched;
+        uint64_t               last_used = 0;
+        uint64_t               sync_gen  = 0;
+    };
+    static constexpr size_t     k_small_gf_cache_max = 8;
+    std::vector<small_gf_entry> small_gf_cache;
+    uint64_t                    small_gf_clock = 0;
+    uint64_t                    sync_gen       = 1;
+    ggml_backend_sched_t        sched_active   = nullptr;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
