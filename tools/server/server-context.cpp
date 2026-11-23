@@ -2615,7 +2615,7 @@ private:
     bool tokenize_cli_input(server_task & task) {
         try {
             auto & prompt = task.cli_prompt;
-            if (mctx != nullptr) {
+            if (mctx != nullptr && !task.cli_files.empty()) {
                 task.tokens = process_mtmd_prompt(mctx, prompt, task.cli_files, init_opt);
             } else {
                 task.tokens = std::move(tokenize_input_prompts(vocab, mctx, prompt, true, true, init_opt)[0]);
@@ -5432,7 +5432,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
 
-        if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
+        if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr && !files.empty()) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
         } else {
@@ -7371,7 +7371,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const s
 
     // TODO @ngxson : refactor this code block, move this to server-common and reuse it in other places
     size_t n_tokens;
-    if (ctx_server.mctx != nullptr) {
+    if (ctx_server.mctx != nullptr && !files.empty()) {
         if (!prompt.is_string()) {
             throw std::runtime_error("for mtmd, input prompt must be a string.");
         }
