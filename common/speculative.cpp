@@ -20,6 +20,9 @@
 #include <map>
 #include <random>
 #include <cinttypes>
+#if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#endif
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1584,9 +1587,12 @@ public:
         std::vector<int32_t> n_block    (n_seq,  0);
         std::vector<int32_t> n_draft_seq(n_seq,  0);
 
+        const bool sample_rnn = has_rnn_context && params.probabilistic;
+
         int32_t n_draft_batch = 0;
         int32_t n_active = 0;
         int32_t min_allowed = n_max;
+        std::vector<int32_t> nd_lim_seq(n_seq, 0);
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             const auto & dp = dparams[seq_id];
             if (!dp.drafting) {
@@ -1598,6 +1604,7 @@ public:
                 nd_lim = std::min(nd_lim, dp.n_max);
             }
             nd_lim = std::max<int32_t>(1, std::min<int32_t>(nd_lim, n_max));
+            nd_lim_seq[seq_id] = nd_lim;
             min_allowed = std::min(min_allowed, nd_lim);
 
             int32_t nd = nd_lim;
@@ -1607,6 +1614,18 @@ public:
             nd = std::max<int32_t>(1, std::min<int32_t>(nd, n_max));
             n_draft_seq[seq_id] = nd;
             n_draft_batch = std::max(n_draft_batch, nd);
+        }
+
+        // For single-slot adaptive probabilistic DSpark, draft up to nd_lim (costs only ~0.13 ms extra
+        // in the factored Markov loop) and apply the lossless per-step causal L2 stopping rule below.
+        if (n_active == 1 && sample_rnn && params.adaptive) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                const auto & dp = dparams[seq_id];
+                if (dp.drafting && dp.temp > 0.0f && (dp.result_q || dp.result_q_f32)) {
+                    n_draft_seq[seq_id] = nd_lim_seq[seq_id];
+                    n_draft_batch       = nd_lim_seq[seq_id];
+                }
+            }
         }
 
         // Synchronize draft lengths across concurrent active slots so non-unified KV caches
@@ -1623,7 +1642,6 @@ public:
             n_draft_batch = nd_shared;
         }
 
-        const bool sample_rnn = has_rnn_context && params.probabilistic;
         std::vector<std::vector<float>> sample_cfgs(n_seq);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1718,9 +1736,38 @@ public:
                 const llama_token * d2t = want_q ? llama_get_dspark_d2t(ctx_dft, &n_d2t) : nullptr;
                 const int32_t q_len = (d2t && n_d2t > 0) ? n_d2t : n_vocab;
 
+                const bool use_causal_l2 = params.adaptive && n_active == 1 && dp.temp > 0.0f && want_q && n_keep > adapt_min;
+                double causal_surv = 1.0;
+
                 for (int32_t i = 1; i <= n_keep; ++i) {
                     const int32_t row = beg + i;
                     const float * probs = want_q ? llama_get_logits_ith(ctx_dft, row) : nullptr;
+                    if (use_causal_l2) {
+                        // Strict causal stopping rule: decides whether to include depth d = i - 1 using ONLY
+                        // sum(q_0^2)..sum(q_d^2) (independent of the sampled token at depth d and all later depths),
+                        // preserving the exact target distribution under rejection sampling.
+                        static constexpr double k_dms[7] = { 2.10, 1.89, 0.91, 1.81, 1.44, 1.67, 1.47 };
+                        static constexpr double k_rate   = 0.14;
+                        double l2 = 0.0;
+#if defined(__APPLE__)
+                        float l2f = 0.0f;
+                        vDSP_svesq(probs, 1, &l2f, (vDSP_Length) q_len);
+                        l2 = (double) l2f;
+#else
+                        for (int32_t k = 0; k < q_len; ++k) {
+                            l2 += (double) probs[k] * (double) probs[k];
+                        }
+#endif
+                        const double p_hat = (l2 < 0.85) ? (0.24 + 0.42 * l2) : std::min(0.96, 0.60 + 2.35 * (l2 - 0.85));
+                        const int32_t d = i - 1;
+                        if (d >= adapt_min) {
+                            const double dms = d < 7 ? k_dms[d] : 1.50;
+                            if (causal_surv * p_hat < k_rate * dms) {
+                                break;
+                            }
+                        }
+                        causal_surv *= p_hat;
+                    }
                     const llama_token tok = (llama_token) std::lround(h_nextn_rows[(size_t) row * n_embd_dec + markov_rank]);
                     result.push_back(tok);
                     if (dp.result_q_f32) {
