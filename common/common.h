@@ -352,7 +352,7 @@ struct common_params_speculative_draft {
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
 
-    bool adaptive = false; // adapt per-slot draft length between 3 and n_max based on live acceptance rate
+    bool adaptive = false; // adapt per-slot draft length in [3, n_max]: per-step causal-L2 cutoff for single-slot probabilistic DSpark, live acceptance hysteresis otherwise
 
     common_params_model mparams;
 

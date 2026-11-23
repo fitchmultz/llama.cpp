@@ -49,6 +49,11 @@ common_speculative_output_limits common_speculative_get_output_limits(
 // return true if the target and draft models have compatible vocabs
 bool common_speculative_are_compatible(const llama_model * model_tgt, const llama_model * model_dft);
 
+// Strict causal stopping rule for single-slot probabilistic DSpark:
+// decides whether to include depth `depth` using only sum(probs^2) and cumulative survival `surv`,
+// strictly independent of the sampled token at `depth` and all later depths.
+bool common_speculative_causal_l2_continue(const float * probs, int32_t n_probs, int32_t depth, int32_t adapt_min, double & surv);
+
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
 
 void common_speculative_free(common_speculative * spec);

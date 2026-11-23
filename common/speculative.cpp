@@ -34,6 +34,30 @@
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
+bool common_speculative_causal_l2_continue(const float * probs, int32_t n_probs, int32_t depth, int32_t adapt_min, double & surv) {
+    static constexpr double k_dms[7] = { 2.10, 1.89, 0.91, 1.81, 1.44, 1.67, 1.47 };
+    static constexpr double k_rate   = 0.14;
+    double l2 = 0.0;
+#if defined(__APPLE__)
+    float l2f = 0.0f;
+    vDSP_svesq(probs, 1, &l2f, (vDSP_Length) n_probs);
+    l2 = (double) l2f;
+#else
+    for (int32_t k = 0; k < n_probs; ++k) {
+        l2 += (double) probs[k] * (double) probs[k];
+    }
+#endif
+    const double p_hat = (l2 < 0.85) ? (0.24 + 0.42 * l2) : std::min(0.96, 0.60 + 2.35 * (l2 - 0.85));
+    if (depth >= adapt_min) {
+        const double dms = depth < 7 ? k_dms[depth] : 1.50;
+        if (surv * p_hat < k_rate * dms) {
+            return false;
+        }
+    }
+    surv *= p_hat;
+    return true;
+}
+
 // Rebuild seq_id's draft sampler at the target's temperature: rejection weighs q against p, so
 // both have to sample alike. Only temp and seed carry over; the draft keeps its own top_k.
 static void spec_retune(
@@ -1742,31 +1766,8 @@ public:
                 for (int32_t i = 1; i <= n_keep; ++i) {
                     const int32_t row = beg + i;
                     const float * probs = want_q ? llama_get_logits_ith(ctx_dft, row) : nullptr;
-                    if (use_causal_l2) {
-                        // Strict causal stopping rule: decides whether to include depth d = i - 1 using ONLY
-                        // sum(q_0^2)..sum(q_d^2) (independent of the sampled token at depth d and all later depths),
-                        // preserving the exact target distribution under rejection sampling.
-                        static constexpr double k_dms[7] = { 2.10, 1.89, 0.91, 1.81, 1.44, 1.67, 1.47 };
-                        static constexpr double k_rate   = 0.14;
-                        double l2 = 0.0;
-#if defined(__APPLE__)
-                        float l2f = 0.0f;
-                        vDSP_svesq(probs, 1, &l2f, (vDSP_Length) q_len);
-                        l2 = (double) l2f;
-#else
-                        for (int32_t k = 0; k < q_len; ++k) {
-                            l2 += (double) probs[k] * (double) probs[k];
-                        }
-#endif
-                        const double p_hat = (l2 < 0.85) ? (0.24 + 0.42 * l2) : std::min(0.96, 0.60 + 2.35 * (l2 - 0.85));
-                        const int32_t d = i - 1;
-                        if (d >= adapt_min) {
-                            const double dms = d < 7 ? k_dms[d] : 1.50;
-                            if (causal_surv * p_hat < k_rate * dms) {
-                                break;
-                            }
-                        }
-                        causal_surv *= p_hat;
+                    if (use_causal_l2 && !common_speculative_causal_l2_continue(probs, q_len, i - 1, adapt_min, causal_surv)) {
+                        break;
                     }
                     const llama_token tok = (llama_token) std::lround(h_nextn_rows[(size_t) row * n_embd_dec + markov_rank]);
                     result.push_back(tok);

@@ -4311,7 +4311,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-draft-adaptive"},
         {"--no-spec-draft-adaptive"},
-        string_format("adapt per-slot draft length between 3 and --spec-draft-n-max based on live acceptance (default: %s)",
+        string_format("adapt per-slot draft length between 3 and --spec-draft-n-max (uses a lossless per-step causal-L2 confidence cutoff for single-slot probabilistic DSpark; live acceptance hysteresis otherwise; default: %s)",
                       params.speculative.draft.adaptive ? "enabled" : "disabled"),
         [](common_params & params, bool value) {
             params.speculative.draft.adaptive = value;
