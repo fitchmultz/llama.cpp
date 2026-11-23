@@ -5594,7 +5594,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_tool_calls({
                 { "special_function", R"({"arg1":1})", "" },
             })
-            .expect_rules({ "tool-0" })
+            .expect_rules({ "tool-calls" })
             .run();
 
         // Thinking, content, then a tool call
@@ -5636,7 +5636,19 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
             .tools({ special_function_tool })
             .expect(simple_assist_msg("", "I should call it", "special_function", R"({"arg1":1})", ""))
+            .expect_rules({ "tool-0" })
             .run();
+
+        // Research model: no tool name before <|content_invoke_tool_json|>
+        for (const auto tool_choice : { COMMON_CHAT_TOOL_CHOICE_AUTO, COMMON_CHAT_TOOL_CHOICE_REQUIRED }) {
+            tst.test(P + "<|content_invoke_tool_json|>{\"name\":\"special_function\",\"args\":{\"arg1\":1}}" + E)
+                .tool_choice(tool_choice)
+                .tools({ special_function_tool })
+                .expect_tool_calls({
+                    { "special_function", R"({"arg1":1})", "" },
+                })
+                .run();
+        }
 
         // Response format
         tst.test(P + "<|content_thinking|>I'm thinking" + E + H + "<|content_text|>{\"amount\": 123.45}" + E)
@@ -8011,8 +8023,13 @@ static void test_inkling2_mid_convo_tools() {
     assert_equals(size_t(1), parsed.tool_calls.size());
     assert_equals(std::string("linear_search"), parsed.tool_calls[0].name);
     assert_equals(std::string("{\"query\":\"atlas\"}"), parsed.tool_calls[0].arguments);
-    assert_contains(out2.grammar, "linear_search");
-    assert_contains(out2.grammar, "read");
+
+    // Under tool_choice=required, both top-level and mid-convo added tools must appear in the grammar
+    common_chat_templates_inputs in2_req = in2;
+    in2_req.tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+    const auto out2_req = common_chat_templates_apply(tmpls.get(), in2_req);
+    assert_contains(out2_req.grammar, "linear_search");
+    assert_contains(out2_req.grammar, "read");
 
     // System message with BOTH tools and non-empty content emits tool_declare followed by text
     json msgs_both = json::array({
