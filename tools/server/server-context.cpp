@@ -323,6 +323,9 @@ struct server_slot {
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
 
+    // true when slot KV/prompt/draft state has changed since the last auto-save or auto-restore
+    bool auto_save_dirty = false;
+
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
     int32_t n_keep  = 0;
@@ -390,6 +393,8 @@ struct server_slot {
         bool res = prompt_cache.load(prompt, tokens, lora_new, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+        } else {
+            auto_save_dirty = true;
         }
 
         return res;
@@ -401,6 +406,7 @@ struct server_slot {
         mem.seq_rm(id, -1, -1);
 
         prompt.clear();
+        auto_save_dirty = false;
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -877,6 +883,7 @@ struct server_slot {
         mem.seq_cp(id, other.id, -1, -1);
 
         other.prompt = prompt.clone();
+        other.auto_save_dirty = true;
     }
 
     void copy_state_to(server_slot & other) const {
@@ -890,6 +897,7 @@ struct server_slot {
         other.stats = stats;
 
         other.prompt = prompt.clone();
+        other.auto_save_dirty = true;
         other.init_sampler();
     }
 };
@@ -1946,6 +1954,7 @@ private:
             }
         }
         slot.lora = task_loras;
+        slot.auto_save_dirty = true;
 
         // if using alora, make sure it's only a single one requested and active
         size_t alora_invocation_start = task.tokens.size();
@@ -3127,10 +3136,11 @@ private:
             }
         }
 
-        size_t n_saved  = 0;
-        size_t n_tokens = 0;
-        size_t n_bytes  = 0;
-        for (const auto & slot : slots) {
+        size_t n_saved   = 0;
+        size_t n_skipped = 0;
+        size_t n_tokens  = 0;
+        size_t n_bytes   = 0;
+        for (auto & slot : slots) {
             const std::string final_path = params_base.slot_save_path + string_format("auto-slot-%d.bin", slot.id);
             const std::string tmp_path   = final_path + ".tmp";
             const bool has_state = !slot.prompt.tokens.empty() &&
@@ -3139,7 +3149,16 @@ private:
                 std::error_code ec;
                 std::filesystem::remove(final_path, ec);
                 std::filesystem::remove(tmp_path, ec);
+                slot.auto_save_dirty = false;
                 continue;
+            }
+
+            {
+                std::error_code ec;
+                if (!slot.auto_save_dirty && std::filesystem::exists(final_path, ec) && !ec) {
+                    n_skipped++;
+                    continue;
+                }
             }
 
             size_t slot_bytes = 0;
@@ -3153,6 +3172,7 @@ private:
                     std::filesystem::remove(final_path, ec);
                     SLT_WRN(slot, "auto-save rename failed for '%s': %s\n", final_path.c_str(), ec.message().c_str());
                 } else {
+                    slot.auto_save_dirty = false;
                     n_saved++;
                     n_tokens += slot.prompt.tokens.size();
                     n_bytes  += slot_bytes;
@@ -3166,8 +3186,8 @@ private:
         }
 
         const double t_ms = (ggml_time_us() - t_start) / 1000.0;
-        SRV_INF("auto-saved %zu slot(s) (%zu tokens, %.2f MiB) to '%s' in %.1f ms\n",
-                n_saved, n_tokens, (double) n_bytes / (1024.0 * 1024.0), params_base.slot_save_path.c_str(), t_ms);
+        SRV_INF("auto-saved %zu slot(s) (%zu tokens, %.2f MiB), skipped %zu unchanged to '%s' in %.1f ms\n",
+                n_saved, n_tokens, (double) n_bytes / (1024.0 * 1024.0), n_skipped, params_base.slot_save_path.c_str(), t_ms);
     }
 
     void auto_restore_slots() {
@@ -3201,6 +3221,7 @@ private:
             std::string err;
             if (restore_slot_from_file(slot, final_path, slot_bytes, err)) {
                 slot.t_last_used = ggml_time_us();
+                slot.auto_save_dirty = false;
                 n_restored++;
                 n_tokens += slot.prompt.tokens.size();
                 n_bytes  += slot_bytes;
@@ -3509,6 +3530,7 @@ private:
                         send_error(task, std::string("Unable to restore slot: ") + err, ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
+                    slot->auto_save_dirty = true;
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
