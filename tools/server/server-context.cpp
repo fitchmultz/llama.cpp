@@ -3999,10 +3999,45 @@ private:
         auto & alora_disabled_id = batch.alora_disabled_id;
 
         // next, batch any pending prompts without exceeding n_batch
+        // Order prompt-pending slots by ascending remaining prompt tokens (Shortest Remaining Prefill First)
+        // so short follow-up prompts finish in one batch instead of stalling behind a long prefill.
         if ((params_base.cont_batching || batch.size() == 0) && !(share_active && t_share_debt_us > 0)) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate(slots, [&](server_slot & slot) {
+            std::vector<std::pair<int32_t, server_slot *>> prompt_ranked;
+            prompt_ranked.reserve(slots.size());
+            for (auto & slot : slots) {
+                if (!slot.is_processing() || !slot.task) {
+                    continue;
+                }
+                if (slot.state == SLOT_STATE_WAIT_OTHER) {
+                    prompt_ranked.emplace_back(INT32_MAX, &slot);
+                    continue;
+                }
+                if (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_STARTED) {
+                    continue;
+                }
+                int32_t rem = slot.task->n_tokens();
+                if (slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+                    rem = std::max<int32_t>(0, slot.task->n_tokens() - slot.prompt.n_tokens());
+                } else if (slot.task->params.cache_prompt && !slot.task->is_stateless()) {
+                    int32_t n_reuse = slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+                    if (slot.task->n_tokens_shared > 0) {
+                        n_reuse = std::min(n_reuse, slot.task->n_tokens_shared);
+                    }
+                    rem = std::max<int32_t>(0, slot.task->n_tokens() - n_reuse);
+                }
+                prompt_ranked.emplace_back(rem, &slot);
+            }
+            std::stable_sort(prompt_ranked.begin(), prompt_ranked.end(),
+                    [](const auto & a, const auto & b) { return a.first < b.first; });
+            std::vector<server_slot *> prompt_slots;
+            prompt_slots.reserve(prompt_ranked.size());
+            for (const auto & entry : prompt_ranked) {
+                prompt_slots.push_back(entry.second);
+            }
+
+            iterate(prompt_slots, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
                 }
@@ -4535,6 +4570,14 @@ private:
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
+
+                    // When a short prompt finishes (or hits its final 4-token checkpoint split) while
+                    // another prompt is queued, flush this small batch now instead of packing a long
+                    // prefill behind it and adding seconds to TTFT.
+                    if (prompt_slots.size() > 1 && n_tokens_cur > 0 && batch.size() < n_batch &&
+                            slot.task->n_tokens() - slot.prompt.n_tokens() <= 4) {
+                        add_ok = false;
+                    }
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
