@@ -2344,7 +2344,7 @@ private:
             res->progress.total     = slot.task->n_tokens();
             res->progress.cache     = slot.stats.n_prompt_cached;
             res->progress.processed = slot.prompt.tokens.size();
-            res->progress.time_ms   = slot.stats.t_elapsed_us() / 1000;
+            res->progress.time_ms   = slot.stats.t_prompt_active_us / 1000;
         }
         if (is_begin) {
             res->is_begin = true;
@@ -4672,7 +4672,9 @@ private:
 
                         metrics_queue_prompt(n_tokens_out);
                         slot.stats.n_prompt_processed += n_tokens_out;
-                        slot.stats.update_prompt_last();
+                        const int64_t t_mtmd_now = ggml_time_us();
+                        slot.stats.t_prompt_active_us += std::max<int64_t>(0, t_mtmd_now - t_decode_start);
+                        slot.stats.set_prompt_last(t_mtmd_now);
 
                         // add the mtmd chunk to cache
                         {
@@ -5065,9 +5067,17 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+        std::vector<bool> slot_had_prompt(slots.size(), false);
+        for (int i = off; i < off + n_batch_tokens; ++i) {
+            const auto & t = batch.tokens[i];
+            if (t.is_prompt && t.id_slot >= 0 && (size_t) t.id_slot < slot_had_prompt.size()) {
+                slot_had_prompt[t.id_slot] = true;
+            }
+        }
+
         iterate(slots, [&](server_slot & slot) {
-            // optionally send prompt processing progress
-            if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
+            // optionally send prompt processing progress (only for slots that actually advanced in this batch)
+            if ((slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) && slot_had_prompt[slot.id]) {
                 if (slot.task->params.stream && slot.task->params.return_progress) {
                     send_partial_response(slot, {}, true);
                 }
@@ -5388,6 +5398,7 @@ private:
         // note: a slot can be released before we get here, which clears its stats
         //       the tokens were still computed, counted in the global metrics, not in slot
         uint64_t n_prompt_tokens = 0;
+        std::vector<uint64_t> n_slot_prompt(slots.size(), 0);
 
         for (int i = off; i < off + n_tokens; ++i) {
             const auto & t = batch.tokens[i];
@@ -5397,6 +5408,9 @@ private:
             }
 
             n_prompt_tokens++;
+            if (t.id_slot >= 0 && (size_t) t.id_slot < n_slot_prompt.size()) {
+                n_slot_prompt[t.id_slot]++;
+            }
 
             auto & slot = slots[t.id_slot];
             if (slot.stats.is_set()) {
@@ -5414,11 +5428,13 @@ private:
         // advance the prompt timing of the slots that had tokens in this batch
         // note: a second pass, it must run after the sync to reflect the compute
         const int64_t t_now = ggml_time_us();
-        for (int i = off; i < off + n_tokens; ++i) {
-            const auto & t = batch.tokens[i];
-            auto & slot = slots[t.id_slot];
-            if (t.is_prompt && slot.stats.is_set()) {
-                slot.stats.set_prompt_last(t_now);
+        const int64_t dt_us = std::max<int64_t>(0, t_now - t_decode_start);
+        if (n_prompt_tokens > 0) {
+            for (size_t s = 0; s < slots.size(); ++s) {
+                if (n_slot_prompt[s] > 0 && slots[s].stats.is_set()) {
+                    slots[s].stats.t_prompt_active_us += (dt_us * (int64_t) n_slot_prompt[s]) / (int64_t) n_prompt_tokens;
+                    slots[s].stats.set_prompt_last(t_now);
+                }
             }
         }
     }

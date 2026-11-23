@@ -456,9 +456,11 @@ struct server_slot_stats {
 
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set
-    int64_t t_start       = 0;
-    int64_t t_prompt_last = 0;
-    int64_t t_gen_last    = 0;
+    int64_t t_start            = 0;
+    int64_t t_prompt_last      = 0;
+    int64_t t_gen_last         = 0;
+    // active GPU prefill time accumulated only from batches containing this slot's prompt tokens (excludes queue wait)
+    int64_t t_prompt_active_us = 0;
 
     // can only move one direction: start -> prompt -> gen
     void update_prompt_start() {
