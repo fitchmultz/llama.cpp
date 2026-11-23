@@ -700,6 +700,14 @@ typedef struct {
     int32_t  nr0;
 } ggml_metal_kargs_mul_mv_id;
 
+typedef struct {
+    ggml_metal_kargs_mul_mv_id base;
+    float    inv_beta;
+    float    beta;
+    float    inv_lb;
+    float    lb;
+} ggml_metal_kargs_mul_mv_id_situ;
+
 // NORM
 // RMS_NORM
 typedef struct {

@@ -1517,6 +1517,38 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_groupe
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_situ(ggml_metal_library_t lib, const ggml_tensor * op, bool has_scale, bool grouped) {
+    char base[256];
+    char name[256];
+
+    const ggml_type tsrc0 = op->src[0]->type;
+    const int nsg = (tsrc0 == GGML_TYPE_NVFP4) ? N_SG_NVFP4 : N_SG_Q8_0;
+    const int nr0 = 2; // 2 SITU outputs (= 4 gate+up weight rows) per simdgroup
+    const bool use_nvfp4_sw = (tsrc0 == GGML_TYPE_NVFP4);
+
+    snprintf(base, sizeof(base), "kernel_mul_mv_id_%s_f32_%ssitu", ggml_type_name(tsrc0), grouped ? "grouped_" : "");
+    snprintf(name, sizeof(name), "%s_nsg=%d_sc=%d_sw=%d", base, nsg, has_scale, use_nvfp4_sw);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_int16(cv, nsg,          FC_MUL_MV + 0);
+        ggml_metal_cv_set_bool (cv, has_scale,    FC_MUL_MV + 6);
+        ggml_metal_cv_set_bool (cv, use_nvfp4_sw, FC_MUL_MV + 7);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    res.nr0  = nr0;
+    res.nr1  = 1;
+    res.nsg  = nsg;
+    res.smem = 0;
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_zero(ggml_metal_library_t lib) {
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, "kernel_mul_mm_id_zero");
     if (!res.pipeline) {

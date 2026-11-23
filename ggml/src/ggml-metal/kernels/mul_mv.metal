@@ -4141,6 +4141,721 @@ kernel void kernel_mul_mv_id_q8_0_f32_grouped(
     }
 }
 
+// ============================================================================
+// Fused small-batch MoE gate_up + SITU kernels (NVFP4 & Q8_0, T=1 and grouped T=2..23)
+// Pairs gate row r with up row r + n_ff in the same simdgroup/sub-warp so src1 is read ONCE
+// and SITU activation is written directly to situ_out with zero extra registers.
+// ============================================================================
+
+static inline float mul_mv_situ_act(float g, float u, float inv_beta, float beta, float inv_lb, float lb) {
+    const float a = (beta * tanh(g * inv_beta)) / (1.0f + exp(-g));
+    const float b = lb * tanh(u * inv_lb);
+    return a * b;
+}
+
+[[host_name("kernel_mul_mv_id_nvfp4_f32_situ")]]
+kernel void kernel_mul_mv_id_nvfp4_f32_situ(
+        constant ggml_metal_kargs_mul_mv_id_situ & sargs,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        device const char * ids,
+        device const float * w_scale,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    constant ggml_metal_kargs_mul_mv_id & args = sargs.base;
+    const int n_ff = args.ne0;
+    const int iid1 = tgpig.z / args.nei0;
+    const int idx  = tgpig.z % args.nei0;
+    const int32_t i02 = ((device const int32_t *) (ids + iid1 * args.nbi1))[idx];
+
+    device float * dst_f32 = (device float *) dst + (uint64_t) idx * n_ff + (uint64_t) iid1 * args.ne1 * n_ff;
+    if (i02 == -1) {
+        const ushort nth = ntg.x * ntg.y * ntg.z;
+        for (int i0 = tiitg; i0 < n_ff; i0 += nth) {
+            dst_f32[i0] = 0.0f;
+        }
+        return;
+    }
+
+    const int first_out = ((int) tgpig.x * FC_mul_mv_nsg + (int) sgitg) * 2;
+    if (first_out >= n_ff) {
+        return;
+    }
+
+    const int64_t i11 = idx % args.ne11;
+    device const block_nvfp4 * x = (device const block_nvfp4 *) (src0s + (uint64_t) i02 * args.nb02);
+    device const float       * y = (device const float       *) (src1  + i11 * args.nb11 + (int64_t) iid1 * args.nb12);
+
+    const int nb     = args.ne00 / QK_NVFP4;
+    const int ns01   = (int) (args.nb01 / args.nb00);
+    const int nb_eff = min(nb, ns01);
+    const float post_scale = FC_mul_mv_id_scale ? (16384.0f * w_scale[i02]) : 16384.0f;
+
+    if (FC_mul_mv_nvfp4_subwarp && nb_eff >= 4 && (nb_eff & 7) == 4) {
+        // 2x 16-lane sub-warps: each sub-warp computes (gate, up) for 1 output element -> exact for nb = 36
+        const short sub     = tiisg >> 4;
+        const short lane    = tiisg & 15;
+        const short ix      = lane >> 2;
+        const short it      = lane & 3;
+        const int   out_row = first_out + sub;
+        const int   rr      = min(out_row, n_ff - 1);
+
+        device const block_nvfp4 * xg = x + (uint64_t) rr * ns01;
+        device const block_nvfp4 * xu = x + (uint64_t) (rr + n_ff) * ns01;
+        device const float * yb = y + ix * QK_NVFP4 + it * QK_NVFP4_SUB;
+
+        float4 yl[4];
+        float sum_g = 0.0f;
+        float sum_u = 0.0f;
+
+        for (int ib = ix; ib < nb_eff; ib += 4) {
+            device const float4 * y4 = (device const float4 *) yb;
+            FOR_UNROLL (short i = 0; i < 4; ++i) {
+                yl[i] = y4[i];
+            }
+
+            {
+                device const block_nvfp4 & xb = xg[ib];
+                device const uint32_t * qw = (device const uint32_t *) (xb.qs + it * (QK_NVFP4_SUB / 2));
+                const uint32_t w0 = qw[0];
+                const uint32_t w1 = qw[1];
+                const float4 acc = (yl[0] * mxfp4_lo4(w0) + yl[2] * mxfp4_hi4(w0))
+                                 + (yl[1] * mxfp4_lo4(w1) + yl[3] * mxfp4_hi4(w1));
+                sum_g += ue4m3_to_fp32(xb.d[it]) * ((acc[0] + acc[1]) + (acc[2] + acc[3]));
+            }
+            {
+                device const block_nvfp4 & xb = xu[ib];
+                device const uint32_t * qw = (device const uint32_t *) (xb.qs + it * (QK_NVFP4_SUB / 2));
+                const uint32_t w0 = qw[0];
+                const uint32_t w1 = qw[1];
+                const float4 acc = (yl[0] * mxfp4_lo4(w0) + yl[2] * mxfp4_hi4(w0))
+                                 + (yl[1] * mxfp4_lo4(w1) + yl[3] * mxfp4_hi4(w1));
+                sum_u += ue4m3_to_fp32(xb.d[it]) * ((acc[0] + acc[1]) + (acc[2] + acc[3]));
+            }
+
+            yb += 4 * QK_NVFP4;
+        }
+
+        sum_g += simd_shuffle_xor(sum_g, 8);
+        sum_g += simd_shuffle_xor(sum_g, 4);
+        sum_g += simd_shuffle_xor(sum_g, 2);
+        sum_g += simd_shuffle_xor(sum_g, 1);
+
+        sum_u += simd_shuffle_xor(sum_u, 8);
+        sum_u += simd_shuffle_xor(sum_u, 4);
+        sum_u += simd_shuffle_xor(sum_u, 2);
+        sum_u += simd_shuffle_xor(sum_u, 1);
+
+        if (lane == 0 && out_row < n_ff) {
+            dst_f32[out_row] = mul_mv_situ_act(sum_g * post_scale, sum_u * post_scale, sargs.inv_beta, sargs.beta, sargs.inv_lb, sargs.lb);
+        }
+        return;
+    }
+
+    const short ix = tiisg / 4;
+    const short it = tiisg % 4;
+    const int r0 = first_out;
+    const int r1 = min(first_out + 1, n_ff - 1);
+    const int rows[4] = { r0, r0 + n_ff, r1, r1 + n_ff };
+
+    float4 yl[4];
+    float sumf[4] = { 0.f, 0.f, 0.f, 0.f };
+    device const float * yb = y + ix * QK_NVFP4 + it * QK_NVFP4_SUB;
+
+    for (int ib = ix; ib < nb_eff; ib += 8) {
+        device const float4 * y4 = (device const float4 *) yb;
+        FOR_UNROLL (short i = 0; i < 4; ++i) {
+            yl[i] = y4[i];
+        }
+        FOR_UNROLL (short k = 0; k < 4; ++k) {
+            device const block_nvfp4 & xb = x[(uint64_t) rows[k] * ns01 + ib];
+            device const uint32_t * qw = (device const uint32_t *) (xb.qs + it * (QK_NVFP4_SUB / 2));
+            const uint32_t w0 = qw[0];
+            const uint32_t w1 = qw[1];
+            const float4 acc = (yl[0] * mxfp4_lo4(w0) + yl[2] * mxfp4_hi4(w0))
+                             + (yl[1] * mxfp4_lo4(w1) + yl[3] * mxfp4_hi4(w1));
+            sumf[k] += ue4m3_to_fp32(xb.d[it]) * ((acc[0] + acc[1]) + (acc[2] + acc[3]));
+        }
+        yb += 8 * QK_NVFP4;
+    }
+
+    const float g0 = simd_sum(sumf[0]) * post_scale;
+    const float u0 = simd_sum(sumf[1]) * post_scale;
+    const float g1 = simd_sum(sumf[2]) * post_scale;
+    const float u1 = simd_sum(sumf[3]) * post_scale;
+    if (tiisg == 0) {
+        dst_f32[first_out] = mul_mv_situ_act(g0, u0, sargs.inv_beta, sargs.beta, sargs.inv_lb, sargs.lb);
+        if (first_out + 1 < n_ff) {
+            dst_f32[first_out + 1] = mul_mv_situ_act(g1, u1, sargs.inv_beta, sargs.beta, sargs.inv_lb, sargs.lb);
+        }
+    }
+}
+
+template<int CNT>
+static inline void kernel_mul_mv_id_nvfp4_grouped_situ_core(
+        constant ggml_metal_kargs_mul_mv_id_situ & sargs,
+        device const block_nvfp4 * x,
+        thread device const float * const y_base[4],
+        thread device float * const dst_base[4],
+        const int first_out,
+        const int n_ff,
+        const int nb,
+        const int ns01,
+        const float post_scale,
+        const ushort tiisg) {
+    const int nb_eff = min(nb, ns01);
+
+    if (FC_mul_mv_nvfp4_subwarp && nb_eff >= 4 && (nb_eff & 7) == 4) {
+        const short sub     = tiisg >> 4;
+        const short lane    = tiisg & 15;
+        const short ix      = lane >> 2;
+        const short it      = lane & 3;
+        const int   out_row = first_out + sub;
+        const int   rr      = min(out_row, n_ff - 1);
+
+        device const block_nvfp4 * xp[2] = {
+            x + (uint64_t) rr * ns01,
+            x + (uint64_t) (rr + n_ff) * ns01,
+        };
+
+        float sumf2[2][CNT];
+        FOR_UNROLL (int r = 0; r < 2; ++r) {
+            FOR_UNROLL (int k = 0; k < CNT; ++k) {
+                sumf2[r][k] = 0.0f;
+            }
+        }
+
+        for (int ib = ix; ib < nb_eff; ib += 4) {
+            const int y_off = ib * QK_NVFP4 + it * QK_NVFP4_SUB;
+            if (CNT <= 2) {
+                float4 yl[CNT][4];
+                FOR_UNROLL (int k = 0; k < CNT; ++k) {
+                    device const float4 * y4 = (device const float4 *) (y_base[k] + y_off);
+                    yl[k][0] = y4[0];
+                    yl[k][1] = y4[1];
+                    yl[k][2] = y4[2];
+                    yl[k][3] = y4[3];
+                }
+                FOR_UNROLL (int r = 0; r < 2; ++r) {
+                    device const block_nvfp4 & xb = xp[r][ib];
+                    device const uint32_t * qw = (device const uint32_t *) (xb.qs + it * (QK_NVFP4_SUB / 2));
+                    const uint32_t w0 = qw[0];
+                    const uint32_t w1 = qw[1];
+                    const float sc = ue4m3_to_fp32(xb.d[it]);
+                    const float4 f0 = mxfp4_lo4(w0);
+                    const float4 f1 = mxfp4_lo4(w1);
+                    const float4 f2 = mxfp4_hi4(w0);
+                    const float4 f3 = mxfp4_hi4(w1);
+                    FOR_UNROLL (int k = 0; k < CNT; ++k) {
+                        const float4 acc = (yl[k][0] * f0 + yl[k][2] * f2) + (yl[k][1] * f1 + yl[k][3] * f3);
+                        sumf2[r][k] += sc * ((acc[0] + acc[1]) + (acc[2] + acc[3]));
+                    }
+                }
+            } else {
+                FOR_UNROLL (int r = 0; r < 2; ++r) {
+                    device const block_nvfp4 & xb = xp[r][ib];
+                    device const uint32_t * qw = (device const uint32_t *) (xb.qs + it * (QK_NVFP4_SUB / 2));
+                    const uint32_t w0 = qw[0];
+                    const uint32_t w1 = qw[1];
+                    const float sc = ue4m3_to_fp32(xb.d[it]);
+                    const float4 f0 = mxfp4_lo4(w0);
+                    const float4 f1 = mxfp4_lo4(w1);
+                    const float4 f2 = mxfp4_hi4(w0);
+                    const float4 f3 = mxfp4_hi4(w1);
+                    FOR_UNROLL (int k = 0; k < CNT; ++k) {
+                        device const float4 * y4 = (device const float4 *) (y_base[k] + y_off);
+                        const float4 acc = (y4[0] * f0 + y4[2] * f2) + (y4[1] * f1 + y4[3] * f3);
+                        sumf2[r][k] += sc * ((acc[0] + acc[1]) + (acc[2] + acc[3]));
+                    }
+                }
+            }
+        }
+
+        if (out_row < n_ff) {
+            FOR_UNROLL (int k = 0; k < CNT; ++k) {
+                float sg = sumf2[0][k];
+                sg += simd_shuffle_xor(sg, 8);
+                sg += simd_shuffle_xor(sg, 4);
+                sg += simd_shuffle_xor(sg, 2);
+                sg += simd_shuffle_xor(sg, 1);
+
+                float su = sumf2[1][k];
+                su += simd_shuffle_xor(su, 8);
+                su += simd_shuffle_xor(su, 4);
+                su += simd_shuffle_xor(su, 2);
+                su += simd_shuffle_xor(su, 1);
+
+                if (lane == 0) {
+                    dst_base[k][out_row] = mul_mv_situ_act(sg * post_scale, su * post_scale, sargs.inv_beta, sargs.beta, sargs.inv_lb, sargs.lb);
+                }
+            }
+        }
+        return;
+    }
+
+    const short ix = tiisg / 4;
+    const short it = tiisg % 4;
+    const int r0 = first_out;
+    const int r1 = min(first_out + 1, n_ff - 1);
+    const int rows[4] = { r0, r0 + n_ff, r1, r1 + n_ff };
+
+    float sumf[4][CNT];
+    FOR_UNROLL (int r = 0; r < 4; ++r) {
+        FOR_UNROLL (int k = 0; k < CNT; ++k) {
+            sumf[r][k] = 0.0f;
+        }
+    }
+
+    for (int ib = ix; ib < nb_eff; ib += 8) {
+        const int y_off = ib * QK_NVFP4 + it * QK_NVFP4_SUB;
+        if (CNT <= 2) {
+            float4 yl[CNT][4];
+            FOR_UNROLL (int k = 0; k < CNT; ++k) {
+                device const float4 * y4 = (device const float4 *) (y_base[k] + y_off);
+                yl[k][0] = y4[0];
+                yl[k][1] = y4[1];
+                yl[k][2] = y4[2];
+                yl[k][3] = y4[3];
+            }
+            FOR_UNROLL (int r = 0; r < 4; ++r) {
+                device const block_nvfp4 & xb = x[(uint64_t) rows[r] * ns01 + ib];
+                device const uint32_t * qw = (device const uint32_t *) (xb.qs + it * (QK_NVFP4_SUB / 2));
+                const uint32_t w0 = qw[0];
+                const uint32_t w1 = qw[1];
+                const float sc = ue4m3_to_fp32(xb.d[it]);
+                const float4 f0 = mxfp4_lo4(w0);
+                const float4 f1 = mxfp4_lo4(w1);
+                const float4 f2 = mxfp4_hi4(w0);
+                const float4 f3 = mxfp4_hi4(w1);
+                FOR_UNROLL (int k = 0; k < CNT; ++k) {
+                    const float4 acc = (yl[k][0] * f0 + yl[k][2] * f2) + (yl[k][1] * f1 + yl[k][3] * f3);
+                    sumf[r][k] += sc * ((acc[0] + acc[1]) + (acc[2] + acc[3]));
+                }
+            }
+        } else {
+            FOR_UNROLL (int r = 0; r < 4; ++r) {
+                device const block_nvfp4 & xb = x[(uint64_t) rows[r] * ns01 + ib];
+                device const uint32_t * qw = (device const uint32_t *) (xb.qs + it * (QK_NVFP4_SUB / 2));
+                const uint32_t w0 = qw[0];
+                const uint32_t w1 = qw[1];
+                const float sc = ue4m3_to_fp32(xb.d[it]);
+                const float4 f0 = mxfp4_lo4(w0);
+                const float4 f1 = mxfp4_lo4(w1);
+                const float4 f2 = mxfp4_hi4(w0);
+                const float4 f3 = mxfp4_hi4(w1);
+                FOR_UNROLL (int k = 0; k < CNT; ++k) {
+                    device const float4 * y4 = (device const float4 *) (y_base[k] + y_off);
+                    const float4 acc = (y4[0] * f0 + y4[2] * f2) + (y4[1] * f1 + y4[3] * f3);
+                    sumf[r][k] += sc * ((acc[0] + acc[1]) + (acc[2] + acc[3]));
+                }
+            }
+        }
+    }
+
+    FOR_UNROLL (int k = 0; k < CNT; ++k) {
+        const float g0 = simd_sum(sumf[0][k]) * post_scale;
+        const float u0 = simd_sum(sumf[1][k]) * post_scale;
+        const float g1 = simd_sum(sumf[2][k]) * post_scale;
+        const float u1 = simd_sum(sumf[3][k]) * post_scale;
+        if (tiisg == 0) {
+            dst_base[k][first_out] = mul_mv_situ_act(g0, u0, sargs.inv_beta, sargs.beta, sargs.inv_lb, sargs.lb);
+            if (first_out + 1 < n_ff) {
+                dst_base[k][first_out + 1] = mul_mv_situ_act(g1, u1, sargs.inv_beta, sargs.beta, sargs.inv_lb, sargs.lb);
+            }
+        }
+    }
+}
+
+[[host_name("kernel_mul_mv_id_nvfp4_f32_grouped_situ")]]
+kernel void kernel_mul_mv_id_nvfp4_f32_grouped_situ(
+        constant ggml_metal_kargs_mul_mv_id_situ & sargs,
+        device const char * src0s,
+        device const char * src1,
+        device const uint32_t * tpe,
+        device const int32_t  * hids,
+        device       char * dst,
+        device const float * w_scale,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const uint32_t tile = tgpig.z;
+    if (tile >= tpe[0]) {
+        return;
+    }
+
+    constant ggml_metal_kargs_mul_mv_id & args = sargs.base;
+    const int n_ff = args.ne0;
+    const int first_out = ((int) tgpig.x * FC_mul_mv_nsg + (int) sgitg) * 2;
+    if (first_out >= n_ff) {
+        return;
+    }
+
+    const int32_t  i02       = (int32_t) tpe[1 + 3 * tile + 0];
+    const uint32_t first_ent =           tpe[1 + 3 * tile + 1];
+    const uint32_t cnt       =           tpe[1 + 3 * tile + 2];
+
+    device const block_nvfp4 * x = (device const block_nvfp4 *) (src0s + (uint64_t) i02 * args.nb02);
+    const int nb   = args.ne00 / QK_NVFP4;
+    const int ns01 = (int) (args.nb01 / args.nb00);
+
+    device const float * y_base[4];
+    device       float * dst_base[4];
+    FOR_UNROLL (uint32_t k = 0; k < 4; ++k) {
+        const int32_t ent  = hids[first_ent + (k < cnt ? k : 0)];
+        const int64_t tok  = ent / args.nei0;
+        const int64_t slot = ent % args.nei0;
+        const int64_t i11  = slot % args.ne11;
+        y_base[k]   = (device const float *) (src1 + i11 * args.nb11 + tok * args.nb12);
+        dst_base[k] = (device       float *)  dst  + (uint64_t) slot * n_ff + (uint64_t) tok * args.ne1 * n_ff;
+    }
+
+    const float post_scale = FC_mul_mv_id_scale ? (16384.0f * w_scale[i02]) : 16384.0f;
+
+    switch (cnt) {
+        case 1: kernel_mul_mv_id_nvfp4_grouped_situ_core<1>(sargs, x, y_base, dst_base, first_out, n_ff, nb, ns01, post_scale, tiisg); break;
+        case 2: kernel_mul_mv_id_nvfp4_grouped_situ_core<2>(sargs, x, y_base, dst_base, first_out, n_ff, nb, ns01, post_scale, tiisg); break;
+        case 3: kernel_mul_mv_id_nvfp4_grouped_situ_core<3>(sargs, x, y_base, dst_base, first_out, n_ff, nb, ns01, post_scale, tiisg); break;
+        case 4: kernel_mul_mv_id_nvfp4_grouped_situ_core<4>(sargs, x, y_base, dst_base, first_out, n_ff, nb, ns01, post_scale, tiisg); break;
+    }
+}
+
+[[host_name("kernel_mul_mv_id_q8_0_f32_situ")]]
+kernel void kernel_mul_mv_id_q8_0_f32_situ(
+        constant ggml_metal_kargs_mul_mv_id_situ & sargs,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        device const char * ids,
+        device const float * w_scale,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    (void) w_scale;
+    constant ggml_metal_kargs_mul_mv_id & args = sargs.base;
+    const int n_ff = args.ne0;
+    const int iid1 = tgpig.z / args.nei0;
+    const int idx  = tgpig.z % args.nei0;
+    const int32_t i02 = ((device const int32_t *) (ids + iid1 * args.nbi1))[idx];
+
+    device float * dst_f32 = (device float *) dst + (uint64_t) idx * n_ff + (uint64_t) iid1 * args.ne1 * n_ff;
+    if (i02 == -1) {
+        const ushort nth = ntg.x * ntg.y * ntg.z;
+        for (int i0 = tiitg; i0 < n_ff; i0 += nth) {
+            dst_f32[i0] = 0.0f;
+        }
+        return;
+    }
+
+    const int first_out = ((int) tgpig.x * FC_mul_mv_nsg + (int) sgitg) * 2;
+    if (first_out >= n_ff) {
+        return;
+    }
+
+    constexpr short NQ = 8;
+    const int nb = args.ne00 / QK8_0;
+    const int64_t i11 = idx % args.ne11;
+    device const char  * src0_cur = src0s + (uint64_t) i02 * args.nb02;
+    device const float * y        = (device const float *) (src1 + i11 * args.nb11 + (int64_t) iid1 * args.nb12);
+
+    if (nb >= 4 && (nb & 7) == 4) {
+        const short sub     = tiisg >> 4;
+        const short lane    = tiisg & 15;
+        const short ix      = lane >> 2;
+        const short il      = lane & 3;
+        const int   out_row = first_out + sub;
+        const int   rr      = min(out_row, n_ff - 1);
+
+        device const block_q8_0 * xg = (device const block_q8_0 *) (src0_cur + (uint64_t) rr * args.nb01);
+        device const block_q8_0 * xu = (device const block_q8_0 *) (src0_cur + (uint64_t) (rr + n_ff) * args.nb01);
+        device const float * yb = y + ix * QK8_0 + il * NQ;
+
+        float sum_g = 0.0f;
+        float sum_u = 0.0f;
+        for (int ib = ix; ib < nb; ib += 4) {
+            const float4 y0 = float4(*(device const packed_float4 *) (yb + 0));
+            const float4 y1 = float4(*(device const packed_float4 *) (yb + 4));
+            {
+                device const block_q8_0 & xb = xg[ib];
+                device const packed_char4 * q4 = (device const packed_char4 *) (xb.qs + il * NQ);
+                sum_g += (dot(float4(q4[0]), y0) + dot(float4(q4[1]), y1)) * (float) xb.d;
+            }
+            {
+                device const block_q8_0 & xb = xu[ib];
+                device const packed_char4 * q4 = (device const packed_char4 *) (xb.qs + il * NQ);
+                sum_u += (dot(float4(q4[0]), y0) + dot(float4(q4[1]), y1)) * (float) xb.d;
+            }
+            yb += 4 * QK8_0;
+        }
+
+        sum_g += simd_shuffle_xor(sum_g, 8);
+        sum_g += simd_shuffle_xor(sum_g, 4);
+        sum_g += simd_shuffle_xor(sum_g, 2);
+        sum_g += simd_shuffle_xor(sum_g, 1);
+
+        sum_u += simd_shuffle_xor(sum_u, 8);
+        sum_u += simd_shuffle_xor(sum_u, 4);
+        sum_u += simd_shuffle_xor(sum_u, 2);
+        sum_u += simd_shuffle_xor(sum_u, 1);
+
+        if (lane == 0 && out_row < n_ff) {
+            dst_f32[out_row] = mul_mv_situ_act(sum_g, sum_u, sargs.inv_beta, sargs.beta, sargs.inv_lb, sargs.lb);
+        }
+        return;
+    }
+
+    const int r0 = first_out;
+    const int r1 = min(first_out + 1, n_ff - 1);
+    device const block_q8_0 * ax[4] = {
+        (device const block_q8_0 *) (src0_cur + (uint64_t) r0 * args.nb01),
+        (device const block_q8_0 *) (src0_cur + (uint64_t) (r0 + n_ff) * args.nb01),
+        (device const block_q8_0 *) (src0_cur + (uint64_t) r1 * args.nb01),
+        (device const block_q8_0 *) (src0_cur + (uint64_t) (r1 + n_ff) * args.nb01),
+    };
+
+    float sumf[4] = { 0.f, 0.f, 0.f, 0.f };
+    const short ix = tiisg >> 2;
+    const short il = tiisg & 3;
+    device const float * yb = y + ix * QK8_0 + il * NQ;
+
+    for (int ib = ix; ib < nb; ib += 8) {
+        const float4 y0 = float4(*(device const packed_float4 *) (yb + 0));
+        const float4 y1 = float4(*(device const packed_float4 *) (yb + 4));
+        FOR_UNROLL (short k = 0; k < 4; ++k) {
+            device const block_q8_0 & xb = ax[k][ib];
+            device const packed_char4 * q4 = (device const packed_char4 *) (xb.qs + il * NQ);
+            sumf[k] += (dot(float4(q4[0]), y0) + dot(float4(q4[1]), y1)) * (float) xb.d;
+        }
+        yb += 8 * QK8_0;
+    }
+
+    const float g0 = simd_sum(sumf[0]);
+    const float u0 = simd_sum(sumf[1]);
+    const float g1 = simd_sum(sumf[2]);
+    const float u1 = simd_sum(sumf[3]);
+    if (tiisg == 0) {
+        dst_f32[first_out] = mul_mv_situ_act(g0, u0, sargs.inv_beta, sargs.beta, sargs.inv_lb, sargs.lb);
+        if (first_out + 1 < n_ff) {
+            dst_f32[first_out + 1] = mul_mv_situ_act(g1, u1, sargs.inv_beta, sargs.beta, sargs.inv_lb, sargs.lb);
+        }
+    }
+}
+
+template<int CNT>
+static inline void kernel_mul_mv_id_q8_0_grouped_situ_core(
+        constant ggml_metal_kargs_mul_mv_id_situ & sargs,
+        device const char * src0_cur,
+        thread device const float * const y_base[4],
+        thread device float * const dst_base[4],
+        const int first_out,
+        const int n_ff,
+        const int nb,
+        const ushort tiisg) {
+    constant ggml_metal_kargs_mul_mv_id & args = sargs.base;
+    constexpr short NQ = 8;
+
+    if (nb >= 4 && (nb & 7) == 4) {
+        const short sub     = tiisg >> 4;
+        const short lane    = tiisg & 15;
+        const short ix      = lane >> 2;
+        const short il      = lane & 3;
+        const int   out_row = first_out + sub;
+        const int   rr      = min(out_row, n_ff - 1);
+
+        device const block_q8_0 * ax2[2] = {
+            (device const block_q8_0 *) (src0_cur + (uint64_t) rr * args.nb01),
+            (device const block_q8_0 *) (src0_cur + (uint64_t) (rr + n_ff) * args.nb01),
+        };
+
+        float sumf2[2][CNT];
+        FOR_UNROLL (int r = 0; r < 2; ++r) {
+            FOR_UNROLL (int k = 0; k < CNT; ++k) {
+                sumf2[r][k] = 0.0f;
+            }
+        }
+
+        for (int ib = ix; ib < nb; ib += 4) {
+            const int y_off = ib * QK8_0 + il * NQ;
+            if (CNT <= 2) {
+                float4 y0[CNT], y1[CNT];
+                FOR_UNROLL (int k = 0; k < CNT; ++k) {
+                    device const float * yb = y_base[k] + y_off;
+                    y0[k] = float4(*(device const packed_float4 *) (yb + 0));
+                    y1[k] = float4(*(device const packed_float4 *) (yb + 4));
+                }
+                FOR_UNROLL (int r = 0; r < 2; ++r) {
+                    device const block_q8_0 & xb = ax2[r][ib];
+                    device const packed_char4 * q4 = (device const packed_char4 *) (xb.qs + il * NQ);
+                    const float4 f0 = float4(q4[0]);
+                    const float4 f1 = float4(q4[1]);
+                    const float d  = (float) xb.d;
+                    FOR_UNROLL (int k = 0; k < CNT; ++k) {
+                        sumf2[r][k] += (dot(f0, y0[k]) + dot(f1, y1[k])) * d;
+                    }
+                }
+            } else {
+                FOR_UNROLL (int r = 0; r < 2; ++r) {
+                    device const block_q8_0 & xb = ax2[r][ib];
+                    device const packed_char4 * q4 = (device const packed_char4 *) (xb.qs + il * NQ);
+                    const float4 f0 = float4(q4[0]);
+                    const float4 f1 = float4(q4[1]);
+                    const float d  = (float) xb.d;
+                    FOR_UNROLL (int k = 0; k < CNT; ++k) {
+                        device const float * yb = y_base[k] + y_off;
+                        const float4 y0 = float4(*(device const packed_float4 *) (yb + 0));
+                        const float4 y1 = float4(*(device const packed_float4 *) (yb + 4));
+                        sumf2[r][k] += (dot(f0, y0) + dot(f1, y1)) * d;
+                    }
+                }
+            }
+        }
+
+        if (out_row < n_ff) {
+            FOR_UNROLL (int k = 0; k < CNT; ++k) {
+                float sg = sumf2[0][k];
+                sg += simd_shuffle_xor(sg, 8);
+                sg += simd_shuffle_xor(sg, 4);
+                sg += simd_shuffle_xor(sg, 2);
+                sg += simd_shuffle_xor(sg, 1);
+
+                float su = sumf2[1][k];
+                su += simd_shuffle_xor(su, 8);
+                su += simd_shuffle_xor(su, 4);
+                su += simd_shuffle_xor(su, 2);
+                su += simd_shuffle_xor(su, 1);
+
+                if (lane == 0) {
+                    dst_base[k][out_row] = mul_mv_situ_act(sg, su, sargs.inv_beta, sargs.beta, sargs.inv_lb, sargs.lb);
+                }
+            }
+        }
+        return;
+    }
+
+    const short ix = tiisg >> 2;
+    const short il = tiisg & 3;
+    const int r0 = first_out;
+    const int r1 = min(first_out + 1, n_ff - 1);
+    device const block_q8_0 * ax[4] = {
+        (device const block_q8_0 *) (src0_cur + (uint64_t) r0 * args.nb01),
+        (device const block_q8_0 *) (src0_cur + (uint64_t) (r0 + n_ff) * args.nb01),
+        (device const block_q8_0 *) (src0_cur + (uint64_t) r1 * args.nb01),
+        (device const block_q8_0 *) (src0_cur + (uint64_t) (r1 + n_ff) * args.nb01),
+    };
+
+    float sumf[4][CNT];
+    FOR_UNROLL (int row = 0; row < 4; ++row) {
+        FOR_UNROLL (int k = 0; k < CNT; ++k) {
+            sumf[row][k] = 0.0f;
+        }
+    }
+
+    for (int ib = ix; ib < nb; ib += 8) {
+        const int y_off = ib * QK8_0 + il * NQ;
+        if (CNT <= 2) {
+            float4 y0[CNT], y1[CNT];
+            FOR_UNROLL (int k = 0; k < CNT; ++k) {
+                device const float * yb = y_base[k] + y_off;
+                y0[k] = float4(*(device const packed_float4 *) (yb + 0));
+                y1[k] = float4(*(device const packed_float4 *) (yb + 4));
+            }
+            FOR_UNROLL (int row = 0; row < 4; ++row) {
+                device const block_q8_0 & xb = ax[row][ib];
+                device const packed_char4 * q4 = (device const packed_char4 *) (xb.qs + il * NQ);
+                const float4 f0 = float4(q4[0]);
+                const float4 f1 = float4(q4[1]);
+                const float d  = (float) xb.d;
+                FOR_UNROLL (int k = 0; k < CNT; ++k) {
+                    sumf[row][k] += (dot(f0, y0[k]) + dot(f1, y1[k])) * d;
+                }
+            }
+        } else {
+            FOR_UNROLL (int row = 0; row < 4; ++row) {
+                device const block_q8_0 & xb = ax[row][ib];
+                device const packed_char4 * q4 = (device const packed_char4 *) (xb.qs + il * NQ);
+                const float4 f0 = float4(q4[0]);
+                const float4 f1 = float4(q4[1]);
+                const float d  = (float) xb.d;
+                FOR_UNROLL (int k = 0; k < CNT; ++k) {
+                    device const float * yb = y_base[k] + y_off;
+                    const float4 y0 = float4(*(device const packed_float4 *) (yb + 0));
+                    const float4 y1 = float4(*(device const packed_float4 *) (yb + 4));
+                    sumf[row][k] += (dot(f0, y0) + dot(f1, y1)) * d;
+                }
+            }
+        }
+    }
+
+    FOR_UNROLL (int k = 0; k < CNT; ++k) {
+        const float g0 = simd_sum(sumf[0][k]);
+        const float u0 = simd_sum(sumf[1][k]);
+        const float g1 = simd_sum(sumf[2][k]);
+        const float u1 = simd_sum(sumf[3][k]);
+        if (tiisg == 0) {
+            dst_base[k][first_out] = mul_mv_situ_act(g0, u0, sargs.inv_beta, sargs.beta, sargs.inv_lb, sargs.lb);
+            if (first_out + 1 < n_ff) {
+                dst_base[k][first_out + 1] = mul_mv_situ_act(g1, u1, sargs.inv_beta, sargs.beta, sargs.inv_lb, sargs.lb);
+            }
+        }
+    }
+}
+
+[[host_name("kernel_mul_mv_id_q8_0_f32_grouped_situ")]]
+kernel void kernel_mul_mv_id_q8_0_f32_grouped_situ(
+        constant ggml_metal_kargs_mul_mv_id_situ & sargs,
+        device const char * src0s,
+        device const char * src1,
+        device const uint32_t * tpe,
+        device const int32_t  * hids,
+        device       char * dst,
+        device const float * w_scale,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    (void) w_scale;
+    const uint32_t tile = tgpig.z;
+    if (tile >= tpe[0]) {
+        return;
+    }
+
+    constant ggml_metal_kargs_mul_mv_id & args = sargs.base;
+    const int n_ff = args.ne0;
+    const int first_out = ((int) tgpig.x * FC_mul_mv_nsg + (int) sgitg) * 2;
+    if (first_out >= n_ff) {
+        return;
+    }
+
+    const int32_t  i02       = (int32_t) tpe[1 + 3 * tile + 0];
+    const uint32_t first_ent =           tpe[1 + 3 * tile + 1];
+    const uint32_t cnt       =           tpe[1 + 3 * tile + 2];
+
+    device const char * src0_cur = src0s + (uint64_t) i02 * args.nb02;
+    const int nb = args.ne00 / QK8_0;
+
+    device const float * y_base[4];
+    device       float * dst_base[4];
+    FOR_UNROLL (uint32_t k = 0; k < 4; ++k) {
+        const int32_t ent  = hids[first_ent + (k < cnt ? k : 0)];
+        const int64_t tok  = ent / args.nei0;
+        const int64_t slot = ent % args.nei0;
+        const int64_t i11  = slot % args.ne11;
+        y_base[k]   = (device const float *) (src1 + i11 * args.nb11 + tok * args.nb12);
+        dst_base[k] = (device       float *)  dst  + (uint64_t) slot * n_ff + (uint64_t) tok * args.ne1 * n_ff;
+    }
+
+    switch (cnt) {
+        case 1: kernel_mul_mv_id_q8_0_grouped_situ_core<1>(sargs, src0_cur, y_base, dst_base, first_out, n_ff, nb, tiisg); break;
+        case 2: kernel_mul_mv_id_q8_0_grouped_situ_core<2>(sargs, src0_cur, y_base, dst_base, first_out, n_ff, nb, tiisg); break;
+        case 3: kernel_mul_mv_id_q8_0_grouped_situ_core<3>(sargs, src0_cur, y_base, dst_base, first_out, n_ff, nb, tiisg); break;
+        case 4: kernel_mul_mv_id_q8_0_grouped_situ_core<4>(sargs, src0_cur, y_base, dst_base, first_out, n_ff, nb, tiisg); break;
+    }
+}
+
 #if defined(GGML_METAL_HAS_BF16)
 template<int NR0, int CNT>
 static inline void kernel_mul_mv_id_bf16_grouped_core(
