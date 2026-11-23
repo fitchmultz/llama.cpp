@@ -3674,6 +3674,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_SAVE_PATH"));
     add_opt(common_arg(
+        {"--slot-save-auto"},
+        {"--no-slot-save-auto"},
+        string_format("automatically save non-empty slots to --slot-save-path on sleep/shutdown and restore them on startup/wake (default: %s)", params.slot_save_auto ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.slot_save_auto = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_SAVE_AUTO"));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {

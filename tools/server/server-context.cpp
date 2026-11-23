@@ -1197,6 +1197,7 @@ private:
                 // note: for sleeping == false, event is emitted by load_model()
             }
             SRV_INF("%s", "server is entering sleeping state\n");
+            auto_save_slots();
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
@@ -1681,6 +1682,14 @@ private:
 
         // propagate new defaults back to caller
         params = params_base;
+
+        if (params_base.slot_save_auto && params_base.slot_save_path.empty()) {
+            if (!is_resume) {
+                SRV_WRN("%s", "--slot-save-auto requires --slot-save-path; auto-persistence disabled\n");
+            }
+        } else {
+            auto_restore_slots();
+        }
 
         if (!is_resume) {
             return init();
@@ -2972,6 +2981,242 @@ private:
         return n_read;
     }
 
+    std::string build_auto_slot_meta() const {
+        auto file_sig = [](const std::string & path) -> std::string {
+            if (path.empty()) {
+                return "none";
+            }
+            std::error_code ec;
+            const auto sz = std::filesystem::file_size(path, ec);
+            const auto mt = std::filesystem::last_write_time(path, ec);
+            if (ec) {
+                return path;
+            }
+            return string_format("%s|%llu|%lld", path.c_str(),
+                    (unsigned long long) sz,
+                    (long long) mt.time_since_epoch().count());
+        };
+        return string_format(
+                "version=1\nmodel=%s\nn_ctx=%u\nn_parallel=%d\ntype_k=%d\ntype_v=%d\ndraft=%s\ndraft_k=%d\ndraft_v=%d\n",
+                file_sig(params_base.model.path).c_str(),
+                ctx_tgt ? llama_n_ctx(ctx_tgt) : 0u,
+                params_base.n_parallel,
+                (int) params_base.cache_type_k,
+                (int) params_base.cache_type_v,
+                file_sig(params_base.speculative.draft.mparams.path).c_str(),
+                (int) params_base.speculative.draft.cache_type_k,
+                (int) params_base.speculative.draft.cache_type_v);
+    }
+
+    bool save_slot_to_file(const server_slot & slot, const std::string & filepath, size_t & n_bytes_out, std::string & err_out, enum error_type & err_type_out) const {
+        n_bytes_out = 0;
+        std::vector<char> packed;
+        try {
+            packed = slot.prompt.tokens.serialize();
+        } catch (const std::exception & err) {
+            err_out = err.what();
+            err_type_out = ERROR_TYPE_NOT_SUPPORTED;
+            return false;
+        }
+
+        GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+        const size_t nwrite = llama_state_seq_save_file(
+            ctx_tgt, filepath.c_str(), slot.id,
+            reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+        if (nwrite == 0) {
+            err_out = "Unable to save slot";
+            err_type_out = ERROR_TYPE_SERVER;
+            return false;
+        }
+
+        size_t nwrite_ckpt = 0;
+        if (!save_slot_checkpoints(filepath, slot, nwrite_ckpt)) {
+            err_out = "Unable to save slot: incomplete context checkpoints";
+            err_type_out = ERROR_TYPE_SERVER;
+            return false;
+        }
+
+        size_t nwrite_dft = 0;
+        if (!save_slot_draft(filepath, slot, nwrite_dft)) {
+            err_out = "Unable to save slot: incomplete draft state";
+            err_type_out = ERROR_TYPE_SERVER;
+            return false;
+        }
+
+        n_bytes_out = nwrite + nwrite_ckpt + nwrite_dft;
+        return true;
+    }
+
+    bool restore_slot_from_file(server_slot & slot, const std::string & filepath, size_t & n_bytes_out, std::string & err_out) {
+        n_bytes_out = 0;
+        size_t nread = 0;
+        try {
+            size_t n_packed = 0;
+            llama_tokens packed;
+            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot.id, nullptr, 0, &n_packed);
+            if (nread != 0) {
+                packed.resize(std::max<size_t>(1, n_packed));
+                nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot.id, packed.data(), packed.size(), &n_packed);
+            }
+            if (nread == 0) {
+                throw std::runtime_error("No available space in KV cache or invalid slot save file");
+            }
+            packed.resize(n_packed);
+
+            server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
+
+            if (restored.size() > (size_t) slot.n_ctx) {
+                throw std::runtime_error("Restored prompt does not fit in the slot context");
+            }
+
+            if (!restored.validate(ctx_tgt)) {
+                throw std::runtime_error("Invalid tokens in slot save file");
+            }
+
+            slot.prompt.clear();
+            slot.prompt.tokens = std::move(restored);
+        } catch (const std::exception & err) {
+            slot.prompt_clear();
+            err_out = err.what();
+            return false;
+        }
+
+        // nread is the end offset of the llama state payload within the file
+        const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, slot);
+        const size_t nread_dft  = load_slot_draft(filepath, nread + nread_ckpt, slot);
+        n_bytes_out = nread + nread_ckpt + nread_dft;
+        return true;
+    }
+
+    void auto_save_slots() {
+        if (!params_base.slot_save_auto || params_base.slot_save_path.empty() || ctx_tgt == nullptr || sleeping) {
+            return;
+        }
+
+        const int64_t t_start = ggml_time_us();
+        llama_synchronize(ctx_tgt);
+        if (ctx_dft != nullptr) {
+            llama_synchronize(ctx_dft);
+        }
+
+        const std::string meta_path = params_base.slot_save_path + "auto-slots-meta.txt";
+        const std::string meta_tmp  = meta_path + ".tmp";
+        {
+            std::ofstream ofs(meta_tmp, std::ios::binary | std::ios::trunc);
+            if (!ofs) {
+                SRV_WRN("auto-save slots: failed to write '%s'\n", meta_tmp.c_str());
+                return;
+            }
+            const std::string meta = build_auto_slot_meta();
+            ofs.write(meta.data(), meta.size());
+            ofs.flush();
+            if (!ofs) {
+                std::error_code ec;
+                std::filesystem::remove(meta_tmp, ec);
+                SRV_WRN("auto-save slots: incomplete write to '%s'\n", meta_tmp.c_str());
+                return;
+            }
+        }
+        {
+            std::error_code ec;
+            std::filesystem::rename(meta_tmp, meta_path, ec);
+            if (ec) {
+                std::filesystem::remove(meta_tmp, ec);
+                SRV_WRN("auto-save slots: failed to rename '%s': %s\n", meta_path.c_str(), ec.message().c_str());
+                return;
+            }
+        }
+
+        size_t n_saved  = 0;
+        size_t n_tokens = 0;
+        size_t n_bytes  = 0;
+        for (const auto & slot : slots) {
+            const std::string final_path = params_base.slot_save_path + string_format("auto-slot-%d.bin", slot.id);
+            const std::string tmp_path   = final_path + ".tmp";
+            const bool has_state = !slot.prompt.tokens.empty() &&
+                    llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) >= 0;
+            if (!has_state) {
+                std::error_code ec;
+                std::filesystem::remove(final_path, ec);
+                std::filesystem::remove(tmp_path, ec);
+                continue;
+            }
+
+            size_t slot_bytes = 0;
+            std::string err;
+            enum error_type err_type = ERROR_TYPE_SERVER;
+            if (save_slot_to_file(slot, tmp_path, slot_bytes, err, err_type)) {
+                std::error_code ec;
+                std::filesystem::rename(tmp_path, final_path, ec);
+                if (ec) {
+                    std::filesystem::remove(tmp_path, ec);
+                    std::filesystem::remove(final_path, ec);
+                    SLT_WRN(slot, "auto-save rename failed for '%s': %s\n", final_path.c_str(), ec.message().c_str());
+                } else {
+                    n_saved++;
+                    n_tokens += slot.prompt.tokens.size();
+                    n_bytes  += slot_bytes;
+                }
+            } else {
+                std::error_code ec;
+                std::filesystem::remove(tmp_path, ec);
+                std::filesystem::remove(final_path, ec);
+                SLT_WRN(slot, "auto-save failed: %s\n", err.c_str());
+            }
+        }
+
+        const double t_ms = (ggml_time_us() - t_start) / 1000.0;
+        SRV_INF("auto-saved %zu slot(s) (%zu tokens, %.2f MiB) to '%s' in %.1f ms\n",
+                n_saved, n_tokens, (double) n_bytes / (1024.0 * 1024.0), params_base.slot_save_path.c_str(), t_ms);
+    }
+
+    void auto_restore_slots() {
+        if (!params_base.slot_save_auto || params_base.slot_save_path.empty() || ctx_tgt == nullptr) {
+            return;
+        }
+
+        const std::string meta_path = params_base.slot_save_path + "auto-slots-meta.txt";
+        std::ifstream ifs(meta_path, std::ios::binary);
+        if (!ifs) {
+            return; // no saved slots yet
+        }
+        const std::string saved_meta((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        if (saved_meta != build_auto_slot_meta()) {
+            SRV_INF("skipping slot auto-restore from '%s': saved metadata does not match current model/context\n",
+                    params_base.slot_save_path.c_str());
+            return;
+        }
+
+        const int64_t t_start = ggml_time_us();
+        size_t n_restored = 0;
+        size_t n_tokens   = 0;
+        size_t n_bytes    = 0;
+        for (auto & slot : slots) {
+            const std::string final_path = params_base.slot_save_path + string_format("auto-slot-%d.bin", slot.id);
+            std::error_code ec;
+            if (!std::filesystem::exists(final_path, ec)) {
+                continue;
+            }
+            size_t slot_bytes = 0;
+            std::string err;
+            if (restore_slot_from_file(slot, final_path, slot_bytes, err)) {
+                slot.t_last_used = ggml_time_us();
+                n_restored++;
+                n_tokens += slot.prompt.tokens.size();
+                n_bytes  += slot_bytes;
+            } else {
+                SLT_WRN(slot, "auto-restore failed for '%s': %s (removing stale file)\n", final_path.c_str(), err.c_str());
+                std::filesystem::remove(final_path, ec);
+            }
+        }
+
+        if (n_restored > 0) {
+            const double t_ms = (ggml_time_us() - t_start) / 1000.0;
+            SRV_INF("auto-restored %zu slot(s) (%zu tokens, %.2f MiB) from '%s' in %.1f ms\n",
+                    n_restored, n_tokens, (double) n_bytes / (1024.0 * 1024.0), params_base.slot_save_path.c_str(), t_ms);
+        }
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -3217,32 +3462,11 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
-                    std::vector<char> packed;
-                    try {
-                        packed = slot->prompt.tokens.serialize();
-                    } catch (const std::exception & err) {
-                        send_error(task, err.what(), ERROR_TYPE_NOT_SUPPORTED);
-                        break;
-                    }
-
-                    GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
-                    const size_t nwrite = llama_state_seq_save_file(
-                        ctx_tgt, filepath.c_str(), slot->id,
-                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
-                    if (nwrite == 0) {
-                        send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
-                        break;
-                    }
-
-                    size_t nwrite_ckpt = 0;
-                    if (!save_slot_checkpoints(filepath, *slot, nwrite_ckpt)) {
-                        send_error(task, "Unable to save slot: incomplete context checkpoints", ERROR_TYPE_SERVER);
-                        break;
-                    }
-
-                    size_t nwrite_dft = 0;
-                    if (!save_slot_draft(filepath, *slot, nwrite_dft)) {
-                        send_error(task, "Unable to save slot: incomplete draft state", ERROR_TYPE_SERVER);
+                    size_t n_bytes = 0;
+                    std::string err;
+                    enum error_type err_type = ERROR_TYPE_SERVER;
+                    if (!save_slot_to_file(*slot, filepath, n_bytes, err, err_type)) {
+                        send_error(task, err, err_type);
                         break;
                     }
 
@@ -3255,7 +3479,7 @@ private:
                     res->filename = filename;
                     res->is_save  = true;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nwrite + nwrite_ckpt + nwrite_dft;
+                    res->n_bytes  = n_bytes;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -3279,41 +3503,12 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
-                    size_t nread = 0;
-                    try {
-                        size_t n_packed = 0;
-                        llama_tokens packed;
-                        nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
-                        if (nread != 0) {
-                            packed.resize(std::max<size_t>(1, n_packed));
-                            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
-                        }
-                        if (nread == 0) {
-                            throw std::runtime_error("No available space in KV cache or invalid slot save file");
-                        }
-                        packed.resize(n_packed);
-
-                        server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
-
-                        if (restored.size() > (size_t) slot->n_ctx) {
-                            throw std::runtime_error("Restored prompt does not fit in the slot context");
-                        }
-
-                        if (!restored.validate(ctx_tgt)) {
-                            throw std::runtime_error("Invalid tokens in slot save file");
-                        }
-
-                        slot->prompt.clear();
-                        slot->prompt.tokens = std::move(restored);
-                    } catch (const std::exception & err) {
-                        slot->prompt_clear();
-                        send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
+                    size_t n_bytes = 0;
+                    std::string err;
+                    if (!restore_slot_from_file(*slot, filepath, n_bytes, err)) {
+                        send_error(task, std::string("Unable to restore slot: ") + err, ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-
-                    // nread is the end offset of the llama state payload within the file
-                    const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, *slot);
-                    const size_t nread_dft  = load_slot_draft(filepath, nread + nread_ckpt, *slot);
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -3324,7 +3519,7 @@ private:
                     res->filename = filename;
                     res->is_save  = false;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nread + nread_ckpt + nread_dft;
+                    res->n_bytes  = n_bytes;
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -5276,6 +5471,7 @@ bool server_context::load_model(common_params & params) {
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
+    impl->auto_save_slots();
 }
 
 void server_context::terminate() {
