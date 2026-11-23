@@ -2795,8 +2795,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_sigmoid(ggml
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_depth_mix(ggml_metal_library_t lib, bool has_norm) {
-    const char * name = has_norm ? "kernel_depth_mix_norm_f32_4" : "kernel_depth_mix_f32_4";
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_depth_mix(ggml_metal_library_t lib, enum ggml_type tq, bool has_norm, bool multi_q, int nth) {
+    char name[128];
+    const char * qname = (tq == GGML_TYPE_F16) ? "f16" : (tq == GGML_TYPE_BF16 ? "bf16" : "f32");
+    if (multi_q) {
+        snprintf(name, sizeof(name), "kernel_depth_mix_mq_%s_%d_4", qname, nth);
+    } else if (has_norm) {
+        snprintf(name, sizeof(name), "kernel_depth_mix_norm_%s_%d_4", qname, nth);
+    } else {
+        snprintf(name, sizeof(name), "kernel_depth_mix_%s_%d_4", qname, nth);
+    }
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {

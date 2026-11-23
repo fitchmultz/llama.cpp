@@ -336,7 +336,12 @@ kernel void kernel_situ_f32_4(
     }
 }
 
-template <bool HAS_NORM>
+template <typename Q4_T>
+static inline float4 depth_mix_load_q4(device const char * q_base, int i) {
+    return float4(((device const Q4_T *) q_base)[i]);
+}
+
+template <bool HAS_NORM, typename Q4_T, int NTH>
 kernel void kernel_depth_mix_impl(
         constant ggml_metal_kargs_depth_mix & args,
         device const char * blocks,
@@ -348,22 +353,23 @@ kernel void kernel_depth_mix_impl(
         ushort3 tpitg[[thread_position_in_threadgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]],
         ushort  tiisg[[thread_index_in_simdgroup]]) {
+    constexpr int NSG = NTH / 32;
     const int tok    = tgpig.x;
     const int j      = tgpig.y;
     const int k_prev = args.k_prev;
     const int K      = k_prev + 1;
 
     device const float4 * cur_row = (device const float4 *) (cur   + tok * args.nb11);
-    device const float4 * q_row   = (device const float4 *) (query + j   * args.nb21);
+    device const char   * q_row   =                          query + j   * args.nb21;
 
     // 1. Single-pass: accumulate ||cur||^2, dot(cur, q), and dot(blocks[k], q) before one barrier
     float ss = 0.0f;
     float s_cur = 0.0f;
     float4 cn[4];
     int cidx = 0;
-    for (int i = tpitg.x; i < args.ne00; i += 256) {
+    for (int i = tpitg.x; i < args.ne00; i += NTH) {
         const float4 v = cur_row[i];
-        const float4 q = q_row[i];
+        const float4 q = depth_mix_load_q4<Q4_T>(q_row, i);
         ss    += dot(v, v);
         s_cur += dot(v, q);
         if (cidx < 4) {
@@ -372,41 +378,42 @@ kernel void kernel_depth_mix_impl(
         cidx++;
     }
 
-    float sc[16];
-    sc[k_prev] = simd_sum(s_cur);
-    ss         = simd_sum(ss);
+    // shmem[sg * 17 + 0..K-1] = simdgroup dot partials; shmem[sg * 17 + 16] = simdgroup ss partial
+    // shmem[NSG * 17 + 0..NSG-1] = optional HAS_NORM output sum-of-squares partials
+    threadgroup float shmem[NSG * 17 + NSG];
+    const float sc_cur = simd_sum(s_cur);
+    ss = simd_sum(ss);
+    if (tiisg == 0) {
+        shmem[sgitg * 17 + k_prev] = sc_cur;
+        shmem[sgitg * 17 + 16]     = ss;
+    }
 
     for (int k = 0; k < k_prev; ++k) {
         device const float4 * b_row = (device const float4 *) (blocks + tok * args.nb02 + k * args.nb01);
         float sk = 0.0f;
-        for (int i = tpitg.x; i < args.ne00; i += 256) {
-            sk += dot(b_row[i], q_row[i]);
+        for (int i = tpitg.x; i < args.ne00; i += NTH) {
+            sk += dot(b_row[i], depth_mix_load_q4<Q4_T>(q_row, i));
         }
-        sc[k] = simd_sum(sk);
-    }
-
-    // shmem[sg * 17 + 0..K-1] = simdgroup dot partials; shmem[sg * 17 + 16] = simdgroup ss partial
-    // shmem[8 * 17 + 0..7] = optional HAS_NORM output sum-of-squares partials (separate slots -> no extra pre-barrier!)
-    threadgroup float shmem[8 * 17 + 8];
-    if (tiisg == 0) {
-        for (int k = 0; k < K; ++k) {
-            shmem[sgitg * 17 + k] = sc[k];
+        sk = simd_sum(sk);
+        if (tiisg == 0) {
+            shmem[sgitg * 17 + k] = sk;
         }
-        shmem[sgitg * 17 + 16] = ss;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const float tot_ss =
-        shmem[0*17 + 16] + shmem[1*17 + 16] + shmem[2*17 + 16] + shmem[3*17 + 16] +
-        shmem[4*17 + 16] + shmem[5*17 + 16] + shmem[6*17 + 16] + shmem[7*17 + 16];
+    float tot_ss = 0.0f;
+    FOR_UNROLL (int sg = 0; sg < NSG; ++sg) {
+        tot_ss += shmem[sg * 17 + 16];
+    }
     const float inv_rms = rsqrt(tot_ss / float(args.ne00 * 4) + args.eps);
 
     float w[16];
     float smax = -INFINITY;
     for (int k = 0; k < K; ++k) {
-        float tot =
-            shmem[0*17 + k] + shmem[1*17 + k] + shmem[2*17 + k] + shmem[3*17 + k] +
-            shmem[4*17 + k] + shmem[5*17 + k] + shmem[6*17 + k] + shmem[7*17 + k];
+        float tot = 0.0f;
+        FOR_UNROLL (int sg = 0; sg < NSG; ++sg) {
+            tot += shmem[sg * 17 + k];
+        }
         if (k == k_prev) {
             tot *= inv_rms;
         }
@@ -429,7 +436,7 @@ kernel void kernel_depth_mix_impl(
         float4 acc_reg[4];
         float out_ss = 0.0f;
         int ci = 0;
-        for (int i = tpitg.x; i < args.ne00; i += 256) {
+        for (int i = tpitg.x; i < args.ne00; i += NTH) {
             float4 acc = w_cur * ((ci < 4) ? cn[ci] : cur_row[i]);
             for (int k = 0; k < k_prev; ++k) {
                 device const float4 * b_row = (device const float4 *) (blocks + tok * args.nb02 + k * args.nb01);
@@ -441,22 +448,23 @@ kernel void kernel_depth_mix_impl(
         }
         out_ss = simd_sum(out_ss);
         if (tiisg == 0) {
-            shmem[8 * 17 + sgitg] = out_ss;
+            shmem[NSG * 17 + sgitg] = out_ss;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        const float tot_out_ss =
-            shmem[8*17 + 0] + shmem[8*17 + 1] + shmem[8*17 + 2] + shmem[8*17 + 3] +
-            shmem[8*17 + 4] + shmem[8*17 + 5] + shmem[8*17 + 6] + shmem[8*17 + 7];
+        float tot_out_ss = 0.0f;
+        FOR_UNROLL (int sg = 0; sg < NSG; ++sg) {
+            tot_out_ss += shmem[NSG * 17 + sg];
+        }
         const float out_inv_rms = rsqrt(tot_out_ss / float(args.ne00 * 4) + args.norm_eps);
         device const float4 * nw_row = (device const float4 *) norm_w;
         ci = 0;
-        for (int i = tpitg.x; i < args.ne00; i += 256) {
+        for (int i = tpitg.x; i < args.ne00; i += NTH) {
             out_row[i] = acc_reg[ci] * out_inv_rms * nw_row[i];
             ci++;
         }
     } else {
         int ci = 0;
-        for (int i = tpitg.x; i < args.ne00; i += 256) {
+        for (int i = tpitg.x; i < args.ne00; i += NTH) {
             float4 acc = w_cur * ((ci < 4) ? cn[ci] : cur_row[i]);
             for (int k = 0; k < k_prev; ++k) {
                 device const float4 * b_row = (device const float4 *) (blocks + tok * args.nb02 + k * args.nb01);
@@ -468,9 +476,192 @@ kernel void kernel_depth_mix_impl(
     }
 }
 
-typedef decltype(kernel_depth_mix_impl<false>) kernel_depth_mix_t;
-template [[host_name("kernel_depth_mix_f32_4")]]      kernel kernel_depth_mix_t kernel_depth_mix_impl<false>;
-template [[host_name("kernel_depth_mix_norm_f32_4")]] kernel kernel_depth_mix_t kernel_depth_mix_impl<true>;
+// Multi-query coalesced DEPTH_MIX for prefill (n_q > 1, n_tokens >= 32, !has_norm):
+// tiles up to 4 queries per threadgroup so cur and blocks[0..k_prev-1] are read ONCE per 4 queries.
+template <typename Q4_T, int NTH>
+kernel void kernel_depth_mix_mq_impl(
+        constant ggml_metal_kargs_depth_mix & args,
+        device const char * blocks,
+        device const char * cur,
+        device const char * query,
+        device       char * dst,
+        device const char * norm_w,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]]) {
+    (void) norm_w;
+    constexpr int NSG = NTH / 32;
+    const int tok    = tgpig.x;
+    const int j0     = tgpig.y * 4;
+    const int q_cnt  = min(4, args.n_q - j0);
+    const int k_prev = args.k_prev;
+    const int K      = k_prev + 1;
+
+    device const float4 * cur_row = (device const float4 *) (cur + tok * args.nb11);
+    device const char * q_rows[4];
+    FOR_UNROLL (int jq = 0; jq < 4; ++jq) {
+        const int j = min(j0 + jq, args.n_q - 1);
+        q_rows[jq] = query + j * args.nb21;
+    }
+
+    threadgroup float shmem[NSG * 17 * 4 + NSG];
+    threadgroup float w_sm[4][16];
+    threadgroup float w_cur_sm[4];
+
+    // 1. Read cur ONCE for ||cur||^2 and dot(cur, q[0..q_cnt-1])
+    float ss = 0.0f;
+    float s_cur[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float4 cn[4];
+    int cidx = 0;
+    for (int i = tpitg.x; i < args.ne00; i += NTH) {
+        const float4 v = cur_row[i];
+        ss += dot(v, v);
+        s_cur[0] += dot(v, depth_mix_load_q4<Q4_T>(q_rows[0], i));
+        if (q_cnt > 1) s_cur[1] += dot(v, depth_mix_load_q4<Q4_T>(q_rows[1], i));
+        if (q_cnt > 2) s_cur[2] += dot(v, depth_mix_load_q4<Q4_T>(q_rows[2], i));
+        if (q_cnt > 3) s_cur[3] += dot(v, depth_mix_load_q4<Q4_T>(q_rows[3], i));
+        if (cidx < 4) {
+            cn[cidx] = v;
+        }
+        cidx++;
+    }
+
+    ss = simd_sum(ss);
+    FOR_UNROLL (int jq = 0; jq < 4; ++jq) {
+        if (jq < q_cnt) {
+            const float sc = simd_sum(s_cur[jq]);
+            if (tiisg == 0) {
+                shmem[(sgitg * 17 + k_prev) * 4 + jq] = sc;
+            }
+        }
+    }
+    if (tiisg == 0) {
+        shmem[NSG * 17 * 4 + sgitg] = ss;
+    }
+
+    // 2. Read each blocks[k] ONCE for all q_cnt queries
+    for (int k = 0; k < k_prev; ++k) {
+        device const float4 * b_row = (device const float4 *) (blocks + tok * args.nb02 + k * args.nb01);
+        float sk[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (int i = tpitg.x; i < args.ne00; i += NTH) {
+            const float4 bv = b_row[i];
+            sk[0] += dot(bv, depth_mix_load_q4<Q4_T>(q_rows[0], i));
+            if (q_cnt > 1) sk[1] += dot(bv, depth_mix_load_q4<Q4_T>(q_rows[1], i));
+            if (q_cnt > 2) sk[2] += dot(bv, depth_mix_load_q4<Q4_T>(q_rows[2], i));
+            if (q_cnt > 3) sk[3] += dot(bv, depth_mix_load_q4<Q4_T>(q_rows[3], i));
+        }
+        FOR_UNROLL (int jq = 0; jq < 4; ++jq) {
+            if (jq < q_cnt) {
+                const float tot = simd_sum(sk[jq]);
+                if (tiisg == 0) {
+                    shmem[(sgitg * 17 + k) * 4 + jq] = tot;
+                }
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 3. Softmax over K for each of the q_cnt queries (4 threads in parallel, zero register array)
+    if (tpitg.x < (ushort) q_cnt) {
+        const int jq = tpitg.x;
+        float tot_ss = 0.0f;
+        FOR_UNROLL (int sg = 0; sg < NSG; ++sg) {
+            tot_ss += shmem[NSG * 17 * 4 + sg];
+        }
+        const float inv_rms = rsqrt(tot_ss / float(args.ne00 * 4) + args.eps);
+
+        float smax = -INFINITY;
+        float w_last = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            float tot = 0.0f;
+            FOR_UNROLL (int sg = 0; sg < NSG; ++sg) {
+                tot += shmem[(sg * 17 + k) * 4 + jq];
+            }
+            if (k == k_prev) {
+                tot *= inv_rms;
+                w_last = tot * args.scale;
+                smax = max(smax, w_last);
+            } else {
+                const float wk = tot * args.scale;
+                w_sm[jq][k] = wk;
+                smax = max(smax, wk);
+            }
+        }
+        float wsum = 0.0f;
+        for (int k = 0; k < k_prev; ++k) {
+            const float ek = exp(w_sm[jq][k] - smax);
+            w_sm[jq][k] = ek;
+            wsum += ek;
+        }
+        w_last = exp(w_last - smax);
+        wsum += w_last;
+        const float inv_wsum = 1.0f / wsum;
+        for (int k = 0; k < k_prev; ++k) {
+            w_sm[jq][k] *= inv_wsum;
+        }
+        w_cur_sm[jq] = w_last * inv_wsum * inv_rms;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 4. Weighted sum: read cur (from cn[]) and blocks[k] ONCE for all q_cnt outputs
+    device float4 * out0 = (device float4 *) (dst + tok * args.nb2 + (j0 + 0) * args.nb1);
+    device float4 * out1 = (device float4 *) (dst + tok * args.nb2 + min(j0 + 1, args.n_q - 1) * args.nb1);
+    device float4 * out2 = (device float4 *) (dst + tok * args.nb2 + min(j0 + 2, args.n_q - 1) * args.nb1);
+    device float4 * out3 = (device float4 *) (dst + tok * args.nb2 + min(j0 + 3, args.n_q - 1) * args.nb1);
+
+    const float wc0 = w_cur_sm[0];
+    const float wc1 = (q_cnt > 1) ? w_cur_sm[1] : 0.0f;
+    const float wc2 = (q_cnt > 2) ? w_cur_sm[2] : 0.0f;
+    const float wc3 = (q_cnt > 3) ? w_cur_sm[3] : 0.0f;
+
+    int ci = 0;
+    for (int i = tpitg.x; i < args.ne00; i += NTH) {
+        const float4 cv = (ci < 4) ? cn[ci] : cur_row[i];
+        float4 acc0 = wc0 * cv;
+        float4 acc1 = wc1 * cv;
+        float4 acc2 = wc2 * cv;
+        float4 acc3 = wc3 * cv;
+        for (int k = 0; k < k_prev; ++k) {
+            device const float4 * b_row = (device const float4 *) (blocks + tok * args.nb02 + k * args.nb01);
+            const float4 bv = b_row[i];
+            acc0 += w_sm[0][k] * bv;
+            if (q_cnt > 1) acc1 += w_sm[1][k] * bv;
+            if (q_cnt > 2) acc2 += w_sm[2][k] * bv;
+            if (q_cnt > 3) acc3 += w_sm[3][k] * bv;
+        }
+        out0[i] = acc0;
+        if (q_cnt > 1) out1[i] = acc1;
+        if (q_cnt > 2) out2[i] = acc2;
+        if (q_cnt > 3) out3[i] = acc3;
+        ci++;
+    }
+}
+
+typedef decltype(kernel_depth_mix_impl<false, float4, 256>) kernel_depth_mix_t;
+template [[host_name("kernel_depth_mix_f32_192_4")]]      kernel kernel_depth_mix_t kernel_depth_mix_impl<false, float4, 192>;
+template [[host_name("kernel_depth_mix_f32_256_4")]]      kernel kernel_depth_mix_t kernel_depth_mix_impl<false, float4, 256>;
+template [[host_name("kernel_depth_mix_norm_f32_192_4")]] kernel kernel_depth_mix_t kernel_depth_mix_impl<true,  float4, 192>;
+template [[host_name("kernel_depth_mix_norm_f32_256_4")]] kernel kernel_depth_mix_t kernel_depth_mix_impl<true,  float4, 256>;
+template [[host_name("kernel_depth_mix_f16_192_4")]]      kernel kernel_depth_mix_t kernel_depth_mix_impl<false, half4,  192>;
+template [[host_name("kernel_depth_mix_f16_256_4")]]      kernel kernel_depth_mix_t kernel_depth_mix_impl<false, half4,  256>;
+template [[host_name("kernel_depth_mix_norm_f16_192_4")]] kernel kernel_depth_mix_t kernel_depth_mix_impl<true,  half4,  192>;
+template [[host_name("kernel_depth_mix_norm_f16_256_4")]] kernel kernel_depth_mix_t kernel_depth_mix_impl<true,  half4,  256>;
+
+typedef decltype(kernel_depth_mix_mq_impl<float4, 256>) kernel_depth_mix_mq_t;
+template [[host_name("kernel_depth_mix_mq_f32_192_4")]] kernel kernel_depth_mix_mq_t kernel_depth_mix_mq_impl<float4, 192>;
+template [[host_name("kernel_depth_mix_mq_f32_256_4")]] kernel kernel_depth_mix_mq_t kernel_depth_mix_mq_impl<float4, 256>;
+template [[host_name("kernel_depth_mix_mq_f16_192_4")]] kernel kernel_depth_mix_mq_t kernel_depth_mix_mq_impl<half4,  192>;
+template [[host_name("kernel_depth_mix_mq_f16_256_4")]] kernel kernel_depth_mix_mq_t kernel_depth_mix_mq_impl<half4,  256>;
+
+#if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_depth_mix_bf16_192_4")]]      kernel kernel_depth_mix_t    kernel_depth_mix_impl<false, bfloat4, 192>;
+template [[host_name("kernel_depth_mix_bf16_256_4")]]      kernel kernel_depth_mix_t    kernel_depth_mix_impl<false, bfloat4, 256>;
+template [[host_name("kernel_depth_mix_norm_bf16_192_4")]] kernel kernel_depth_mix_t    kernel_depth_mix_impl<true,  bfloat4, 192>;
+template [[host_name("kernel_depth_mix_norm_bf16_256_4")]] kernel kernel_depth_mix_t    kernel_depth_mix_impl<true,  bfloat4, 256>;
+template [[host_name("kernel_depth_mix_mq_bf16_192_4")]]   kernel kernel_depth_mix_mq_t kernel_depth_mix_mq_impl<bfloat4, 192>;
+template [[host_name("kernel_depth_mix_mq_bf16_256_4")]]   kernel kernel_depth_mix_mq_t kernel_depth_mix_mq_impl<bfloat4, 256>;
+#endif
 
 kernel void kernel_concat_rms_norm_f32_4(
         constant ggml_metal_kargs_concat_rms_norm & args,

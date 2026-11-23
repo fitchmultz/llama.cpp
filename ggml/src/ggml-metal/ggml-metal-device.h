@@ -181,7 +181,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_clip  
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_loop_control      (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_situ              (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_sigmoid       (ggml_metal_library_t lib);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_depth_mix         (ggml_metal_library_t lib, bool has_norm);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_depth_mix         (ggml_metal_library_t lib, enum ggml_type tq, bool has_norm, bool multi_q, int nth);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat_rms_norm   (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_loop_down_norm    (ggml_metal_library_t lib, int mode);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_loop_control_mm   (ggml_metal_library_t lib, bool use_tensor);

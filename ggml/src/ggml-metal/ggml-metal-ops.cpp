@@ -1441,6 +1441,11 @@ static int ggml_metal_op_depth_mix_fused(ggml_metal_op_t ctx, int idx, int n_fus
     const ggml_tensor * out_rms = has_norm ? ctx->node(idx + n_fuse - 2) : nullptr;
     const ggml_tensor * norm_w  = has_norm ? ((dst->src[0] == out_rms) ? dst->src[1] : dst->src[0]) : dst;
 
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+    if (query->type == GGML_TYPE_BF16 && !props_dev->has_bfloat) {
+        return 0;
+    }
+
     for (int i = 1; i < n_fuse; ++i) {
         if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
             ggml_metal_op_concurrency_reset(ctx);
@@ -1448,13 +1453,19 @@ static int ggml_metal_op_depth_mix_fused(ggml_metal_op_t ctx, int idx, int n_fus
         }
     }
 
-    auto pipeline = ggml_metal_library_get_pipeline_depth_mix(ctx->lib, has_norm);
+    const int32_t ne00     = (int32_t) (cur->ne[0] / 4);
+    const int32_t n_q      = (int32_t) query->ne[1];
+    const int32_t n_tokens = (int32_t) cur->ne[2];
+    const int     nth      = (ne00 % 192 == 0 && (!has_norm || ne00 <= 192 * 4)) ? 192 : 256;
+    const bool    multi_q  = (!has_norm && n_q > 1 && n_tokens >= 32);
+
+    auto pipeline = ggml_metal_library_get_pipeline_depth_mix(ctx->lib, query->type, has_norm, multi_q, nth);
 
     ggml_metal_kargs_depth_mix args = {
-        /*.ne00     =*/ (int32_t) (cur->ne[0] / 4),
+        /*.ne00     =*/ ne00,
         /*.k_prev   =*/ (int32_t) blocks->ne[1],
-        /*.n_q      =*/ (int32_t) query->ne[1],
-        /*.n_tokens =*/ (int32_t) cur->ne[2],
+        /*.n_q      =*/ n_q,
+        /*.n_tokens =*/ n_tokens,
         /*.nb01     =*/ blocks->nb[1],
         /*.nb02     =*/ blocks->nb[2],
         /*.nb11     =*/ cur->nb[2],
@@ -1475,7 +1486,8 @@ static int ggml_metal_op_depth_mix_fused(ggml_metal_op_t ctx, int idx, int n_fus
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),    4);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(norm_w), 5);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, args.n_tokens, args.n_q, 1, 256, 1, 1);
+    const uint32_t grid_y = multi_q ? (uint32_t) ((args.n_q + 3) / 4) : (uint32_t) args.n_q;
+    ggml_metal_encoder_dispatch_threadgroups(enc, args.n_tokens, grid_y, 1, nth, 1, 1);
 
     return n_fuse;
 }
@@ -6931,8 +6943,11 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
         }
 
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_DEPTH_MIX) {
-            ctx->count_fusions(fusion);
-            return ggml_metal_op_depth_mix_fused(ctx, idx, n);
+            const int ret = ggml_metal_op_depth_mix_fused(ctx, idx, n);
+            if (ret > 0) {
+                ctx->count_fusions(fusion);
+                return ret;
+            }
         }
 
         if (fusion && (ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_NORM_MUL || ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_NORM_MUL_ADD)) {

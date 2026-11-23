@@ -604,7 +604,8 @@ static bool ggml_metal_fusion_check_depth_mix(
         }
     }
     if (blocks->type != GGML_TYPE_F32 || cur->type != GGML_TYPE_F32 ||
-        query->type != GGML_TYPE_F32 || mm1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        (query->type != GGML_TYPE_F32 && query->type != GGML_TYPE_F16 && query->type != GGML_TYPE_BF16) ||
+        mm1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
         !ggml_is_contiguous(blocks) || !ggml_is_contiguous(cur) ||
         !ggml_is_contiguous(query) || !ggml_is_contiguous(mm1) || !ggml_is_contiguous(dst)) {
         return false;
