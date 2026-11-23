@@ -699,6 +699,7 @@ struct llama_layer {
     struct ggml_tensor * attn_rel_clip    = nullptr;
     struct ggml_tensor * attn_sink_proj   = nullptr;
     // inkling2 loop controllers: q, k, v, mlp
+    struct ggml_tensor * loop_msg_query   = nullptr;
     struct ggml_tensor * loop_down[4]     = {};
     struct ggml_tensor * loop_gain[4]     = {};
     struct ggml_tensor * loop_forget[4]   = {};

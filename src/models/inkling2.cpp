@@ -28,7 +28,9 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_VOCAB_SIZE_UNPADDED, hparams.n_vocab_unpadded);
 
     // MoE
-    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
+    const bool     is_loop_arch = (arch == LLM_ARCH_INKLING2_LOOP);
+    const uint32_t n_layer_kv   = is_loop_arch ? (hparams.n_layer() - hparams.loop_n_extra()) : hparams.n_layer();
+    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, n_layer_kv);
 
     ml.get_key(LLM_KV_ACTIVATION_SITU_BETA,        hparams.situ_beta);
     ml.get_key(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, hparams.situ_linear_beta);
@@ -43,6 +45,15 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
 
     uint32_t n_pattern = 0;
     ml.get_arr_n(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, n_pattern);
+
+    if (is_loop_arch && n_pattern == n_layer_kv) {
+        for (int il = (int) hparams.n_layer() - 1; il >= 0; --il) {
+            const uint32_t ip = hparams.loop_layer(il);
+            hparams.n_ff_exp_arr[il] = hparams.n_ff_exp_arr[ip];
+            hparams.is_swa_impl[il]  = hparams.is_swa_impl[ip];
+        }
+        n_pattern = hparams.n_layer();
+    }
 
     if (n_pattern != hparams.n_layer() || !hparams.n_relative || !hparams.n_relative_extent || !hparams.n_swa ||
         !hparams.attn_res_block_size || !hparams.n_log_scale_floor || hparams.n_shortconv_l_cache < 2 ||
@@ -175,13 +186,26 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
         layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, 2*n_ff_exp, n_expert}, 0);
         layer.ffn_down_exps    = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,    "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
 
-        // message controllers of the looped core: (attn, k, v, mlp) x (down, gain, forget)
+        // message controllers of the looped core: (attn/q, k, v, mlp/ffn) x (down, gain, forget)
         if (loop && i >= (int) hparams.loop_core_start && i < (int) hparams.loop_core_end) {
-            static const llm_tensor down[4]   = {LLM_TENSOR_LOOP_ATTN_DOWN,   LLM_TENSOR_LOOP_K_DOWN,   LLM_TENSOR_LOOP_V_DOWN,   LLM_TENSOR_LOOP_MLP_DOWN};
-            static const llm_tensor gain[4]   = {LLM_TENSOR_LOOP_ATTN_GAIN,   LLM_TENSOR_LOOP_K_GAIN,   LLM_TENSOR_LOOP_V_GAIN,   LLM_TENSOR_LOOP_MLP_GAIN};
-            static const llm_tensor forget[4] = {LLM_TENSOR_LOOP_ATTN_FORGET, LLM_TENSOR_LOOP_K_FORGET, LLM_TENSOR_LOOP_V_FORGET, LLM_TENSOR_LOOP_MLP_FORGET};
+            static const llm_tensor down_v1[4]   = {LLM_TENSOR_LOOP_ATTN_DOWN,   LLM_TENSOR_LOOP_K_DOWN,   LLM_TENSOR_LOOP_V_DOWN,   LLM_TENSOR_LOOP_MLP_DOWN};
+            static const llm_tensor gain_v1[4]   = {LLM_TENSOR_LOOP_ATTN_GAIN,   LLM_TENSOR_LOOP_K_GAIN,   LLM_TENSOR_LOOP_V_GAIN,   LLM_TENSOR_LOOP_MLP_GAIN};
+            static const llm_tensor forget_v1[4] = {LLM_TENSOR_LOOP_ATTN_FORGET, LLM_TENSOR_LOOP_K_FORGET, LLM_TENSOR_LOOP_V_FORGET, LLM_TENSOR_LOOP_MLP_FORGET};
+
+            static const llm_tensor down_v2[4]   = {LLM_TENSOR_LOOP_Q_CTRL_DOWN,   LLM_TENSOR_LOOP_K_CTRL_DOWN,   LLM_TENSOR_LOOP_V_CTRL_DOWN,   LLM_TENSOR_LOOP_FFN_CTRL_DOWN};
+            static const llm_tensor gain_v2[4]   = {LLM_TENSOR_LOOP_Q_CTRL_GAIN,   LLM_TENSOR_LOOP_K_CTRL_GAIN,   LLM_TENSOR_LOOP_V_CTRL_GAIN,   LLM_TENSOR_LOOP_FFN_CTRL_GAIN};
+            static const llm_tensor forget_v2[4] = {LLM_TENSOR_LOOP_Q_CTRL_FORGET, LLM_TENSOR_LOOP_K_CTRL_FORGET, LLM_TENSOR_LOOP_V_CTRL_FORGET, LLM_TENSOR_LOOP_FFN_CTRL_FORGET};
+
+            const bool is_loop_arch = (arch == LLM_ARCH_INKLING2_LOOP);
+            const llm_tensor * down   = is_loop_arch ? down_v2   : down_v1;
+            const llm_tensor * gain   = is_loop_arch ? gain_v2   : gain_v1;
+            const llm_tensor * forget = is_loop_arch ? forget_v2 : forget_v1;
 
             const int64_t n_rank = hparams.loop_gate_rank;
+
+            if (is_loop_arch) {
+                layer.loop_msg_query = create_tensor(tn(LLM_TENSOR_LOOP_MSG_QUERY, "weight", i), {n_embd, 4}, 0);
+            }
 
             for (int m = 0; m < 4; ++m) {
                 layer.loop_down[m]   = create_tensor(tn(down[m],   "weight", i), {2*n_embd, n_rank}, 0);
@@ -191,7 +215,7 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
         }
     }
 
-    if (loop) {
+    if (loop && arch != LLM_ARCH_INKLING2_LOOP) {
         const int64_t n_query = 2*(hparams.loop_core_end - hparams.loop_core_start);
 
         loop_res_query    = create_tensor(tn(LLM_TENSOR_LOOP_RES_QUERY,    "weight"), {n_embd, n_query}, 0);
@@ -431,6 +455,8 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
     ggml_tensor *              prelude_cur         = nullptr;
     ggml_tensor *              pass_m_attn         = nullptr;
     ggml_tensor *              pass_m_kv           = nullptr;
+    ggml_tensor *              pass_bank_prev      = nullptr;
+    ggml_tensor *              pass_bank_cur       = nullptr;
 
     auto slice_mix_row = [&](ggml_tensor * m, int64_t r) -> ggml_tensor * {
         if (n_tokens == 1) {
@@ -459,10 +485,15 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                         bank_prev = bank_prev ? ggml_concat(ctx0, blocks_norm_vec[bi], bank_prev, 1) : blocks_norm_vec[bi];
                     }
 
-                    pass_m_attn = mix(bank_prev, cur, model.loop_res_query);
-                    pass_m_kv   = mix(bank_prev, cur, model.loop_kv_res_query);
-                    ggml_build_forward_expand(gf, pass_m_attn);
-                    ggml_build_forward_expand(gf, pass_m_kv);
+                    if (model.loop_res_query) {
+                        pass_m_attn = mix(bank_prev, cur, model.loop_res_query);
+                        pass_m_kv   = mix(bank_prev, cur, model.loop_kv_res_query);
+                        ggml_build_forward_expand(gf, pass_m_attn);
+                        ggml_build_forward_expand(gf, pass_m_kv);
+                    } else {
+                        pass_bank_prev = bank_prev;
+                        pass_bank_cur  = cur;
+                    }
 
                     blocks_norm_vec = prelude_blocks_norm_vec;
                     blocks_norm     = prelude_blocks_norm;
@@ -471,13 +502,21 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
             }
 
             if (pass > 0) {
-                const int64_t row = 2*(ip - (int) hparams.loop_core_start);
+                if (model.loop_res_query) {
+                    const int64_t row = 2*(ip - (int) hparams.loop_core_start);
 
-                // rows: (attn, mlp) and (k, v)
-                messages[0] = slice_mix_row(pass_m_attn, row + 0);
-                messages[3] = slice_mix_row(pass_m_attn, row + 1);
-                messages[1] = slice_mix_row(pass_m_kv,   row + 0);
-                messages[2] = slice_mix_row(pass_m_kv,   row + 1);
+                    // rows: (attn, mlp) and (k, v)
+                    messages[0] = slice_mix_row(pass_m_attn, row + 0);
+                    messages[3] = slice_mix_row(pass_m_attn, row + 1);
+                    messages[1] = slice_mix_row(pass_m_kv,   row + 0);
+                    messages[2] = slice_mix_row(pass_m_kv,   row + 1);
+                } else if (layer.loop_msg_query) {
+                    ggml_tensor * msg4 = mix(pass_bank_prev, pass_bank_cur, layer.loop_msg_query);
+                    ggml_build_forward_expand(gf, msg4);
+                    for (int m = 0; m < 4; ++m) {
+                        messages[m] = slice_mix_row(msg4, m);
+                    }
+                }
             }
         }
 

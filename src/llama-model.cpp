@@ -325,6 +325,7 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
         case LLM_ARCH_FALCON_H1:
             return new llama_model_falcon_h1(params);
         case LLM_ARCH_INKLING2:
+        case LLM_ARCH_INKLING2_LOOP:
             return new llama_model_inkling2(params);
         case LLM_ARCH_LFM2:
             return new llama_model_lfm2(params);
@@ -1692,15 +1693,43 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // for decision models
     ml.get_arr(LLM_KV_DECISION_LABELS, decision_labels, false);
 
-    // looped layers: the GGUF has one block per layer visit, the visits of a core layer share its weights
-    ml.get_key(LLM_KV_LOOP_CORE_END, hparams.loop_core_end, false);
-    if (hparams.loop_core_end > 0) {
-        ml.get_key(LLM_KV_LOOP_CORE_START, hparams.loop_core_start);
-        ml.get_key(LLM_KV_NUM_LOOPS,       hparams.loop_n_pass);
-        if (hparams.loop_n_pass < 2 || hparams.loop_core_start >= hparams.loop_core_end ||
-            (uint64_t) hparams.loop_core_end + (uint64_t) (hparams.loop_n_pass - 1)*(hparams.loop_core_end - hparams.loop_core_start) > hparams.n_layer()) {
-            throw std::runtime_error(format("invalid loop layout: core [%u, %u) x %u passes, %u layer visits",
-                hparams.loop_core_start, hparams.loop_core_end, hparams.loop_n_pass, hparams.n_layer()));
+    // looped layers: the GGUF has either one block per visit (inkling2) or physical blocks only (inkling2_loop)
+    if (arch == LLM_ARCH_INKLING2_LOOP) {
+        ml.get_key(LLM_KV_LOOP_START, hparams.loop_core_start);
+        ml.get_key(LLM_KV_LOOP_END,   hparams.loop_core_end);
+        ml.get_key(LLM_KV_LOOP_COUNT, hparams.loop_n_pass);
+        bool loop_varying = false;
+        ml.get_key(LLM_KV_LOOP_VARYING, loop_varying, false);
+        const uint32_t n_phys = hparams.n_layer_all;
+        if (hparams.loop_n_pass < (loop_varying ? 1u : 2u) || hparams.loop_core_start >= hparams.loop_core_end ||
+            hparams.loop_core_end > n_phys || hparams.n_layer_nextn > 0) {
+            throw std::runtime_error(format("invalid inkling2_loop layout: core [%u, %u) x %u passes, %u physical layers",
+                hparams.loop_core_start, hparams.loop_core_end, hparams.loop_n_pass, n_phys));
+        }
+        const uint64_t n_visits = (uint64_t) n_phys + (uint64_t) hparams.loop_n_extra();
+        if (n_visits > LLAMA_MAX_LAYERS) {
+            throw std::runtime_error(format("inkling2_loop: %llu layer visits exceed maximum %d",
+                (unsigned long long) n_visits, LLAMA_MAX_LAYERS));
+        }
+        hparams.n_layer_all = (uint32_t) n_visits;
+        for (int il = (int) hparams.n_layer_all - 1; il >= 0; --il) {
+            const uint32_t ip = hparams.loop_layer(il);
+            hparams.n_head_arr[il]        = hparams.n_head_arr[ip];
+            hparams.n_head_kv_arr[il]     = hparams.n_head_kv_arr[ip];
+            hparams.n_ff_arr[il]          = hparams.n_ff_arr[ip];
+            hparams.n_expert_used_arr[il] = hparams.n_expert_used_arr[ip];
+            hparams.is_recr_impl[il]      = hparams.is_recr_impl[ip];
+        }
+    } else {
+        ml.get_key(LLM_KV_LOOP_CORE_END, hparams.loop_core_end, false);
+        if (hparams.loop_core_end > 0) {
+            ml.get_key(LLM_KV_LOOP_CORE_START, hparams.loop_core_start);
+            ml.get_key(LLM_KV_NUM_LOOPS,       hparams.loop_n_pass);
+            if (hparams.loop_n_pass < 2 || hparams.loop_core_start >= hparams.loop_core_end ||
+                (uint64_t) hparams.loop_core_end + (uint64_t) (hparams.loop_n_pass - 1)*(hparams.loop_core_end - hparams.loop_core_start) > hparams.n_layer()) {
+                throw std::runtime_error(format("invalid loop layout: core [%u, %u) x %u passes, %u layer visits",
+                    hparams.loop_core_start, hparams.loop_core_end, hparams.loop_n_pass, hparams.n_layer()));
+            }
         }
     }
 
@@ -3449,7 +3478,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_idx = [&](uint32_t il) {
                             return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
                         };
-                    } else if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_ZAYA1) {
+                    } else if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP || arch == LLM_ARCH_ZAYA1) {
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
                     } else if (arch == LLM_ARCH_INKLING) {
@@ -3834,6 +3863,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_GLM5_NEXT:
         case LLM_ARCH_STARCODER:
         case LLM_ARCH_INKLING2:
+        case LLM_ARCH_INKLING2_LOOP:
         case LLM_ARCH_KOKORO:
             return LLAMA_ROPE_TYPE_NONE;
 
